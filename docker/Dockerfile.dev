@@ -1,0 +1,51 @@
+# Development image for the nabla Postgres extension.
+#
+# A Postgres extension links against the server's own headers, so it is built on
+# the same platform it will run on. The host here is Windows/MSVC, so all builds
+# and tests happen inside this Linux image.
+FROM rust:1.90-bookworm
+
+ARG PG_MAJOR=17
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      gnupg \
+      libclang-dev \
+      pkg-config \
+      libssl-dev \
+      libreadline-dev \
+      zlib1g-dev \
+      flex \
+      bison \
+      git \
+      sudo \
+ && rm -rf /var/lib/apt/lists/*
+
+# PGDG repository, for the matching server + development headers.
+RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+      | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+      > /etc/apt/sources.list.d/pgdg.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      postgresql-${PG_MAJOR} \
+      postgresql-server-dev-${PG_MAJOR} \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
+
+# pgrx builds and runs Postgres as a non-root user.
+RUN useradd -m -s /bin/bash dev \
+ && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
+ && chown -R dev:dev /usr/local/cargo
+
+USER dev
+WORKDIR /work
+
+RUN cargo install cargo-pgrx --locked --version '~0.17'
+
+# Reuse the system server instead of letting pgrx compile its own.
+RUN cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
+
+CMD ["bash"]

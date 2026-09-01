@@ -1,0 +1,21 @@
+# Local experiments and benchmarks (not part of the extension)
+experiments/
+
+# Rust
+target/
+**/*.rs.bk
+
+# pgrx
+.pgrx/
+*.control.generated
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
