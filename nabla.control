@@ -1,0 +1,5 @@
+comment = 'Non-blocking incremental materialized views with delta subscriptions'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/nabla'
+relocatable = false
+superuser = true
