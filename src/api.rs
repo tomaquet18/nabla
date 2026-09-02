@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::definition::{self, Shape, ViewSpec};
 use crate::errors;
+use crate::idle;
 use crate::lsn;
 use crate::shadow;
 
@@ -157,12 +158,13 @@ fn view_index_sql(name: &str, spec: &ViewSpec) -> String {
     format!("CREATE UNIQUE INDEX ON {name} ({}){nulls}", cols.join(", "))
 }
 
-/// Populate a view table and reset its bookkeeping (create and refresh).
+/// Reset a view's bookkeeping after a rebuild: a new epoch invalidates every
+/// subscriber cursor (they get NB003 from changes()).
 fn record_refresh(view_id: i32) {
     run_args(
         "UPDATE nabla.views SET frontier_lsn = pg_catalog.pg_current_wal_lsn(), epoch = epoch + 1, \
-         status = 'live', last_seq = last_seq + 1, resync_seq = last_seq + 1, \
-         apply_failures = 0, last_error = NULL, last_error_at = NULL, stale_reason = NULL WHERE id = $1",
+         status = 'live', apply_failures = 0, last_error = NULL, last_error_at = NULL, stale_reason = NULL \
+         WHERE id = $1",
         &[view_id.into()],
     );
     run_args("DELETE FROM nabla.deltas WHERE view_id = $1", &[view_id.into()]);
@@ -177,16 +179,7 @@ struct CatalogRow {
     epoch: i32,
     status: String,
     last_seq: i64,
-    resync_seq: i64,
     stale_reason: Option<String>,
-}
-
-/// Raised by subscriber-facing functions on a stale view.
-fn stale_error(name: &str, reason: Option<&str>) -> ! {
-    errors::prerequisite(
-        format!("nabla: view \"{name}\" is stale: {}", reason.unwrap_or("reason not recorded")),
-        Some(&format!("Run nabla.refresh('{name}') after fixing the cause.")),
-    )
 }
 
 fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
@@ -194,8 +187,7 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
         let mut out = Vec::new();
         for r in client.select(
             &format!(
-                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq, stale_reason, \
-                        frontier_lsn::text \
+                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, stale_reason, frontier_lsn::text \
                  FROM nabla.views WHERE {clause} ORDER BY id"
             ),
             None,
@@ -212,9 +204,8 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
                 epoch: r.get::<i32>(5)?.expect("epoch"),
                 status: r.get::<String>(6)?.expect("status"),
                 last_seq: r.get::<i64>(7)?.expect("last_seq"),
-                resync_seq: r.get::<i64>(8)?.expect("resync_seq"),
-                stale_reason: r.get::<String>(9)?,
-                frontier: lsn::parse(&r.get::<String>(10)?.unwrap_or_default()).unwrap_or(0),
+                stale_reason: r.get::<String>(8)?,
+                frontier: lsn::parse(&r.get::<String>(9)?.unwrap_or_default()).unwrap_or(0),
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -273,14 +264,64 @@ fn refresh_closure(view: &CatalogRow) -> (Vec<CatalogRow>, BTreeSet<u32>) {
     (views, relids)
 }
 
+/// (frontier, status, stale_reason) read with a fresh snapshot.
+fn current_frontier(name: &str) -> (u64, String, Option<String>) {
+    // Read-only SPI runs under the active snapshot, so push the latest one
+    // to observe the worker's commits while polling.
+    unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot()) };
+    let found = Spi::connect(|client| {
+        let table = client.select(
+            "SELECT frontier_lsn::text, status, stale_reason FROM nabla.views WHERE name = $1",
+            Some(1),
+            &[name.into()],
+        )?;
+        if table.is_empty() {
+            Ok(None)
+        } else {
+            let table = table.first();
+            Ok(Some((table.get::<String>(1)?, table.get::<String>(2)?, table.get::<String>(3)?)))
+        }
+    });
+    unsafe { pg_sys::PopActiveSnapshot() };
+    let (lsn_text, status, stale_reason) = found.unwrap_or_else(|e| spi_fail(e)).unwrap_or((None, None, None));
+    let lsn_text = lsn_text.unwrap_or_else(|| {
+        errors::raise(
+            PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
+            format!("nabla: view \"{name}\" does not exist"),
+            None,
+        )
+    });
+    (lsn::parse(&lsn_text).unwrap_or(0), status.unwrap_or_default(), stale_reason)
+}
+
+/// Poll the frontier every 10 ms until it reaches `target` or the timeout.
+fn wait_for_frontier(name: &str, target: u64, timeout_ms: i32) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+    loop {
+        let (frontier, status, stale_reason) = current_frontier(name);
+        if status == "stale" {
+            errors::stale(name, stale_reason.as_deref());
+        }
+        if idle::effective_frontier(frontier) >= target {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        pgrx::pg_sys::check_for_interrupts!();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The SQL-visible functions. `#[pg_schema]` makes pgrx emit the schema
 /// declaration so the functions can live in `nabla`.
 #[pg_schema]
 mod nabla {
     use super::*;
 
+    /// Returns the canonical (stored) view name; LISTEN on `'nabla:' || name`.
     #[pg_extern]
-    fn create_view(name: &str, definition: &str) {
+    fn create_view(name: &str, definition: &str) -> String {
         let name = require_qualified_name(name);
         let (spec, base) = definition::validate(definition);
         require_logical_wal();
@@ -354,6 +395,7 @@ mod nabla {
                 &[view_id.into(), (rel.oid as i64).into(), (rel.rti as i32).into()],
             );
         }
+        name
     }
 
     #[pg_extern]
@@ -373,7 +415,6 @@ mod nabla {
             }
         }
         for relid in &relids {
-            // Views created before view_relations existed are covered by base_table.
             let used_by_base = read_one::<bool>(
                 "SELECT EXISTS (SELECT 1 FROM nabla.views WHERE base_table = $1::oid::regclass)",
                 &[(*relid as i64).into()],
@@ -445,75 +486,69 @@ mod nabla {
         current_frontier(&name).0 as i64
     }
 
-    /// (frontier, status, stale_reason) read with a fresh snapshot.
-    fn current_frontier(name: &str) -> (u64, String, Option<String>) {
-        // Read-only SPI runs under the active snapshot, so push the latest one
-        // to observe the worker's commits while polling.
-        unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot()) };
-        let found = Spi::connect(|client| {
-            let table = client.select(
-                "SELECT frontier_lsn::text, status, stale_reason FROM nabla.views WHERE name = $1",
-                Some(1),
-                &[name.into()],
-            )?;
-            if table.is_empty() {
-                Ok(None)
-            } else {
-                let table = table.first();
-                Ok(Some((table.get::<String>(1)?, table.get::<String>(2)?, table.get::<String>(3)?)))
-            }
-        });
-        unsafe { pg_sys::PopActiveSnapshot() };
-        let (lsn_text, status, stale_reason) =
-            found.unwrap_or_else(|e| spi_fail(e)).unwrap_or((None, None, None));
-        let lsn_text = lsn_text.unwrap_or_else(|| {
-            errors::raise(
-                PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
-                format!("nabla: view \"{name}\" does not exist"),
-                None,
-            )
-        });
-        (lsn::parse(&lsn_text).unwrap_or(0), status.unwrap_or_default(), stale_reason)
-    }
-
     #[pg_extern(sql = r#"
     CREATE FUNCTION nabla.wait_for(name text, lsn pg_lsn, timeout_ms int DEFAULT 5000) RETURNS bool
     STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     "#)]
     fn wait_for(name: &str, lsn: i64, timeout_ms: i32) -> bool {
         let name = require_qualified_name(name);
-        let target = lsn as u64;
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
-        loop {
-            let (frontier, status, stale_reason) = current_frontier(&name);
-            if status == "stale" {
-                stale_error(&name, stale_reason.as_deref());
-            }
-            if frontier >= target {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            pgrx::pg_sys::check_for_interrupts!();
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_frontier(&name, lsn as u64, timeout_ms)
+    }
+
+    /// Text overload: accepts the `X/Y` form returned by changes() and status().
+    #[pg_extern(sql = r#"
+    CREATE FUNCTION nabla.wait_for(name text, lsn text, timeout_ms int DEFAULT 5000) RETURNS bool
+    STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+    "#)]
+    fn wait_for_text(name: &str, lsn: &str, timeout_ms: i32) -> bool {
+        let name = require_qualified_name(name);
+        let target = lsn::parse(lsn)
+            .unwrap_or_else(|| errors::invalid(format!("nabla: \"{lsn}\" is not a valid LSN (expected X/Y)"), None));
+        wait_for_frontier(&name, target, timeout_ms)
     }
 
     /// Everything a subscriber needs to bootstrap, in one row read from the
-    /// caller's snapshot (so it can share a REPEATABLE READ transaction with
-    /// `SELECT * FROM <view>`).
+    /// caller's snapshot (so it composes with a REPEATABLE READ transaction
+    /// that also reads the view table). `name` is the canonical view name:
+    /// LISTEN on `'nabla:' || name`.
     #[pg_extern(sql = r#"
     CREATE FUNCTION nabla.status(name text)
-    RETURNS TABLE (status text, epoch int, frontier_lsn pg_lsn, current_seq bigint, stale_reason text)
+    RETURNS TABLE (name text, status text, epoch int, frontier_lsn pg_lsn, frontier text, current_seq bigint, stale_reason text)
     STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     "#)]
     fn status(
         name: &str,
-    ) -> TableIterator<'static, (name!(status, String), name!(epoch, i32), name!(frontier_lsn, i64), name!(current_seq, i64), name!(stale_reason, Option<String>))> {
+    ) -> TableIterator<
+        'static,
+        (
+            name!(name, String),
+            name!(status, String),
+            name!(epoch, i32),
+            name!(frontier_lsn, i64),
+            name!(frontier, String),
+            name!(current_seq, i64),
+            name!(stale_reason, Option<String>),
+        ),
+    > {
         let name = require_qualified_name(name);
         let view = load_view(&name);
-        TableIterator::once((view.status, view.epoch, view.frontier as i64, view.last_seq, view.stale_reason))
+        TableIterator::once((
+            view.name,
+            view.status,
+            view.epoch,
+            view.frontier as i64,
+            lsn::format(view.frontier),
+            view.last_seq,
+            view.stale_reason,
+        ))
+    }
+
+    /// The definition's output columns, in order, without the hidden
+    /// `_nabla_*` maintenance columns of the view table.
+    #[pg_extern]
+    fn visible_columns(name: &str) -> Vec<String> {
+        let name = require_qualified_name(name);
+        load_view(&name).spec.visible_columns
     }
 
     #[pg_extern]
@@ -522,47 +557,61 @@ mod nabla {
         load_view(&name).last_seq
     }
 
+    /// Deltas after `after_seq`, whole source transactions only: a result with
+    /// fewer rows than `max_rows` is drained; a trailing transaction that
+    /// straddles `max_rows` is returned in full (so a result may exceed
+    /// `max_rows`). Raises NB002 (stale), NB003 (epoch differs) or NB001
+    /// (cursor older than retention), in that order.
     #[pg_extern(sql = r#"
-    CREATE FUNCTION nabla.changes(name text, after_seq bigint, max_rows int DEFAULT 1000)
-    RETURNS TABLE (seq bigint, lsn pg_lsn, xid bigint, op "char", "row" jsonb, epoch int)
+    CREATE FUNCTION nabla.changes(name text, after_seq bigint, epoch int, max_rows int DEFAULT 1000, include_hidden bool DEFAULT false)
+    RETURNS TABLE (seq bigint, lsn text, xid bigint, op text, "row" jsonb)
     STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     "#)]
     fn changes(
         name: &str,
         after_seq: i64,
+        epoch: i32,
         max_rows: i32,
-    ) -> TableIterator<'static, (name!(seq, i64), name!(lsn, i64), name!(xid, Option<i64>), name!(op, i8), name!(row, JsonB), name!(epoch, i32))> {
+        include_hidden: bool,
+    ) -> TableIterator<'static, (name!(seq, i64), name!(lsn, String), name!(xid, Option<i64>), name!(op, String), name!(row, JsonB))> {
         let name = require_qualified_name(name);
         let view = load_view(&name);
         if view.status == "stale" {
-            stale_error(&name, view.stale_reason.as_deref());
+            errors::stale(&name, view.stale_reason.as_deref());
         }
-        let oldest = read_one::<i64>("SELECT min(seq) FROM nabla.deltas WHERE view_id = $1", &[view.id.into()]);
-        let oldest_available = oldest.unwrap_or(view.last_seq + 1) - 1;
-        if after_seq < view.resync_seq || after_seq < oldest_available {
-            errors::raise(
-                PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
-                format!("nabla: subscriber lagged behind retention for view \"{name}\""),
-                Some("Resync from the view table and continue from nabla.current_seq(name)."),
-            );
+        if epoch != view.epoch {
+            errors::epoch_changed(&name, epoch, view.epoch);
+        }
+        match read_one::<i64>("SELECT min(seq) FROM nabla.deltas WHERE view_id = $1", &[view.id.into()]) {
+            Some(oldest) if after_seq < oldest - 1 => errors::lagged(&name, oldest),
+            None if after_seq < view.last_seq => errors::lagged(&name, view.last_seq + 1),
+            _ => {}
         }
 
-        let epoch = view.epoch;
-        let args: [DatumWithOid; 3] = [view.id.into(), after_seq.into(), (max_rows.max(0) as i64).into()];
+        let hidden: Vec<String> = if include_hidden { Vec::new() } else { view.spec.hidden_columns.clone() };
+        let limit = max_rows.max(1) as i64;
+        let args: [DatumWithOid; 4] = [view.id.into(), after_seq.into(), limit.into(), hidden.into()];
         let rows = Spi::connect(|client| {
             let mut out = Vec::new();
             for r in client.select(
-                "SELECT seq, lsn::text, xid, op, row FROM nabla.deltas \
-                 WHERE view_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+                "WITH page AS (SELECT seq, lsn, xid, op, row FROM nabla.deltas \
+                               WHERE view_id = $1 AND seq > $2 ORDER BY seq LIMIT $3), \
+                      last AS (SELECT seq, lsn, xid FROM page ORDER BY seq DESC LIMIT 1), \
+                      rest AS (SELECT d.seq, d.lsn, d.xid, d.op, d.row FROM nabla.deltas d, last \
+                               WHERE (SELECT count(*) FROM page) >= $3 AND d.view_id = $1 \
+                                 AND d.seq > last.seq AND d.lsn = last.lsn AND d.xid IS NOT DISTINCT FROM last.xid) \
+                 SELECT seq, lsn::text, xid, op::text, row - $4::text[] \
+                 FROM (SELECT * FROM page UNION ALL SELECT * FROM rest) u ORDER BY seq",
                 None,
                 &args,
             )? {
-                let seq = r.get::<i64>(1)?.expect("seq");
-                let lsn_text = r.get::<String>(2)?.expect("lsn");
-                let xid = r.get::<i64>(3)?;
-                let op = r.get::<i8>(4)?.expect("op");
-                let row = r.get::<JsonB>(5)?.expect("row");
-                out.push((seq, lsn::parse(&lsn_text).unwrap_or(0) as i64, xid, op, row, epoch));
+                out.push((
+                    r.get::<i64>(1)?.expect("seq"),
+                    r.get::<String>(2)?.expect("lsn"),
+                    r.get::<i64>(3)?,
+                    r.get::<String>(4)?.expect("op"),
+                    r.get::<JsonB>(5)?.expect("row"),
+                ));
             }
             Ok::<_, pgrx::spi::Error>(out)
         })

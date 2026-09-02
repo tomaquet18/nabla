@@ -124,6 +124,12 @@ pub struct ViewSpec {
     /// GROUP BY expressions of the populate query, if any.
     #[serde(default)]
     pub group_by: Option<String>,
+    /// The definition's output column names, in order.
+    #[serde(default)]
+    pub visible_columns: Vec<String>,
+    /// Maintenance columns nabla added (`_nabla_*`), stripped from delta rows by default.
+    #[serde(default)]
+    pub hidden_columns: Vec<String>,
 }
 
 impl ViewSpec {
@@ -731,6 +737,8 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             relations: relations.clone(),
             select_list: String::new(),
             group_by: None,
+            visible_columns: visible.iter().map(|t| t.alias.clone()).collect(),
+            hidden_columns: Vec::new(),
         };
         // Output columns of the populate query, in definition order.
         let mut populate_targets: Vec<String> = Vec::new();
@@ -772,6 +780,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                             let counter = format!("{HIDDEN_SUM_COUNTER_PREFIX}{index}");
                             populate_targets.push(format!("sum({expr}) AS {quoted_alias}"));
                             hidden_targets.push(format!("count({expr}) AS {counter}"));
+                            spec.hidden_columns.push(counter.clone());
                             spec.sums.push(SumSpec { expr, alias: t.alias.clone(), counter });
                         }
                     }
@@ -791,6 +800,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             if spec.count_alias.is_none() {
                 populate_targets.push(format!("count(*) AS {HIDDEN_COUNT_COLUMN}"));
                 spec.count_alias = Some(HIDDEN_COUNT_COLUMN.to_string());
+                spec.hidden_columns.push(HIDDEN_COUNT_COLUMN.to_string());
                 spec.hidden_count = true;
             }
         } else {
@@ -815,6 +825,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                             quote_identifier(col),
                             quote_identifier(&hidden)
                         ));
+                        spec.hidden_columns.push(hidden.clone());
                         spec.pk_view_columns.push(hidden);
                     }
                 }

@@ -11,6 +11,7 @@ mod apply;
 mod definition;
 mod errors;
 mod guc;
+mod idle;
 mod lsn;
 mod pgoutput;
 mod shadow;
@@ -23,6 +24,7 @@ extension_sql_file!("../sql/bootstrap.sql", name = "bootstrap", bootstrap);
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     guc::register();
+    idle::register();
     worker::register();
 }
 

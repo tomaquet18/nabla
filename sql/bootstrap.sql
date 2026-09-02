@@ -16,7 +16,6 @@ CREATE TABLE nabla.views (
   epoch         int NOT NULL DEFAULT 1,          -- bumped by refresh; subscribers must resync
   status        text NOT NULL DEFAULT 'live' CHECK (status IN ('live', 'stale')),
   last_seq      bigint NOT NULL DEFAULT 0,       -- last delta sequence number handed out
-  resync_seq    bigint NOT NULL DEFAULT 0,       -- cursors below this must resync (set by refresh)
   -- Failure isolation (see README "Failure isolation"). Added in v0.1 before
   -- any release, so no upgrade script migrates older catalogs.
   apply_failures int NOT NULL DEFAULT 0,          -- consecutive failed applies of the pending transaction
@@ -69,8 +68,8 @@ LANGUAGE plpgsql AS $$
 BEGIN
   IF coalesce(current_setting('nabla.internal_write', true), 'off') <> 'on' THEN
     RAISE EXCEPTION 'nabla: cannot modify a nabla view directly'
-      USING HINT = 'The view is maintained by the nabla worker. Change the base table instead.',
-            ERRCODE = 'insufficient_privilege';
+      USING HINT = 'The table is maintained by the nabla worker. Change the base table instead.',
+            ERRCODE = 'NB005';
   END IF;
   IF TG_OP = 'DELETE' THEN
     RETURN OLD;

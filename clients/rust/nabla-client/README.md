@@ -20,14 +20,16 @@ loop {
 }
 ```
 
-- `Subscription::open(config, view)` connects, `LISTEN`s on `nabla:<view>` and
+- `Subscription::open(config, view)` connects, `LISTEN`s on
+  `nabla:<canonical name>` (from `nabla.status`) and
   prepares the first bootstrap; `open_with` takes `Options` (batch size,
   fallback poll interval, whether to keep `_nabla_*` columns, stale backoff).
 - `next()` returns the next event: a `Snapshot` (rows from one
   `REPEATABLE READ` transaction, with the cursor to continue from), a
   `Transaction` (all deltas of one source transaction: same `xid` and `lsn`,
   contiguous `seq`), or a `Resync` (`lagged`, `epoch changed`, `stale`,
-  `disconnected`), always followed by a fresh `Snapshot`.
+  `disconnected`), always followed by a fresh `Snapshot`. Server conditions are
+  recognized by SQLSTATE (`NB001`, `NB002`, `NB003`) only.
 - `wait_for(lsn, timeout)` blocks until the view has absorbed everything up to
   `lsn` (read-your-writes; pass `pg_current_wal_lsn()` taken after your commit).
 

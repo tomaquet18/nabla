@@ -130,12 +130,46 @@ LISTEN "nabla:public.orders_by_k";
 SELECT * FROM nabla.changes('public.orders_by_k', 42);    -- rows with seq > 42
 ```
 
-SQL API (schema `nabla`): `create_view(name, definition)`, `drop_view(name)`,
-`refresh(name)`, `frontier(name) -> pg_lsn`,
-`wait_for(name, lsn, timeout_ms default 5000) -> bool`,
-`current_seq(name) -> bigint`,
-`status(name) -> TABLE(status, epoch, frontier_lsn, current_seq, stale_reason)`,
-`changes(name, after_seq, max_rows default 1000) -> TABLE(seq, lsn, xid, op, row, epoch)`.
+SQL API (schema `nabla`):
+
+- `create_view(name, definition) -> text` returns the canonical (stored) view
+  name; `drop_view(name)`; `refresh(name)`.
+- `status(name) -> TABLE(name text, status text, epoch int, frontier_lsn pg_lsn,
+  frontier text, current_seq bigint, stale_reason text)`: everything a
+  subscriber needs, from the caller's snapshot. `LISTEN` on
+  `'nabla:' || status.name`.
+- `changes(name, after_seq bigint, epoch int, max_rows int default 1000,
+  include_hidden bool default false) -> TABLE(seq bigint, lsn text, xid bigint,
+  op text, row jsonb)`: deltas with `seq > after_seq`, `op` is `'I'` or `'D'`,
+  `lsn` is the `X/Y` text form. Whole source transactions only: a result
+  with fewer rows than `max_rows` is drained; a trailing transaction that
+  straddles `max_rows` is returned in full, so a result may exceed
+  `max_rows`. `epoch` must be the epoch from the subscriber's bootstrap.
+  `_nabla_*` columns are removed from `row` unless `include_hidden`.
+- `visible_columns(name) -> text[]`: the definition's output columns, for
+  clients that read the view table and want to drop the `_nabla_*` columns.
+- `frontier(name) -> pg_lsn`; `wait_for(name, lsn pg_lsn | text, timeout_ms
+  default 5000) -> bool` (the text overload takes the form `changes()` and
+  `status()` return); `current_seq(name) -> bigint`.
+
+Conditions a client must branch on carry nabla-specific SQLSTATEs:
+
+| SQLSTATE | condition | message / DETAIL / HINT |
+|---|---|---|
+| `NB001` | cursor older than retention | `nabla: subscriber lagged behind retention for view "<name>"` / `oldest retained seq is N` / resync from the view and continue from `nabla.status(...).current_seq` |
+| `NB002` | view is stale | `nabla: view "<name>" is stale` / the stale reason / `run nabla.refresh('<name>') after fixing the cause` |
+| `NB003` | epoch differs (the view was refreshed) | `nabla: view "<name>" epoch changed` / `epoch N -> M` / resync from the view |
+| `NB004` | unsupported view definition | `nabla: unsupported view definition: <reason>` / - / the accepted shapes |
+| `NB005` | direct write to a nabla-managed table | `nabla: cannot modify a nabla view directly` |
+
+`changes()` checks stale, then epoch, then retention, so a refresh is always
+reported as `NB003`, never as `NB001`.
+
+Changelog: the v0.1 `changes()` signature changed (added `epoch` and
+`include_hidden`, `lsn`/`op` are text, the `epoch` column was dropped);
+`create_view` returns the canonical name; `status()` gained `name` and
+`frontier`; `wait_for` gained a text overload; `nabla.views.resync_seq` was
+removed.
 
 View names must be schema-qualified. View tables reject direct DML
 (`nabla: cannot modify a nabla view directly`).
@@ -185,31 +219,31 @@ pruning.
 The reference implementation is `clients/rust/nabla-client` (library plus
 the `follow` example); clients in other languages follow the same steps.
 
-1. Connect and `LISTEN "nabla:<view>"`. The channel name is the qualified
-   view name exactly as stored in `nabla.views.name` (lowercase), quoted as
-   one identifier. Notifications are only wake-ups; their payload
-   (`<seq>:<lsn>`) is informational.
+1. Connect, read `name` from `nabla.status('<view>')` and
+   `LISTEN "nabla:<name>"` (the canonical stored name, quoted as one
+   identifier). Notifications are only wake-ups; their payload
+   (`<seq>:<lsn>`) is advisory.
 2. Bootstrap atomically: in one `REPEATABLE READ` transaction run
-   `SELECT * FROM nabla.status('<view>')` and `SELECT * FROM <view>`. Keep
-   `epoch` and `current_seq` (the cursor) from the same snapshot as the rows.
-   Ignore `_nabla_*` columns. If `status` is `stale`, wait with backoff and
-   bootstrap again; `stale_reason` says why.
+   `SELECT * FROM nabla.status('<view>')`, `nabla.visible_columns('<view>')`
+   and `SELECT <visible columns> FROM <view>`. Keep `epoch` and
+   `current_seq` (the cursor) from the same snapshot as the rows. If
+   `status` is `stale`, wait with backoff and bootstrap again;
+   `stale_reason` says why.
 3. Follow: on every notification, and on a fallback timer (about one second)
    so a lost notification cannot stall you, call
-   `nabla.changes('<view>', cursor, batch)` until it returns fewer rows than
-   `batch`. Rows are contiguous in `seq`; consecutive rows with the same
-   `(xid, lsn)` are one source transaction and should be applied atomically
-   (`D` before `I` for an update). Advance the cursor to the last `seq` only
-   after the transaction was handed to the application.
-4. Resync: the error `nabla: subscriber lagged behind retention` (cursor older
-   than `nabla.retain_deltas` or the view was refreshed), the error
-   `nabla: view "..." is stale: <reason>`, or a row whose `epoch` differs
-   from the bootstrap epoch mean the local copy is no longer continuable:
-   discard it and bootstrap again. On a lost connection, reconnect, `LISTEN`
-   again and bootstrap again.
-5. Read-your-writes: after committing, take `pg_current_wal_lsn()` and call
-   `nabla.wait_for('<view>', lsn, timeout_ms)`; when it returns true the view
-   (and the delta log) include your transaction.
+   `nabla.changes('<view>', cursor, epoch, batch)` until it returns fewer
+   rows than `batch`. Rows are contiguous in `seq`; consecutive rows with the
+   same `(xid, lsn)` are one source transaction (never split by the server)
+   and should be applied atomically (`D` before `I` for an update). Advance
+   the cursor to the last `seq` only after the transaction was handed to the
+   application.
+4. Resync on SQLSTATE: `NB001` (lagged), `NB003` (the view was refreshed) and
+   `NB002` (stale; wait with backoff) mean the local copy is no longer
+   continuable: discard it and bootstrap again. Never branch on message
+   text. On a lost connection, reconnect, `LISTEN` again and bootstrap again.
+5. Read-your-writes: after committing, take `pg_current_wal_lsn()` (or its
+   text form) and call `nabla.wait_for('<view>', lsn, timeout_ms)`; when it
+   returns true the view and the delta log include your transaction.
 
 Events a client should surface: `Snapshot { epoch, frontier, cursor, rows }`,
 `Transaction { xid, lsn, epoch, deltas[] }` and `Resync { reason }` where the

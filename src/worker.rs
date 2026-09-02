@@ -33,6 +33,7 @@ use std::time::Duration;
 use crate::apply::{self, Op, Planned, ViewTarget};
 use crate::definition::ViewSpec;
 use crate::guc;
+use crate::idle;
 use crate::lsn;
 use crate::pgoutput::{Change, ColumnValue, Decoder, Relation, SourceTransaction, Tuple};
 
@@ -715,6 +716,8 @@ struct WorkerState {
     /// Flush position right after our own last idle-advance write, so the
     /// worker does not chase its own WAL every poll.
     self_flush: u64,
+    /// Frontier every live object was advanced to by the last idle advance.
+    last_advance: u64,
     reported_missing_extension: bool,
 }
 
@@ -795,6 +798,12 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
 
     let drained = (rows.len() as i64) < PEEK_LIMIT;
     if rows.is_empty() && target == state.self_flush {
+        // Nothing decodable and no WAL beyond our own last commit: the
+        // range (last_advance, target] holds no published change, so a
+        // view at last_advance also reflects the base tables at target.
+        if state.last_advance > 0 {
+            idle::publish(state.last_advance, target);
+        }
         return Ok(Round::Idle);
     }
     for data in &rows {
@@ -845,6 +854,8 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
             select_one::<String>("SELECT pg_catalog.pg_current_wal_flush_lsn()::text", &[])
                 .map(|t| t.and_then(|t| lsn::parse(&t)).unwrap_or(0))
         })??;
+        state.last_advance = frontier;
+        idle::publish(frontier, frontier);
     }
     if applied > 0 {
         pgrx::log!(
@@ -873,7 +884,7 @@ fn worker_main() {
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
     pgrx::log!("nabla worker: connected to database {database}");
 
-    let mut state = WorkerState { decoder: Decoder::default(), self_flush: 0, reported_missing_extension: false };
+    let mut state = WorkerState { decoder: Decoder::default(), self_flush: 0, last_advance: 0, reported_missing_extension: false };
     let mut busy = false;
     loop {
         if !busy {

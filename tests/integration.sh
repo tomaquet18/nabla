@@ -27,6 +27,11 @@ q() { psql -X -q -A -t -v ON_ERROR_STOP=1 -p "$PORT" -d "$DB" -c "$1"; }
 # Run a statement expected to fail; print its stderr.
 q_err() { psql -X -q -A -t -p "$PORT" -d "$DB" -c "$1" 2>&1 >/dev/null; }
 
+# SQLSTATE of a failing statement (psql verbose error format: ERROR:  XX000: ...).
+sqlstate_of() { psql -X -q -A -t -v VERBOSITY=verbose -p "$PORT" -d "$DB" -c "$1" 2>&1 >/dev/null | grep -oE '^ERROR:  [A-Z0-9]{5}:' | head -n 1 | cut -c 9-13; }
+# nabla.changes(view, after_seq) with the view's current epoch.
+CH() { echo "nabla.changes('$1', $2, (SELECT epoch FROM nabla.status('$1')))"; }
+
 assert_eq() { # label expected actual
   if [ "$2" = "$3" ]; then pass "$1"; else fail "$1" "expected [$2], got [$3]"; fi
 }
@@ -41,6 +46,8 @@ cleanup() {
   if [ -f "$PGDATA/postmaster.pid" ]; then
     "$PG_BIN/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1
   fi
+  # Keep the server log for post-mortem analysis (target/ is a named volume).
+  cp "$LOG" /work/target/nabla-pg.log 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -147,9 +154,9 @@ esac
 assert_eq "k=999 final count" "5" "$(q "SELECT n FROM orders_by_k WHERE k = 999")"
 # 5 inserts into a fresh group produce 1 + 4*2 = 9 deltas, all from one source transaction.
 assert_eq "deltas of one source transaction share lsn and xid" "9|1|1" \
-  "$(q "SELECT count(*) || '|' || count(DISTINCT lsn) || '|' || count(DISTINCT xid) FROM nabla.changes('public.orders_by_k', $SEQ0)")"
+  "$(q "SELECT count(*) || '|' || count(DISTINCT lsn) || '|' || count(DISTINCT xid) FROM $(CH public.orders_by_k $SEQ0)")"
 assert_eq "last delta of the transaction is the final group row" "I|5" \
-  "$(q "SELECT op::text || '|' || (row->>'n') FROM nabla.changes('public.orders_by_k', $SEQ0) ORDER BY seq DESC LIMIT 1")"
+  "$(q "SELECT op || '|' || (row->>'n') FROM $(CH public.orders_by_k $SEQ0) ORDER BY seq DESC LIMIT 1")"
 
 # --- 4. writers are not blocked ---------------------------------------------
 echo "== 4. writers are not blocked"
@@ -177,16 +184,18 @@ echo "== 5. subscription cursor"
 SEQ0=$(q "SELECT nabla.current_seq('public.paid_orders')")
 for i in $(seq 1 10); do q "INSERT INTO orders (k, amount, status) VALUES (11, $i, 'paid')" >/dev/null; done
 wait_view public.paid_orders
-CHECK=$(q "SELECT count(*) || '|' || bool_and(seq = $SEQ0 + rn) || '|' || bool_and(lsn > prev_lsn) || '|' || bool_and(op = 'I')
+CHECK=$(q "SELECT count(*) || '|' || bool_and(seq = $SEQ0 + rn) || '|' || bool_and(lsn::pg_lsn > prev_lsn::pg_lsn) || '|' || bool_and(op = 'I')
   FROM (SELECT seq, lsn, op, row_number() OVER (ORDER BY seq) rn, lag(lsn, 1, '0/0') OVER (ORDER BY seq) prev_lsn
-        FROM nabla.changes('public.paid_orders', $SEQ0)) c")
+        FROM $(CH public.paid_orders $SEQ0)) c")
 assert_eq "changes() returns the 10 transactions in order with increasing seq and lsn" "10|true|true|true" "$CHECK"
-assert_eq "changes() past the cursor is empty" "0" "$(q "SELECT count(*) FROM nabla.changes('public.paid_orders', $SEQ0 + 10)")"
+assert_eq "changes() past the cursor is empty" "0" "$(q "SELECT count(*) FROM $(CH public.paid_orders $((SEQ0 + 10)))")"
 q "INSERT INTO orders (k, amount, status) SELECT 12, i, 'paid' FROM generate_series(1, 60) i" >/dev/null
 wait_view public.paid_orders
-ERR=$(q_err "SELECT count(*) FROM nabla.changes('public.paid_orders', 0)")
+ERR=$(q_err "SELECT count(*) FROM $(CH public.paid_orders 0)")
 assert_contains "changes() from a cursor older than retention raises the lagged error" \
   'nabla: subscriber lagged behind retention for view "public.paid_orders"' "$ERR"
+assert_contains "the lagged error names the oldest retained seq" 'DETAIL:  oldest retained seq is' "$ERR"
+assert_eq "the lagged error carries SQLSTATE NB001" "NB001" "$(sqlstate_of "SELECT count(*) FROM $(CH public.paid_orders 0)")"
 assert_eq "retention keeps at most 50 deltas" "t" "$(q "SELECT count(*) <= 50 FROM nabla.deltas d JOIN nabla.views v ON v.id = d.view_id WHERE v.name = 'public.paid_orders'")"
 
 # --- 6. rejections -----------------------------------------------------------
@@ -198,6 +207,7 @@ ERR=$(q_err "SELECT nabla.create_view('public.bad2', 'SELECT k, avg(amount) FROM
 assert_contains "avg() is rejected" "nabla: unsupported view definition" "$ERR"
 ERR=$(q_err "SELECT nabla.create_view('public.bad3', 'SELECT id, k FROM orders ORDER BY id')")
 assert_contains "ORDER BY is rejected" "nabla: unsupported view definition" "$ERR"
+assert_eq "rejections carry SQLSTATE NB004" "NB004" "$(sqlstate_of "SELECT nabla.create_view('public.bad3', 'SELECT id, k FROM orders ORDER BY id')")"
 ERR=$(q_err "SELECT nabla.create_view('public.bad4', 'SELECT k FROM orders')")
 assert_contains "projection without the primary key is rejected" "missing id" "$ERR"
 q "CREATE TABLE events (id int PRIMARY KEY, kind text, n int)" >/dev/null
@@ -210,6 +220,7 @@ ERR=$(q_err "INSERT INTO paid_orders VALUES (1, 1, 1)")
 assert_contains "direct INSERT into a view is rejected" "cannot modify a nabla view directly" "$ERR"
 ERR=$(q_err "DELETE FROM orders_by_k")
 assert_contains "direct DELETE from a view is rejected" "cannot modify a nabla view directly" "$ERR"
+assert_eq "direct writes carry SQLSTATE NB005" "NB005" "$(sqlstate_of "DELETE FROM orders_by_k")"
 
 # --- 8. refresh --------------------------------------------------------------
 echo "== 8. refresh"
@@ -217,6 +228,7 @@ EPOCH0=$(q "SELECT epoch FROM nabla.views WHERE name = 'public.orders_by_k'")
 CURSOR=$(q "SELECT nabla.current_seq('public.orders_by_k')")
 q "SELECT nabla.refresh('public.orders_by_k')" >/dev/null || die "refresh failed"
 EPOCH1=$(q "SELECT epoch FROM nabla.views WHERE name = 'public.orders_by_k'")
+CURSOR1=$(q "SELECT current_seq FROM nabla.status('public.orders_by_k')")
 assert_eq "refresh bumps the epoch" "$((EPOCH0 + 1))" "$EPOCH1"
 q "INSERT INTO orders (k, amount, status) VALUES (13, 3, 'paid')" >/dev/null
 wait_view public.orders_by_k
@@ -225,10 +237,11 @@ DIFF=$(q "SELECT count(*) FROM (
   UNION ALL
   (SELECT k, count(*), sum(amount) FROM orders WHERE status = 'paid' GROUP BY k EXCEPT SELECT k, n, total FROM orders_by_k)) d")
 assert_eq "aggregate view equals its query after refresh" "0" "$DIFF"
-ERR=$(q_err "SELECT count(*) FROM nabla.changes('public.orders_by_k', $CURSOR)")
-assert_contains "a cursor from before the refresh must resync" "lagged behind retention" "$ERR"
+ERR=$(q_err "SELECT count(*) FROM nabla.changes('public.orders_by_k', $CURSOR, $EPOCH0)")
+assert_contains "a cursor from before the refresh must resync (epoch changed, not lagged)" 'nabla: view "public.orders_by_k" epoch changed' "$ERR"
+assert_eq "the epoch error carries SQLSTATE NB003" "NB003" "$(sqlstate_of "SELECT count(*) FROM nabla.changes('public.orders_by_k', $CURSOR, $EPOCH0)")"
 # k=13 is a new group, so exactly one 'I' delta follows the refresh.
-assert_eq "a fresh cursor after refresh works" "1" "$(q "SELECT count(*) FROM nabla.changes('public.orders_by_k', (SELECT resync_seq FROM nabla.views WHERE name = 'public.orders_by_k'))")"
+assert_eq "a fresh cursor after refresh works" "1" "$(q "SELECT count(*) FROM $(CH public.orders_by_k $CURSOR1)")"
 
 # --- 9. idle worker generates no WAL -----------------------------------------
 echo "== 9. idle worker"
@@ -392,11 +405,13 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 assert_eq "the slot advanced past the failing transaction" "yes" "$SLOT_OK"
-ERR=$(q_err "SELECT count(*) FROM nabla.changes('public.bad', 0)")
-assert_contains "changes() on a stale view names the reason" 'nabla: view "public.bad" is stale: apply failed 3 times: division by zero' "$ERR"
-assert_contains "changes() on a stale view carries the refresh hint" "Run nabla.refresh('public.bad') after fixing the cause" "$ERR"
+ERR=$(q_err "SELECT count(*) FROM $(CH public.bad 0)")
+assert_contains "changes() on a stale view raises the stale error" 'nabla: view "public.bad" is stale' "$ERR"
+assert_contains "the stale error names the reason in DETAIL" 'DETAIL:  apply failed 3 times: division by zero' "$ERR"
+assert_contains "changes() on a stale view carries the refresh hint" "run nabla.refresh('public.bad') after fixing the cause" "$ERR"
+assert_eq "the stale error carries SQLSTATE NB002" "NB002" "$(sqlstate_of "SELECT count(*) FROM $(CH public.bad 0)")"
 ERR=$(q_err "SELECT nabla.wait_for('public.bad', pg_current_wal_lsn(), 100)")
-assert_contains "wait_for() on a stale view raises the stale error" 'nabla: view "public.bad" is stale: apply failed 3 times' "$ERR"
+assert_contains "wait_for() on a stale view raises the stale error" 'nabla: view "public.bad" is stale' "$ERR"
 assert_eq "frontier('bad') still returns the last absorbed LSN" "t" \
   "$(q "SELECT nabla.frontier('public.bad') >= '$F0'::pg_lsn AND nabla.frontier('public.bad') < '$L0'::pg_lsn")"
 ERR=$(q_err "SELECT nabla.refresh('public.bad')")
@@ -541,11 +556,11 @@ q "SELECT pg_reload_conf()" >/dev/null
 wait_view public.order_lines
 assert_eq "final state shows the new customer name" "Alicia|0" "$(q "SELECT customer FROM order_lines WHERE order_id = $NEW_ORDER")|$(lines_diff)"
 assert_eq "T1's delta carries the name as of T1 (read from the shadow), then T2's D/I pair" "I:Alice,D:Alice,I:Alicia" \
-  "$(q "SELECT string_agg(op::text || ':' || (row->>'customer'), ',' ORDER BY seq) FROM nabla.changes('public.order_lines', $SEQ0) WHERE (row->>'order_id')::bigint = $NEW_ORDER")"
+  "$(q "SELECT string_agg(op || ':' || (row->>'customer'), ',' ORDER BY seq) FROM $(CH public.order_lines $SEQ0) WHERE (row->>'order_id')::bigint = $NEW_ORDER")"
 assert_eq "T1 and T2 deltas carry distinct increasing LSNs" "2|true" \
-  "$(q "SELECT count(DISTINCT lsn) || '|' || (min(lsn) < max(lsn)) FROM nabla.changes('public.order_lines', $SEQ0)")"
+  "$(q "SELECT count(DISTINCT lsn) || '|' || (min(lsn::pg_lsn) < max(lsn::pg_lsn)) FROM $(CH public.order_lines $SEQ0)")"
 assert_eq "T2 rewrote every order of the customer" "3" \
-  "$(q "SELECT count(*) FROM nabla.changes('public.order_lines', $SEQ0) WHERE op = 'I' AND row->>'customer' = 'Alicia'")"
+  "$(q "SELECT count(*) FROM $(CH public.order_lines $SEQ0) WHERE op = 'I' AND row->>'customer' = 'Alicia'")"
 psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 1, 'paid'); SELECT pg_sleep(3); COMMIT" >/dev/null 2>&1 &
 WRITER_PID=$!
 sleep 0.5
@@ -646,6 +661,51 @@ wait "$CLIENT_PID"
 CLIENT_RC=$?
 CLIENT_PID=""
 assert_eq "client exits cleanly on SIGINT" "0|1" "$CLIENT_RC|$(grep -c '^interrupted$' "$OUT")"
+
+# --- 20. API contract ----------------------------------------------------------
+echo "== 20. API contract (epochs, SQLSTATEs, whole transactions, hidden columns)"
+CANON=$(q "SELECT nabla.create_view('Public.Canon_Test', 'SELECT id, k FROM orders')")
+assert_eq "create_view returns the canonical name and status() agrees" "public.canon_test|public.canon_test" \
+  "$CANON|$(q "SELECT name FROM nabla.status('PUBLIC.canon_test')")"
+wait_view public.canon_test
+EPOCH_C=$(q "SELECT epoch FROM nabla.status('public.canon_test')")
+CUR_C=$(q "SELECT current_seq FROM nabla.status('public.canon_test')")
+q "INSERT INTO orders (k, amount, status) VALUES (701, 1, 'paid')" >/dev/null
+q "INSERT INTO orders (k, amount, status) VALUES (702, 1, 'paid')" >/dev/null
+q "INSERT INTO orders (k, amount, status) SELECT 700, i, 'paid' FROM generate_series(1, 30) i" >/dev/null
+wait_view public.canon_test
+assert_eq "changes() never splits a transaction (30 rows, max_rows = 10)" "30|1" \
+  "$(q "SELECT count(*) || '|' || count(DISTINCT (xid, lsn)) FROM nabla.changes('public.canon_test', $((CUR_C + 2)), $EPOCH_C, 10)")"
+assert_eq "a page ending inside a transaction is extended to its end (2 + 30 rows for max_rows = 10)" "32|3" \
+  "$(q "SELECT count(*) || '|' || count(DISTINCT (xid, lsn)) FROM nabla.changes('public.canon_test', $CUR_C, $EPOCH_C, 10)")"
+assert_eq "a result shorter than max_rows is drained" "2|0" \
+  "$(q "SELECT count(*) FROM nabla.changes('public.canon_test', $CUR_C, $EPOCH_C, 2)")|$(q "SELECT count(*) FROM nabla.changes('public.canon_test', $((CUR_C + 32)), $EPOCH_C, 10)")"
+assert_eq "changes() rows use driver-friendly types" "bigint,text,bigint,text,jsonb" \
+  "$(q "SELECT string_agg(format_type(t.oid, NULL), ',' ORDER BY a.ord) FROM pg_proc p, unnest(p.proallargtypes) WITH ORDINALITY a(oid, ord) JOIN pg_type t ON t.oid = a.oid WHERE p.proname = 'changes' AND p.pronamespace = 'nabla'::regnamespace AND a.ord > 5")"
+q "SELECT nabla.refresh('public.canon_test')" >/dev/null || die "refresh(canon_test) failed"
+assert_eq "a refresh with a live cursor is reported as NB003, never as lagged" "NB003" \
+  "$(sqlstate_of "SELECT count(*) FROM nabla.changes('public.canon_test', $((CUR_C + 32)), $EPOCH_C)")"
+assert_contains "NB003 carries the epochs in DETAIL" "DETAIL:  epoch $EPOCH_C -> $((EPOCH_C + 1))" \
+  "$(q_err "SELECT count(*) FROM nabla.changes('public.canon_test', $((CUR_C + 32)), $EPOCH_C)")"
+assert_eq "the new epoch works with the current cursor" "0" \
+  "$(q "SELECT count(*) FROM nabla.changes('public.canon_test', (SELECT current_seq FROM nabla.status('public.canon_test')), $((EPOCH_C + 1)))")"
+assert_eq "visible_columns() lists the definition's output names" "{id,k}|{k,n,total}|{order_id,customer,product,total}" \
+  "$(q "SELECT nabla.visible_columns('public.canon_test')")|$(q "SELECT nabla.visible_columns('public.orders_by_k')")|$(q "SELECT nabla.visible_columns('public.order_lines')")"
+SEQ_K=$(q "SELECT current_seq FROM nabla.status('public.orders_by_k')")
+EPOCH_K=$(q "SELECT epoch FROM nabla.status('public.orders_by_k')")
+q "INSERT INTO orders (k, amount, status) VALUES (703, 2, 'paid')" >/dev/null
+wait_view public.orders_by_k
+assert_eq "delta rows hide _nabla_* columns by default and expose them with include_hidden" "f|t" \
+  "$(q "SELECT bool_or(row ? '_nabla_nn_1') FROM nabla.changes('public.orders_by_k', $SEQ_K, $EPOCH_K)")|$(q "SELECT bool_or(row ? '_nabla_nn_1') FROM nabla.changes('public.orders_by_k', $SEQ_K, $EPOCH_K, 1000, true)")"
+# The first call waits on the WAL position after the worker's own bookkeeping
+# commit: it is satisfied through the idle window, not through a user write.
+assert_eq "wait_for() accepts the text LSN form" "t|t" \
+  "$(q "SELECT nabla.wait_for('public.orders_by_k', pg_current_wal_lsn()::text, 5000)")|$(q "SELECT nabla.wait_for('public.orders_by_k', (SELECT frontier FROM nabla.status('public.orders_by_k')), 5000)")"
+assert_eq "SQLSTATE NB004 for unsupported definitions" "NB004" "$(sqlstate_of "SELECT nabla.create_view('public.x', 'SELECT DISTINCT id FROM orders')")"
+assert_eq "SQLSTATE NB005 for direct writes" "NB005" "$(sqlstate_of "DELETE FROM canon_test")"
+assert_eq "the client branches on SQLSTATEs, never on message text" "0" \
+  "$(grep -cE 'lagged behind|is stale' /work/clients/rust/nabla-client/src/lib.rs)"
+q "SELECT nabla.drop_view('public.canon_test')" >/dev/null
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

@@ -2,18 +2,20 @@
 //!
 //! The protocol, as implemented by [`Subscription`]:
 //!
-//! 1. Connect and `LISTEN "nabla:<view>"` (the channel is the qualified view
-//!    name as stored in `nabla.views.name`).
+//! 1. Connect, read the canonical view name from `nabla.status(view)` and
+//!    `LISTEN "nabla:<name>"`.
 //! 2. Bootstrap atomically: in one `REPEATABLE READ` transaction read
-//!    `nabla.status(view)` and `SELECT * FROM <view>`, and emit
-//!    [`Event::Snapshot`] whose `cursor` is the view's current sequence number.
+//!    `nabla.status(view)`, `nabla.visible_columns(view)` and the view's rows,
+//!    and emit [`Event::Snapshot`] whose `cursor` is the view's current
+//!    sequence number and whose `epoch` every later `changes()` call carries.
 //! 3. Follow: on every notification, and on a fallback timer, call
-//!    `nabla.changes(view, cursor, batch)` until it returns fewer rows than
-//!    `batch`; consecutive rows sharing `(xid, lsn)` form one
-//!    [`Event::Transaction`]; the cursor advances only after the event was
-//!    handed to the caller.
-//! 4. Resync: a `lagged` error, a `stale` error, an epoch change, or a lost
-//!    connection produce [`Event::Resync`] followed by a new bootstrap.
+//!    `nabla.changes(view, cursor, epoch, batch)` until it returns fewer rows
+//!    than `batch` (the server never splits a transaction); consecutive rows
+//!    sharing `(xid, lsn)` form one [`Event::Transaction`]; the cursor
+//!    advances only after the event was handed to the caller.
+//! 4. Resync: SQLSTATE `NB001` (lagged), `NB002` (stale) or `NB003` (epoch
+//!    changed), or a lost connection, produce [`Event::Resync`] followed by a
+//!    new bootstrap. No error message text is ever inspected.
 //!
 //! Buffers are bounded: at most one batch plus the trailing (possibly
 //! incomplete) transaction is held, and notifications are coalesced.
@@ -26,6 +28,10 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_postgres::{AsyncMessage, Client, IsolationLevel, NoTls};
+
+pub const SQLSTATE_LAGGED: &str = "NB001";
+pub const SQLSTATE_STALE: &str = "NB002";
+pub const SQLSTATE_EPOCH_CHANGED: &str = "NB003";
 
 #[derive(Debug)]
 pub enum Error {
@@ -71,11 +77,11 @@ pub struct Delta {
 
 #[derive(Debug, Clone)]
 pub enum ResyncReason {
-    /// The cursor fell behind `nabla.retain_deltas`.
+    /// The cursor fell behind `nabla.retain_deltas` (NB001).
     Lagged,
-    /// The view was refreshed (`nabla.refresh`).
+    /// The view was refreshed (NB003).
     EpochChanged { from: i32, to: i32 },
-    /// The view is no longer maintained; bootstrap is retried with backoff.
+    /// The view is no longer maintained (NB002); bootstrap retries with backoff.
     Stale { reason: String },
     /// The connection was lost and re-established.
     Disconnected,
@@ -101,11 +107,11 @@ pub enum Event {
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Rows per `nabla.changes` call.
+    /// Rows per `nabla.changes` call (a trailing transaction may exceed it).
     pub batch: i32,
     /// Fallback poll when no notification arrives.
     pub poll_interval: Duration,
-    /// Keep the `_nabla_*` columns in snapshot rows and deltas.
+    /// Include the `_nabla_*` maintenance columns in snapshot rows and deltas.
     pub keep_hidden: bool,
     /// Longest wait between bootstrap attempts on a stale view.
     pub max_backoff: Duration,
@@ -129,7 +135,6 @@ struct ChangeRow {
     xid: Option<i64>,
     op: Op,
     row: Value,
-    epoch: i32,
 }
 
 enum State {
@@ -140,6 +145,7 @@ enum State {
 enum Failure {
     Lagged,
     Stale(String),
+    EpochChanged { from: i32, to: i32 },
     Disconnected,
     Other(Error),
 }
@@ -155,36 +161,34 @@ fn quote_view(view: &str) -> String {
     }
 }
 
-fn strip_hidden(mut row: Value, keep: bool) -> Value {
-    if !keep {
-        if let Value::Object(map) = &mut row {
-            map.retain(|k, _| !k.starts_with("_nabla_"));
+/// Classify a server error by SQLSTATE only.
+fn classify(e: tokio_postgres::Error, epoch: i32) -> Failure {
+    let Some(db) = e.as_db_error() else {
+        // Anything that is not a server-reported error is a transport problem.
+        return Failure::Disconnected;
+    };
+    match db.code().code() {
+        SQLSTATE_LAGGED => Failure::Lagged,
+        SQLSTATE_STALE => Failure::Stale(db.detail().unwrap_or("reason not recorded").to_string()),
+        SQLSTATE_EPOCH_CHANGED => {
+            // DETAIL is "epoch N -> M"; the client's epoch is N.
+            let to = db
+                .detail()
+                .and_then(|d| d.rsplit(' ').next())
+                .and_then(|m| m.parse::<i32>().ok())
+                .unwrap_or(epoch);
+            Failure::EpochChanged { from: epoch, to }
         }
+        _ => Failure::Other(Error::Postgres(e)),
     }
-    row
-}
-
-fn classify(e: tokio_postgres::Error) -> Failure {
-    if let Some(db) = e.as_db_error() {
-        let message = db.message();
-        if message.contains("lagged behind retention") {
-            return Failure::Lagged;
-        }
-        if let Some((_, reason)) = message.split_once(" is stale: ") {
-            return Failure::Stale(reason.to_string());
-        }
-        return Failure::Other(Error::Postgres(e));
-    }
-    // Anything that is not a server-reported error is a transport problem.
-    Failure::Disconnected
 }
 
 pub struct Subscription {
     config: String,
+    /// Canonical view name as stored by nabla (`nabla.status(...).name`).
     view: String,
     options: Options,
     conn: Option<Conn>,
-    connected_once: bool,
     state: State,
     epoch: i32,
     cursor: i64,
@@ -205,10 +209,9 @@ impl Subscription {
     pub async fn open_with(config: &str, view: &str, options: Options) -> Result<Self> {
         let mut sub = Subscription {
             config: config.to_string(),
-            view: view.trim().to_lowercase(),
+            view: view.trim().to_string(),
             options,
             conn: None,
-            connected_once: false,
             state: State::NeedBootstrap,
             epoch: 0,
             cursor: 0,
@@ -237,9 +240,11 @@ impl Subscription {
             }
             // Dropping `tx` closes the channel: the subscription sees Disconnected.
         });
+        // The channel is derived from the canonical name nabla stores.
+        let row = client.query_one("SELECT name FROM nabla.status($1)", &[&self.view]).await?;
+        self.view = row.get(0);
         client.batch_execute(&format!("LISTEN {}", quote_ident(&format!("nabla:{}", self.view)))).await?;
         self.conn = Some(Conn { client, notifications: rx });
-        self.connected_once = true;
         self.state = State::NeedBootstrap;
         self.tail.clear();
         Ok(())
@@ -256,6 +261,12 @@ impl Subscription {
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(5));
         }
+    }
+
+    fn resync(&mut self, reason: ResyncReason) {
+        self.pending.push_back((Event::Resync { reason }, None));
+        self.tail.clear();
+        self.state = State::NeedBootstrap;
     }
 
     /// The next event. Blocks until a transaction arrives; a lost notification
@@ -281,7 +292,7 @@ impl Subscription {
                     }
                     Err(Failure::Disconnected) => self.conn = None,
                     Err(Failure::Other(e)) => return Err(e),
-                    Err(Failure::Lagged) | Err(Failure::Stale(_)) => {}
+                    Err(_) => {}
                 },
                 State::Following => {
                     if self.tail.is_empty() && !self.wait_for_wakeup().await {
@@ -290,20 +301,9 @@ impl Subscription {
                     }
                     match self.fetch().await {
                         Ok(()) => {}
-                        Err(Failure::Lagged) => {
-                            let reason = match self.current_epoch().await {
-                                Ok(Some(to)) if to != self.epoch => ResyncReason::EpochChanged { from: self.epoch, to },
-                                _ => ResyncReason::Lagged,
-                            };
-                            self.pending.push_back((Event::Resync { reason }, None));
-                            self.tail.clear();
-                            self.state = State::NeedBootstrap;
-                        }
-                        Err(Failure::Stale(reason)) => {
-                            self.pending.push_back((Event::Resync { reason: ResyncReason::Stale { reason } }, None));
-                            self.tail.clear();
-                            self.state = State::NeedBootstrap;
-                        }
+                        Err(Failure::Lagged) => self.resync(ResyncReason::Lagged),
+                        Err(Failure::Stale(reason)) => self.resync(ResyncReason::Stale { reason }),
+                        Err(Failure::EpochChanged { from, to }) => self.resync(ResyncReason::EpochChanged { from, to }),
                         Err(Failure::Disconnected) => {
                             self.tail.clear();
                             self.conn = None;
@@ -329,11 +329,12 @@ impl Subscription {
         }
     }
 
-    /// One REPEATABLE READ transaction: status and full content from the same
-    /// snapshot. Returns the stale reason and the backoff to sleep when the
-    /// view is stale.
+    /// One REPEATABLE READ transaction: status, visible columns and content
+    /// from the same snapshot. Returns the stale reason and the backoff to
+    /// sleep for a stale view.
     async fn bootstrap(&mut self) -> std::result::Result<Option<(String, Duration)>, Failure> {
         let keep = self.options.keep_hidden;
+        let view = self.view.clone();
         let conn = self.conn.as_mut().ok_or(Failure::Other(Error::NotConnected))?;
         let result: std::result::Result<Option<Event>, tokio_postgres::Error> = async {
             let tx = conn
@@ -345,8 +346,8 @@ impl Subscription {
                 .await?;
             let status = tx
                 .query_one(
-                    "SELECT status, epoch, frontier_lsn::text, current_seq, stale_reason FROM nabla.status($1)",
-                    &[&self.view],
+                    "SELECT status, epoch, frontier, current_seq, stale_reason FROM nabla.status($1)",
+                    &[&view],
                 )
                 .await?;
             let state: String = status.get(0);
@@ -360,9 +361,16 @@ impl Subscription {
             let epoch: i32 = status.get(1);
             let frontier: String = status.get(2);
             let cursor: i64 = status.get(3);
-            let rows = tx.query(&format!("SELECT to_jsonb(v) FROM {} AS v", quote_view(&self.view)), &[]).await?;
+            let sql = if keep {
+                format!("SELECT to_jsonb(v) FROM {} AS v", quote_view(&view))
+            } else {
+                let columns: Vec<String> = tx.query_one("SELECT nabla.visible_columns($1)", &[&view]).await?.get(0);
+                let list: Vec<String> = columns.iter().map(|c| quote_ident(c)).collect();
+                format!("SELECT to_jsonb(v) FROM (SELECT {} FROM {}) AS v", list.join(", "), quote_view(&view))
+            };
+            let rows = tx.query(&sql, &[]).await?;
             tx.commit().await?;
-            let rows = rows.into_iter().map(|r| strip_hidden(r.get::<_, Value>(0), keep)).collect();
+            let rows = rows.into_iter().map(|r| r.get::<_, Value>(0)).collect();
             Ok(Some(Event::Snapshot { epoch, frontier, cursor, rows }))
         }
         .await;
@@ -382,14 +390,8 @@ impl Subscription {
                 Ok(None)
             }
             Ok(_) => Ok(None),
-            Err(e) => Err(classify(e)),
+            Err(e) => Err(classify(e, self.epoch)),
         }
-    }
-
-    async fn current_epoch(&mut self) -> Result<Option<i32>> {
-        let conn = self.conn.as_mut().ok_or(Error::NotConnected)?;
-        let row = conn.client.query_opt("SELECT epoch FROM nabla.status($1)", &[&self.view]).await?;
-        Ok(row.map(|r| r.get(0)))
     }
 
     /// Fetch one batch after the last known row and turn complete
@@ -397,16 +399,19 @@ impl Subscription {
     async fn fetch(&mut self) -> std::result::Result<(), Failure> {
         let after = self.tail.last().map_or(self.cursor, |r| r.seq);
         let batch = self.options.batch;
+        let epoch = self.epoch;
         let keep = self.options.keep_hidden;
         let conn = self.conn.as_mut().ok_or(Failure::Other(Error::NotConnected))?;
         let rows = conn
             .client
             .query(
-                "SELECT seq, lsn::text, xid, op::text, row, epoch FROM nabla.changes($1, $2, $3)",
-                &[&self.view, &after, &batch],
+                "SELECT seq, lsn, xid, op, row FROM nabla.changes($1, $2, $3, $4, $5)",
+                &[&self.view, &after, &epoch, &batch, &keep],
             )
             .await
-            .map_err(classify)?;
+            .map_err(|e| classify(e, epoch))?;
+        // The server returns whole transactions; a trailing one may exceed
+        // `batch`, so "full" means "possibly more after this".
         let full = rows.len() as i32 >= batch;
         let mut expected = after + 1;
         let mut parsed = Vec::with_capacity(rows.len());
@@ -424,14 +429,7 @@ impl Subscription {
                 "D" => Op::Delete,
                 other => return Err(Failure::Other(Error::Protocol(format!("unknown op {other:?}")))),
             };
-            parsed.push(ChangeRow {
-                seq,
-                lsn: r.get(1),
-                xid: r.get(2),
-                op,
-                row: strip_hidden(r.get(4), keep),
-                epoch: r.get(5),
-            });
+            parsed.push(ChangeRow { seq, lsn: r.get(1), xid: r.get(2), op, row: r.get(4) });
         }
         let mut all = std::mem::take(&mut self.tail);
         all.extend(parsed);
@@ -446,25 +444,16 @@ impl Subscription {
             }
         }
         if full {
-            // The last group may continue in the next batch.
+            // Defensive: the server promises whole transactions, but keep the
+            // last group until the next call confirms nothing continues it.
             if let Some(tail) = groups.pop() {
                 self.tail = tail;
             }
         }
         for group in groups {
-            if let Some(other) = group.iter().find(|r| r.epoch != self.epoch) {
-                self.pending.push_back((
-                    Event::Resync { reason: ResyncReason::EpochChanged { from: self.epoch, to: other.epoch } },
-                    None,
-                ));
-                self.tail.clear();
-                self.state = State::NeedBootstrap;
-                return Ok(());
-            }
             let last_seq = group.last().map(|r| r.seq).expect("non-empty group");
             let xid = group[0].xid;
             let lsn = group[0].lsn.clone();
-            let epoch = group[0].epoch;
             let deltas = group.into_iter().map(|r| Delta { seq: r.seq, op: r.op, row: r.row }).collect();
             self.pending.push_back((Event::Transaction { xid, lsn, epoch, deltas }, Some(last_seq)));
         }
@@ -472,15 +461,21 @@ impl Subscription {
     }
 
     /// Read-your-writes: block until the view's frontier reaches `lsn`
-    /// (typically `pg_current_wal_lsn()` right after a commit).
+    /// (the `X/Y` text form, for example `pg_current_wal_lsn()::text` taken
+    /// right after a commit, or a `lsn` from a delta).
     pub async fn wait_for(&self, lsn: &str, timeout: Duration) -> Result<bool> {
         let conn = self.conn.as_ref().ok_or(Error::NotConnected)?;
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         let row = conn
             .client
-            .query_one("SELECT nabla.wait_for($1, $2::pg_lsn, $3)", &[&self.view, &lsn, &timeout_ms])
+            .query_one("SELECT nabla.wait_for($1, $2::text, $3)", &[&self.view, &lsn, &timeout_ms])
             .await?;
         Ok(row.get(0))
+    }
+
+    /// The canonical view name (as stored by nabla).
+    pub fn view(&self) -> &str {
+        &self.view
     }
 
     pub fn cursor(&self) -> i64 {
