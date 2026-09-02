@@ -6,6 +6,7 @@
 #   scripts/dev.sh test     install the extension and run tests/integration.sh
 #   scripts/dev.sh unit     run the Rust unit tests (cargo test --lib)
 #   scripts/dev.sh bench    worker throughput benchmark (scripts/bench.sh)
+#   scripts/dev.sh h2h      head-to-head benchmark against pg_ivm (bench/head-to-head)
 #   scripts/dev.sh client   build the reference client (clients/rust/nabla-client, release)
 #   scripts/dev.sh shell    interactive shell inside the container
 #   scripts/dev.sh run CMD  run an arbitrary command inside the container
@@ -49,6 +50,14 @@ case "$cmd" in
   bench)
     run_in_container $(common_args) -e BACKLOG -e DRAIN_CAP_S "$IMAGE" bash -c "sudo chown -R dev:dev /work/target /usr/local/cargo/registry && bash scripts/bench.sh"
     ;;
+  h2h)
+    # Head-to-head benchmark against pg_ivm. Its image is the dev image plus
+    # pg_ivm, built from bench/head-to-head/Dockerfile.
+    MSYS_NO_PATHCONV=1 docker build -t nabla-h2h:17 "$REPO_DIR/bench/head-to-head" >/dev/null       || { echo "docker build of nabla-h2h:17 failed" >&2; exit 1; }
+    HOST_INFO=$(docker info --format '{{.ServerVersion}} on {{.OperatingSystem}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes RAM' 2>/dev/null || echo unknown)
+    NABLA_COMMIT=$(git -C "$(dirname "$0")/.." rev-parse --short HEAD 2>/dev/null || echo unknown)
+    run_in_container $(common_args)       -e "H2H_HOST_INFO=$HOST_INFO" -e "H2H_NABLA_COMMIT=$NABLA_COMMIT"       -e DURATION -e REPS -e CLIENTS -e ORDERS -e ARMS -e WORKLOADS       nabla-h2h:17 bash -c       "sudo chown -R dev:dev /work/target /usr/local/cargo/registry && bash bench/head-to-head/run.sh"
+    ;;
   unit)
     # Plain Rust unit tests. cargo pgrx test (the #[pg_test] harness) does not
     # run reliably in this container; SQL-level coverage lives in tests/integration.sh.
@@ -72,7 +81,7 @@ case "$cmd" in
     run_in_container $(common_args) "$IMAGE" bash -c "$*"
     ;;
   *)
-    echo "usage: $0 {build|test|unit|bench|client|shell|run CMD}" >&2
+    echo "usage: $0 {build|test|unit|bench|h2h|client|shell|run CMD}" >&2
     exit 2
     ;;
 esac

@@ -45,32 +45,65 @@ Nobody waits for anybody.
 
 ## It does not slow your writes down
 
-That is the whole point, so it is the first thing to measure. `scripts/dev.sh
-bench` runs pgbench single-row `INSERT` transactions against a table with two
-live three-table join views on it, and against an identical table with none:
+That is the whole claim, so it is the first thing to measure — against the
+alternative, not against nothing. `bench/head-to-head` runs the same view, on
+the same dataset, on the same PostgreSQL 17 server binary, three ways: with no
+derived view at all, maintained by [pg_ivm](https://github.com/sraoss/pg_ivm)
+(the established incremental-view extension, which does the work inside the
+writing transaction), and maintained by nabla.
 
-| pgbench clients | inserts/s, no views | inserts/s, two live join views | retained |
+Inserts into `orders`, transactions per second:
+
+| pgbench clients | no view | pg_ivm | nabla |
 |---:|---:|---:|---:|
-| 1 | 849 | 840 | **99%** |
-| 4 | 1772 | 1700 | **96%** |
-| 16 | 6461 | 6378 | **99%** |
+| 1 | 857 | 681 | 857 |
+| 4 | 1796 | 716 | 1803 |
+| 16 | 6335 | 677 | 6591 |
 
-Nothing runs in the writer's commit path — not a trigger, not a lock, not even
-while a view is being created or rebuilt. A background worker reads the WAL
-through a logical replication slot and does the work on its own time,
-currently around **1300 source transactions per second**; a backlog of 20 000
-single-row transactions drains in 15 seconds.
+Read the pg_ivm column downwards: it does not move. Adding writers does not add
+throughput, because each one waits for an exclusive lock on the view while it is
+maintained. By sixteen clients that is **11% of what the same hardware does
+without a view** — and the same shape shows up on the other two workloads, where
+pg_ivm holds at 573 tps updating `orders` and 461 tps updating `customers`
+against baselines of 6785 and 6804. Two independent full runs agree on this
+within two points.
 
-For contrast, the same style of test against
-[pg_ivm](https://github.com/sraoss/pg_ivm), which maintains views synchronously
-inside the writing transaction, retained 77% of throughput at one client and
-**9.8% at sixteen**: every writer serialises on an exclusive lock on the view,
-so the curve gets worse exactly when you need it not to. That measurement used a
-simpler single-table aggregate, so read the shape of the curve rather than the
-absolute numbers.
+nabla's writers track the no-view baseline instead of flattening. How closely is
+below the noise of the test host: across those two runs nabla measured between
+71% and 104% of the baseline on the insert and update-`orders` workloads, with
+the baseline itself swinging as much as the difference being measured. Take the
+honest reading — nabla does not make writers wait, and its cost, whatever it is
+exactly, does not grow with concurrency.
 
-Numbers are from a laptop under Docker Desktop for Windows; run
-`scripts/dev.sh bench` to get your own.
+## What that costs you
+
+Staleness, and it is not small. nabla moves the maintenance work off the writer;
+it does not make the work disappear. After ten seconds of writes at sixteen
+clients, this is how long the view took to become current again:
+
+| workload | catch-up after a 10 s burst |
+|---|---:|
+| insert into `orders` | 43 s |
+| update `orders` | 88 s |
+| update `customers` (one row, many groups) | **16 min** |
+
+The last row is the honest worst case: changing one customer's region rewrites
+every group row that customer contributed to. nabla's writers pay nothing for it
+(95–108% of baseline in both runs) and the worker pays all of it — at that write
+rate the worker never catches up while the writers keep going, and the lag grows
+until the slot cap marks the view stale. pg_ivm pays the same fan-out, but
+synchronously and in front of the user: 7% of baseline throughput, with a view
+that is correct at commit.
+
+Neither column is a score. pg_ivm spends write throughput to buy freshness;
+nabla spends freshness to buy write throughput. Pick the one your workload can
+afford.
+
+Full tables, spreads, methodology and the exact configuration of every arm are
+in [`bench/head-to-head/RESULTS.md`](bench/head-to-head/RESULTS.md); reproduce
+them with `scripts/dev.sh h2h`. The worker currently applies about **1300 source
+transactions per second** on this host (`scripts/dev.sh bench`), which is the
+number that decides how quickly the lag above drains.
 
 ## It tells you what changed
 
@@ -486,6 +519,11 @@ single-row backlog. On a laptop under Docker Desktop for Windows:
 | worker drain rate, source transactions per second | 22 | 1333 |
 | 20k single-row backlog | not drained in 120 s (2729 applied) | drained in 15.0 s |
 | per round of 1667 single-row transactions | - | peek and decode 10-70 ms, apply 1.1-1.3 s, slot advance 5-50 ms |
+
+The writer-throughput row of that table exists only to show the change did not
+make writers worse; it is a single run and its spread is as wide as the effect.
+For the writer-side comparison, use the repeated, three-armed measurement in
+[`bench/head-to-head`](bench/head-to-head/RESULTS.md) instead.
 
 The step-by-step gains on the same script: one worker transaction and one
 slot advance per round took the drain rate from 22 to 1000 tx/s; kept SPI
