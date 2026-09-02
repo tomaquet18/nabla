@@ -1,9 +1,113 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="" width="112">
+
 # nabla
 
-Incrementally maintained views for PostgreSQL that never block writers, with
-real-time delta subscriptions. A PostgreSQL 17 extension written in Rust
-(pgrx). Version 0.1 is a walking skeleton: small on purpose, correct on what it
-accepts, explicit about what it rejects.
+**Materialized views for PostgreSQL that stay current without ever blocking your
+writers — and that your application can subscribe to.**
+
+[![License](https://img.shields.io/badge/extension-AGPL--3.0--or--later-1D4ED8)](LICENSE)
+[![Client license](https://img.shields.io/badge/client-MIT%20OR%20Apache--2.0-0284C7)](clients/rust/nabla-client)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-336791)](https://www.postgresql.org/)
+[![Rust](https://img.shields.io/badge/Rust-pgrx%200.17-EA580C)](https://github.com/pgcentralfoundation/pgrx)
+
+</div>
+
+---
+
+You have a query that is too expensive to run on every request: a join across a
+few tables with a `GROUP BY` on top. The usual answers are a materialized view
+on a cron job — stale between refreshes, and the refresh locks readers out — or
+a cache you invalidate by hand, which is wrong eventually.
+
+nabla keeps that query materialized as an ordinary PostgreSQL view, updates it
+from the write-ahead log milliseconds after each commit, and hands your
+application the exact rows that changed.
+
+```sql
+CREATE EXTENSION nabla;
+
+SELECT nabla.create_view('revenue_by_region', $$
+  SELECT c.region, count(*) AS orders, sum(o.qty * p.price) AS revenue
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+    JOIN products  p ON p.id = o.product_id
+   WHERE o.status = 'paid'
+   GROUP BY c.region
+$$);
+
+SELECT * FROM revenue_by_region;   -- an ordinary view, always up to date
+```
+
+Then write to `orders`, `customers` or `products` exactly as you always have.
+Nobody waits for anybody.
+
+## It does not slow your writes down
+
+That is the whole point, so it is the first thing to measure. `scripts/dev.sh
+bench` runs pgbench single-row `INSERT` transactions against a table with two
+live three-table join views on it, and against an identical table with none:
+
+| pgbench clients | inserts/s, no views | inserts/s, two live join views | retained |
+|---:|---:|---:|---:|
+| 1 | 849 | 840 | **99%** |
+| 4 | 1772 | 1700 | **96%** |
+| 16 | 6461 | 6378 | **99%** |
+
+Nothing runs in the writer's commit path — not a trigger, not a lock, not even
+while a view is being created or rebuilt. A background worker reads the WAL
+through a logical replication slot and does the work on its own time,
+currently around **1300 source transactions per second**; a backlog of 20 000
+single-row transactions drains in 15 seconds.
+
+For contrast, the same style of test against
+[pg_ivm](https://github.com/sraoss/pg_ivm), which maintains views synchronously
+inside the writing transaction, retained 77% of throughput at one client and
+**9.8% at sixteen**: every writer serialises on an exclusive lock on the view,
+so the curve gets worse exactly when you need it not to. That measurement used a
+simpler single-table aggregate, so read the shape of the curve rather than the
+absolute numbers.
+
+Numbers are from a laptop under Docker Desktop for Windows; run
+`scripts/dev.sh bench` to get your own.
+
+## It tells you what changed
+
+A view is only half of it. Every applied transaction also appends its deltas to
+a bounded, durable log, so a client can follow the view instead of polling it:
+
+```
+$ follow "host=/tmp dbname=shop" revenue_by_region
+snapshot: rows=5 epoch=1 frontier=0/19BF970 cursor=0
+tx lsn=0/19C01F0 xid=761 deltas=2
+  1 -{"orders":2,"region":"AR","revenue":120}
+  2 +{"orders":3,"region":"AR","revenue":150}
+```
+
+One batch per source transaction, in commit order, netted: you get the state
+before and the state after, never an intermediate row that was never committed.
+
+## What it guarantees
+
+A view always equals its defining query evaluated at **some committed snapshot**
+of the base tables — never half a transaction, never a torn join. Each view
+carries a `frontier_lsn` naming exactly which snapshot that is, so "eventually
+consistent" becomes a contract you can check, and `nabla.wait_for()` gives you
+read-your-writes when you need it.
+
+Everything is bounded on purpose. A subscriber that falls too far behind is told
+so and resyncs; a replication slot that grows past its cap marks views stale
+rather than filling your disk; a view whose maintenance keeps failing goes stale
+alone, without stopping the others.
+
+## Status
+
+Version 0.1 is a walking skeleton: small on purpose, correct about what it
+accepts, explicit about what it rejects. It is covered by 284 integration
+assertions but has no production mileage yet. See
+[what it accepts](#v01-scope-two-accepted-shapes) and
+[what it does not do yet](#not-yet).
 
 ## Three decisions
 
@@ -32,38 +136,9 @@ Two safety rules keep everything bounded:
   worker marks every view `stale` and drops the slot rather than fill the disk;
   `nabla.refresh()` rebuilds a view and recreates the slot.
 
-### Failure isolation
-
-Every source transaction is applied to each view in its own subtransaction
-of the worker's round transaction. If applying a source transaction to one
-view raises (for example `100 / k` meeting `k = 0`), only that view's
-subtransaction is rolled back; the other views absorb the transaction and
-advance. The failing view keeps the frontier of the last transaction it
-absorbed (healthy transactions earlier in the same round are kept);
-`apply_failures` is incremented once per round and `last_error` /
-`last_error_at` record the PostgreSQL error. The round stops after that
-transaction and the slot is advanced to just before it, so the view is
-retried on the next poll while healthy views skip the transaction through
-their frontier.
-After `nabla.max_apply_failures` consecutive failures (default 3) the view is
-marked `stale` with `stale_reason = 'apply failed N times: <error>'`, one
-WARNING is logged, the slot advances and everything else continues. Damage is
-bounded to `max_apply_failures x poll_interval`. A success on retry resets the
-counter.
-
-Observe it with
-`SELECT name, status, apply_failures, last_error, last_error_at, stale_reason FROM nabla.views`.
-`nabla.changes()` and `nabla.wait_for()` on a stale view raise
-`nabla: view "<name>" is stale: <reason>` with a hint to run
-`nabla.refresh('<name>')` after fixing the cause; `nabla.frontier()` keeps
-returning the last absorbed LSN. `refresh` rebuilds the table from the current
-data and clears the bookkeeping; if the definition still fails on the current
-rows, refresh surfaces PostgreSQL's error and the view stays stale, which is
-the correct outcome until the data or the definition is fixed.
-
 ## v0.1 scope: two accepted shapes
 
-One base table per view. Definitions are parsed and analyzed by PostgreSQL
+Definitions are parsed and analyzed by PostgreSQL
 itself (`raw_parser` + `parse_analyze`), so quoted and mixed-case identifiers,
 aliases, schema-qualified names, comments and string literals all behave
 exactly as in `psql`; the shape decision is made on the analyzed query tree
@@ -324,6 +399,36 @@ Events a client should surface: `Snapshot { epoch, frontier, cursor, rows }`,
 `Transaction { xid, lsn, epoch, deltas[] }` and `Resync { reason }` where the
 reason is one of lagged, epoch changed, stale (with the reason) or
 disconnected. Keep buffers bounded: one batch plus the trailing transaction.
+
+## Failure isolation
+
+
+Every source transaction is applied to each view in its own subtransaction
+of the worker's round transaction. If applying a source transaction to one
+view raises (for example `100 / k` meeting `k = 0`), only that view's
+subtransaction is rolled back; the other views absorb the transaction and
+advance. The failing view keeps the frontier of the last transaction it
+absorbed (healthy transactions earlier in the same round are kept);
+`apply_failures` is incremented once per round and `last_error` /
+`last_error_at` record the PostgreSQL error. The round stops after that
+transaction and the slot is advanced to just before it, so the view is
+retried on the next poll while healthy views skip the transaction through
+their frontier.
+After `nabla.max_apply_failures` consecutive failures (default 3) the view is
+marked `stale` with `stale_reason = 'apply failed N times: <error>'`, one
+WARNING is logged, the slot advances and everything else continues. Damage is
+bounded to `max_apply_failures x poll_interval`. A success on retry resets the
+counter.
+
+Observe it with
+`SELECT name, status, apply_failures, last_error, last_error_at, stale_reason FROM nabla.views`.
+`nabla.changes()` and `nabla.wait_for()` on a stale view raise
+`nabla: view "<name>" is stale: <reason>` with a hint to run
+`nabla.refresh('<name>')` after fixing the cause; `nabla.frontier()` keeps
+returning the last absorbed LSN. `refresh` rebuilds the table from the current
+data and clears the bookkeeping; if the definition still fails on the current
+rows, refresh surfaces PostgreSQL's error and the view stays stale, which is
+the correct outcome until the data or the definition is fixed.
 
 ## Performance
 

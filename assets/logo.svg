@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="title">
+  <title id="title">nabla</title>
+  <defs>
+    <linearGradient id="pgStream" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3B82F6" />
+      <stop offset="100%" stop-color="#1D4ED8" />
+    </linearGradient>
+    <linearGradient id="cyanFrontier" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06B6D4" />
+      <stop offset="100%" stop-color="#0284C7" />
+    </linearGradient>
+    <linearGradient id="rustDelta" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F97316" />
+      <stop offset="100%" stop-color="#EA580C" />
+    </linearGradient>
+  </defs>
+
+  <!-- Base tables: the state the views are derived from. -->
+  <path d="M 80 120 L 432 120 C 442 120 448 130 442 138 L 412 180 C 408 186 400 190 392 190 L 120 190 C 112 190 104 186 100 180 L 70 138 C 64 130 70 120 80 120 Z" fill="url(#pgStream)" />
+
+  <!-- The worker: logical decoding, incremental maintenance. -->
+  <path d="M 134 210 L 378 210 C 388 210 394 220 388 228 L 322 320 C 318 326 310 330 302 330 L 210 330 C 202 330 194 326 190 320 L 124 228 C 118 220 124 210 134 210 Z" fill="url(#cyanFrontier)" />
+
+  <!-- The delta log: what subscribers receive, at the frontier LSN. -->
+  <path d="M 212 350 L 300 350 C 308 350 314 360 308 368 L 264 430 C 260 436 252 436 248 430 L 204 368 C 198 360 204 350 212 350 Z" fill="url(#rustDelta)" />
+</svg>
