@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Decoder for the pgoutput binary protocol, proto_version 1.
 //!
 //! Only the message kinds the worker needs are modelled. Origin ('O'),

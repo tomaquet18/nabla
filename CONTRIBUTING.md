@@ -17,7 +17,7 @@ which is what allows the components below to carry different ones.
 
 | Component | Path | License |
 |---|---|---|
-| nabla PostgreSQL extension | `src/`, `sql/`, `nabla.control` | AGPL-3.0-only |
+| nabla PostgreSQL extension | `src/`, `sql/`, `nabla.control` | AGPL-3.0-or-later |
 | reference client and subscription protocol | `clients/` | MIT OR Apache-2.0 |
 | delta engine crate (once split out of the extension) | — | Apache-2.0 |
 

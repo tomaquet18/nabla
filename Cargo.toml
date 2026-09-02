@@ -3,7 +3,7 @@ name = "nabla"
 version = "0.1.0"
 edition = "2021"
 description = "Non-blocking incremental materialized views for PostgreSQL with delta subscriptions"
-license = "AGPL-3.0-only"
+license = "AGPL-3.0-or-later"
 repository = ""
 readme = "README.md"
 

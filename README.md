@@ -480,7 +480,7 @@ nabla is licensed per component:
 
 | Component | Path | License |
 |---|---|---|
-| PostgreSQL extension | `src/`, `sql/`, `nabla.control` | [AGPL-3.0-only](LICENSE) |
+| PostgreSQL extension | `src/`, `sql/`, `nabla.control` | [AGPL-3.0-or-later](LICENSE) |
 | Reference client and subscription protocol | `clients/` | [MIT](clients/rust/nabla-client/LICENSE-MIT) OR [Apache-2.0](clients/rust/nabla-client/LICENSE-APACHE) |
 | Delta engine crate (once split out of the extension) | — | Apache-2.0 |
 

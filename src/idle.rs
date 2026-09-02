@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! The idle window: a WAL range the worker has verified to contain no
 //! published change, shared with backends through shared memory.
 //!

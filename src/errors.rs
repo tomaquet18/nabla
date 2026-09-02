@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Error reporting helpers. Every user-facing error is prefixed with "nabla:".
 //!
 //! Conditions a client must branch on carry nabla-specific SQLSTATEs:
