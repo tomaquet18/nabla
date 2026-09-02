@@ -34,14 +34,17 @@ Two safety rules keep everything bounded:
 
 ### Failure isolation
 
-Each view is applied in its own subtransaction of the worker's transaction.
-If applying a source transaction to one view raises (for example `100 / k`
-meeting `k = 0`), only that view's subtransaction is rolled back; the other
-views absorb the transaction and advance. The failing view keeps its previous
-`frontier_lsn`; `apply_failures` is incremented and `last_error` /
-`last_error_at` record the PostgreSQL error. The slot is not advanced past a
-transaction that a live view has not absorbed, so the view is retried on the
-next poll while healthy views skip the transaction through their frontier.
+Every source transaction is applied to each view in its own subtransaction
+of the worker's round transaction. If applying a source transaction to one
+view raises (for example `100 / k` meeting `k = 0`), only that view's
+subtransaction is rolled back; the other views absorb the transaction and
+advance. The failing view keeps the frontier of the last transaction it
+absorbed (healthy transactions earlier in the same round are kept);
+`apply_failures` is incremented once per round and `last_error` /
+`last_error_at` record the PostgreSQL error. The round stops after that
+transaction and the slot is advanced to just before it, so the view is
+retried on the next poll while healthy views skip the transaction through
+their frontier.
 After `nabla.max_apply_failures` consecutive failures (default 3) the view is
 marked `stale` with `stale_reason = 'apply failed N times: <error>'`, one
 WARNING is logged, the slot advances and everything else continues. Damage is
@@ -202,8 +205,8 @@ moving the VIEW with ALTER VIEW is not supported (maintenance continues, the
 channel name does not follow).
 
 GUCs: `nabla.database`, `nabla.poll_interval_ms` (100),
-`nabla.retain_deltas` (100000), `nabla.max_slot_lag_bytes` (1 GiB),
-`nabla.max_apply_failures` (3).
+`nabla.batch_changes` (5000), `nabla.retain_deltas` (100000),
+`nabla.max_slot_lag_bytes` (1 GiB), `nabla.max_apply_failures` (3).
 
 ## Joins and shadow tables
 
@@ -322,6 +325,96 @@ Events a client should surface: `Snapshot { epoch, frontier, cursor, rows }`,
 reason is one of lagged, epoch changed, stale (with the reason) or
 disconnected. Keep buffers bounded: one batch plus the trailing transaction.
 
+## Performance
+
+Writers are never blocked: the worker reads the WAL through a logical slot
+and applies changes to the storage tables on its own. What matters is how
+fast it applies them, because everything a subscriber sees is behind the
+worker's frontier.
+
+### What the worker does per round
+
+One round, every `nabla.poll_interval_ms` (or immediately while there is a
+backlog):
+
+1. peek up to `nabla.batch_changes` decoded changes from the slot; PostgreSQL
+   never splits a transaction across that limit;
+2. in one worker transaction: for every complete source transaction, in
+   commit order, plan and execute the row changes against every live view
+   (each view in its own subtransaction, so a failure rolls back that view
+   alone), maintain the shadow tables of join views, and net the deltas per
+   source transaction; then, once per view, update the frontier, append the
+   round's deltas with one multi-row `INSERT`, garbage-collect and send one
+   notification carrying the last `seq:lsn`;
+3. commit and advance the slot once, to the end of the last applied
+   transaction.
+
+Hot statements (view upserts, shadow lookups and writes) run through kept
+SPI plans, so they are parsed and planned once per view and change kind for
+the life of the worker.
+
+### Why one transaction per round is correct
+
+nabla offers deferred transactional consistency: a reader sees the view as
+it was after some committed source transaction, never a state that did not
+exist. Committing once per round only means readers skip the intermediate
+committed states of that round; the frontier still names the exact source
+LSN the view reflects, delta batches still map one-to-one to source
+transactions (netted per transaction, in commit order), and a subscriber
+following `changes()` sees the same sequence it would have seen with one
+commit per transaction. The trade is latency inside a round against
+throughput: one WAL flush, one slot advance and one catalog update per
+round instead of per transaction.
+
+### Measured
+
+`scripts/dev.sh bench` (`scripts/bench.sh`) builds a throwaway cluster with
+200k orders, 1000 customers and 500 products, creates two three-table join
+views (`revenue_by_region`, an aggregate; `paid_orders`, a projection), runs
+pgbench single-row `INSERT` transactions against a control table and against
+`orders`, then measures the worker's drain rate and the time to drain a 20k
+single-row backlog. On a laptop under Docker Desktop for Windows:
+
+| | before (one transaction and one slot advance per source transaction) | after (one per round, kept plans) |
+|---|---|---|
+| writer throughput retained, 1 / 4 / 16 pgbench clients | 108% / 87% / 110% | 95% / 76% / 86% (other runs: 101-113%; the host was shared and the spread between runs is about 20 points either way) |
+| worker drain rate, source transactions per second | 22 | 1333 |
+| 20k single-row backlog | not drained in 120 s (2729 applied) | drained in 15.0 s |
+| per round of 1667 single-row transactions | - | peek and decode 10-70 ms, apply 1.1-1.3 s, slot advance 5-50 ms |
+
+The step-by-step gains on the same script: one worker transaction and one
+slot advance per round took the drain rate from 22 to 1000 tx/s; kept SPI
+plans took it to 1300-1500 tx/s. Writing a running-transactions record after
+each round (to move the slot's restart point sooner) changed nothing
+measurable and was dropped. The remaining cost is the apply phase itself:
+about 0.7 ms per source transaction for two three-table join views, spent in
+the delta query against the shadow tables, the storage upsert and the
+subtransaction around each view.
+
+### The honest limit
+
+The worker is one process applying one round at a time. A sustained write
+rate above its apply rate accumulates lag: the frontier falls behind, the
+slot retains WAL, and `nabla.max_slot_lag_bytes` eventually marks every view
+stale and drops the slot. That cap is a safety valve against filling the
+disk, not a target: size the workload (or the views) so the worker keeps up,
+and watch `nabla.status()` for a frontier that keeps drifting away from
+`pg_current_wal_lsn()`.
+
+A long-running transaction slows the worker down in a second way: while it
+holds its snapshot, the old versions of the storage rows the worker keeps
+updating (an aggregate view's group rows above all) cannot be pruned, and
+every upsert walks a longer chain. `nabla.wait_for()` with a long timeout is
+such a transaction. Wait with LISTEN or with short, repeated calls rather
+than one call that spans a whole backlog; the benchmark script does exactly
+that after having measured the cost of its own observer.
+
+Knobs: `nabla.batch_changes` (changes per peek, default 5000; larger rounds
+amortise better but hold more work in one transaction and lengthen the delay
+before the first notification of a backlog), `nabla.poll_interval_ms`
+(latency floor when idle; a backlog is drained without sleeping),
+`nabla.retain_deltas` (how far a slow subscriber may fall behind).
+
 ## Build and test
 
 Everything compiles and runs inside the `nabla-dev:17` Docker image
@@ -357,14 +450,15 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
    more than `nabla.max_slot_lag_bytes`, mark views stale and drop it.
 2. Peek `pg_logical_slot_peek_binary_changes` up to the current flush LSN and
    decode the `pgoutput` stream (`src/pgoutput.rs`) into complete transactions.
-3. For each source transaction, in one worker transaction: set
-   `nabla.internal_write`, apply each row change to every live view of that
-   table (`src/apply.rs`: SQL over SPI with the decoded row bound as typed
-   parameters), append deltas, advance `frontier_lsn` to the transaction's end
-   LSN, notify, and garbage-collect deltas beyond retention. Commit, then
-   advance the slot in a separate transaction. Transactions at or below a
-   view's frontier are skipped, so a crash between the two steps replays
-   safely.
+3. In one worker transaction per round: set `nabla.internal_write`, then for
+   each complete source transaction of the peek, in commit order, apply each
+   row change to every live view of that table (`src/apply.rs`: SQL over SPI
+   with the decoded row bound as typed parameters, through kept plans) and
+   net the view's deltas. Once per view per round: advance `frontier_lsn` to
+   the end LSN of the last absorbed transaction, append the deltas, notify,
+   and garbage-collect deltas beyond retention. Commit, then advance the
+   slot once, in a separate transaction. Transactions at or below a view's
+   frontier are skipped, so a crash between the two steps replays safely.
 4. When the peek is drained, advance every live view's frontier to the flush
    LSN read before the peek: the view reflects all commits up to that point.
 

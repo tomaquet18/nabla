@@ -445,6 +445,57 @@ assert_eq "refresh() recovers the view" "live|0|true|true" \
 q "INSERT INTO t (k, amount) VALUES (7, 1)" >/dev/null
 wait_view public.bad
 assert_eq "bad is maintained again after recovery" "0|1" "$(bad_diff)|$(q "SELECT count(*) FROM bad WHERE ratio = 14")"
+# A failing transaction in the middle of healthy ones, all in one peek: the
+# worker is parked (long poll interval), eleven single-row transactions are
+# written, then the worker is woken with a 1 s poll so every round is
+# observable. The healthy transactions are absorbed by every view in the first
+# round; bad counts exactly one failure per round and goes stale after three.
+q "ALTER SYSTEM SET nabla.poll_interval_ms = 60000" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+sleep 0.5
+for k in 11 12 13 14 15; do q "INSERT INTO t (k, amount) VALUES ($k, 1)" >/dev/null; done
+L5=$(q "SELECT pg_current_wal_lsn()")
+q "INSERT INTO t (k, amount) VALUES (0, 1)" >/dev/null
+L0=$(q "SELECT pg_current_wal_lsn()")
+for k in 16 17 18 19 20; do q "INSERT INTO t (k, amount) VALUES ($k, 1)" >/dev/null; done
+L_END=$(q "SELECT pg_current_wal_lsn()")
+assert_eq "the worker is parked: no view absorbed the batch yet" "t|t" \
+  "$(q "SELECT nabla.frontier('public.bad') < '$L5'::pg_lsn")|$(q "SELECT nabla.frontier('public.good') < '$L5'::pg_lsn")"
+q "ALTER SYSTEM SET nabla.poll_interval_ms = 1000" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+SEQUENCE=""
+GOOD_AT_FIRST_FAILURE=""
+STATUS=live
+for _ in $(seq 1 150); do
+  ROW=$(q "SELECT status || '|' || apply_failures FROM nabla.views WHERE name = 'public.bad'")
+  STATUS=${ROW%%|*}
+  FAILS=${ROW##*|}
+  if [ "$FAILS" -ge 1 ] && [ "${SEQUENCE##* }" != "$FAILS" ]; then
+    SEQUENCE="$SEQUENCE $FAILS"
+    [ -z "$GOOD_AT_FIRST_FAILURE" ] && GOOD_AT_FIRST_FAILURE="$(good_diff)|$(q "SELECT nabla.frontier('public.good') >= '$L_END'::pg_lsn")"
+  fi
+  [ "$STATUS" = stale ] && break
+  sleep 0.1
+done
+q "ALTER SYSTEM RESET nabla.poll_interval_ms" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+assert_eq "batch: bad counts exactly one failure per round and goes stale" "stale| 1 2 3" "$STATUS|$SEQUENCE"
+assert_eq "batch: good absorbed the whole batch in the round of the first failure" "0|t" "$GOOD_AT_FIRST_FAILURE"
+assert_eq "batch: bad absorbed the healthy transactions before the failing one and nothing after it" "5|0|t" \
+  "$(q "SELECT count(*) FROM bad b JOIN t ON t.id = b.id WHERE t.k BETWEEN 11 AND 15")|$(q "SELECT count(*) FROM bad b JOIN t ON t.id = b.id WHERE t.k BETWEEN 16 AND 20")|$(q "SELECT nabla.frontier('public.bad') >= '$L5'::pg_lsn AND nabla.frontier('public.bad') < '$L0'::pg_lsn")"
+assert_eq "batch: good includes k = 0 and equals its query" "1|0" "$(q "SELECT n FROM good WHERE k = 0")|$(good_diff)"
+SLOT_OK=no
+for _ in $(seq 1 50); do
+  if [ "$(q "SELECT confirmed_flush_lsn >= '$L_END'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'nabla'")" = t ]; then SLOT_OK=yes; break; fi
+  sleep 0.1
+done
+assert_eq "batch: the slot advanced past the healthy transactions once bad went stale" "yes" "$SLOT_OK"
+assert_eq "batch: exactly one more stale WARNING for bad" "2" "$(grep -c 'nabla worker: view public.bad marked stale' "$LOG")"
+q "DELETE FROM t WHERE k = 0" >/dev/null
+q "SELECT nabla.refresh('public.bad')" >/dev/null || die "refresh(bad) failed after the batch"
+await_ready public.bad
+wait_view public.bad
+assert_eq "batch: bad equals its query after refresh" "0" "$(bad_diff)"
 
 # --- 14. NULL semantics of sum() and count(expr) -----------------------------
 echo "== 14. sum()/count(expr) NULL semantics"
@@ -1195,6 +1246,58 @@ await_ready sales_by_region
 assert_eq "replay: SELECT * shows only region, orders, revenue" "region,orders,revenue|2" \
   "$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sales_by_region'")|$(q "SELECT count(*) FROM sales_by_region")"
 q "SELECT nabla.drop_view('sales_by_region')" >/dev/null || die "drop_view(sales_by_region) failed"
+
+# --- 25. worker throughput (scaled-down scripts/bench.sh) ----------------------
+echo "== 25. worker throughput"
+q "CREATE TABLE c25 (id int PRIMARY KEY, name text)" >/dev/null
+q "CREATE TABLE b25 (id bigserial PRIMARY KEY, customer_id int, qty int)" >/dev/null
+q "INSERT INTO c25 SELECT i, 'customer ' || i FROM generate_series(1, 10) i" >/dev/null
+q "INSERT INTO b25 (customer_id, qty) SELECT 1 + (i % 10), 1 + (i % 5) FROM generate_series(1, 1000) i" >/dev/null
+q "SELECT nabla.create_view('public.s25_agg', 'SELECT c.name, count(*) AS n, sum(o.qty) AS q FROM b25 o JOIN c25 c ON c.id = o.customer_id GROUP BY c.name')" >/dev/null || die "create_view(s25_agg) failed"
+q "SELECT nabla.create_view('public.s25_proj', 'SELECT id, qty FROM b25')" >/dev/null || die "create_view(s25_proj) failed"
+await_ready public.s25_agg
+await_ready public.s25_proj
+wait_view public.s25_agg
+wait_view public.s25_proj
+agg25_diff() { q "SELECT count(*) FROM ((SELECT name, n, q FROM s25_agg EXCEPT SELECT c.name, count(*), sum(o.qty) FROM b25 o JOIN c25 c ON c.id = o.customer_id GROUP BY c.name) UNION ALL (SELECT c.name, count(*), sum(o.qty) FROM b25 o JOIN c25 c ON c.id = o.customer_id GROUP BY c.name EXCEPT SELECT name, n, q FROM s25_agg)) d"; }
+proj25_diff() { q "SELECT count(*) FROM ((SELECT id, qty FROM s25_proj EXCEPT SELECT id, qty FROM b25) UNION ALL (SELECT id, qty FROM b25 EXCEPT SELECT id, qty FROM s25_proj)) d"; }
+SEQ_AGG0=$(q "SELECT current_seq FROM nabla.status('public.s25_agg')")
+SEQ_PROJ0=$(q "SELECT current_seq FROM nabla.status('public.s25_proj')")
+ROUNDS0=$(grep -c 'nabla worker: applied ' "$LOG")
+# A LISTEN session that keeps reporting notifications while the batch drains.
+{ echo 'LISTEN "nabla:public.s25_agg";'; echo 'LISTEN "nabla:public.s25_proj";'; for _ in $(seq 1 100); do echo 'SELECT pg_sleep(0.2);'; done; } > /tmp/nabla-listen25.sql
+psql -X -q -A -t -p "$PORT" -d "$DB" -f /tmp/nabla-listen25.sql > /tmp/nabla-listen25.out 2>&1 &
+LISTEN_PID=$!
+sleep 0.5
+cat > /tmp/nabla-bench25.sql <<'EOF'
+\set c random(1, 10)
+\set qn random(1, 5)
+INSERT INTO b25 (customer_id, qty) VALUES (:c, :qn);
+EOF
+START25=$(date +%s%N)
+"$PG_BIN/pgbench" -n -p "$PORT" -c 4 -j 4 -t 500 -f /tmp/nabla-bench25.sql "$DB" > /tmp/nabla-bench25.out 2>&1 || die "pgbench failed: $(tail -n 12 /tmp/nabla-bench25.out)"
+WRITE_MS=$(( ($(date +%s%N) - START25) / 1000000 ))
+TARGET25=$(q "SELECT pg_current_wal_lsn()")
+DRAINED=$(q "SELECT nabla.wait_for('public.s25_proj', '$TARGET25'::pg_lsn, 10000)")
+TOTAL_MS=$(( ($(date +%s%N) - START25) / 1000000 ))
+assert_eq "2000 single-row transactions drained within 10 s of the last write" "t" "$DRAINED"
+echo "   (2000 transactions written in ${WRITE_MS} ms, all applied ${TOTAL_MS} ms after the first write)"
+wait_view public.s25_agg
+assert_eq "both views equal their queries after the batch" "0|0" "$(agg25_diff)|$(proj25_diff)"
+assert_eq "the projection logged exactly one delta per source transaction" "2000" \
+  "$(( $(q "SELECT current_seq FROM nabla.status('public.s25_proj')") - SEQ_PROJ0 ))"
+assert_eq "the aggregate logged at most two deltas per source transaction" "t" \
+  "$(q "SELECT (SELECT current_seq FROM nabla.status('public.s25_agg')) - $SEQ_AGG0 BETWEEN 2000 AND 4000")"
+sleep 0.5
+kill "$LISTEN_PID" 2>/dev/null; wait "$LISTEN_PID" 2>/dev/null
+ROUNDS=$(( $(grep -c 'nabla worker: applied ' "$LOG") - ROUNDS0 ))
+N_AGG=$(grep -c 'Asynchronous notification "nabla:public.s25_agg"' /tmp/nabla-listen25.out)
+N_PROJ=$(grep -c 'Asynchronous notification "nabla:public.s25_proj"' /tmp/nabla-listen25.out)
+echo "   (worker rounds: $ROUNDS, notifications: s25_agg $N_AGG, s25_proj $N_PROJ)"
+assert_eq "notifications arrived at most once per view per round, and at least once" "t|t|t" \
+  "$(q "SELECT $N_AGG BETWEEN 1 AND $ROUNDS")|$(q "SELECT $N_PROJ BETWEEN 1 AND $ROUNDS")|$(q "SELECT $ROUNDS < 2000")"
+LAST_PAYLOAD=$(grep -oE 'Asynchronous notification "nabla:public.s25_proj" with payload "[^"]+"' /tmp/nabla-listen25.out | tail -n 1 | grep -oE 'payload ".*"' | tr -d '"' | cut -c 9-)
+assert_eq "the last notification carries the view's current seq" "$(q "SELECT current_seq FROM nabla.status('public.s25_proj')")" "${LAST_PAYLOAD%%:*}"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

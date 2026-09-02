@@ -12,9 +12,12 @@
 //! Decoded values are bound as text parameters and cast to the base column
 //! types, never interpolated.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
-use pgrx::spi::quote_identifier;
+use pgrx::spi::{quote_identifier, OwnedPreparedStatement};
 
 use crate::definition::{Shape, ViewSpec};
 use crate::pgoutput::{ColumnValue, Relation, Tuple};
@@ -85,15 +88,66 @@ pub fn row_args<'a>(tuple: &[ColumnValue]) -> Vec<DatumWithOid<'a>> {
 /// Run a statement and return the first column of each returned row as text.
 pub fn returning_text(sql: &str, args: &[DatumWithOid]) -> Result<Vec<String>, String> {
     Spi::connect_mut(|client| {
-        let mut out = Vec::new();
-        for row in client.update(sql, None, args)? {
-            if let Some(s) = row.get::<String>(1)? {
-                out.push(s);
+        with_plan(client, sql, args, |client, plan| {
+            let mut out = Vec::new();
+            for row in client.update(plan, None, args)? {
+                if let Some(s) = row.get::<String>(1)? {
+                    out.push(s);
+                }
             }
-        }
-        Ok::<_, pgrx::spi::Error>(out)
+            Ok(out)
+        })
     })
     .map_err(|e| format!("{sql}: {e}"))
+}
+
+/// Run a statement for its side effects through the plan cache.
+pub fn execute_cached(sql: &str, args: &[DatumWithOid]) -> Result<(), String> {
+    Spi::connect_mut(|client| with_plan(client, sql, args, |client, plan| client.update(plan, None, args).map(|_| ())))
+        .map_err(|e| format!("{sql}: {e}"))
+}
+
+thread_local! {
+    /// Kept SPI plans (`SPI_keepplan`) keyed by statement text and argument
+    /// types. The worker is a single backend that repeats a small set of
+    /// statements per view, shadow and change kind for its whole life; a kept
+    /// plan lives in CacheMemoryContext, survives the worker's transactions,
+    /// and PostgreSQL's plan cache re-plans it when a relation it references
+    /// changes (rebuilt storage table, extended shadow), so no explicit
+    /// invalidation is needed. Statement texts carry the storage or shadow
+    /// table name, hence a rebuilt view never resolves to an older plan.
+    static PLANS: RefCell<HashMap<(String, Vec<pg_sys::Oid>), OwnedPreparedStatement>> = RefCell::new(HashMap::new());
+}
+
+/// Cache bound; DDL churn (views come and go) produces distinct texts, so the
+/// cache is dropped wholesale when it grows past this.
+const PLAN_CACHE_LIMIT: usize = 4096;
+
+fn with_plan<'c, R>(
+    client: &mut pgrx::spi::SpiClient<'c>,
+    sql: &str,
+    args: &[DatumWithOid],
+    run: impl FnOnce(&mut pgrx::spi::SpiClient<'c>, &OwnedPreparedStatement) -> Result<R, pgrx::spi::Error>,
+) -> Result<R, pgrx::spi::Error> {
+    let key = (sql.to_owned(), args.iter().map(|a| a.oid()).collect::<Vec<_>>());
+    if !PLANS.with(|p| p.borrow().contains_key(&key)) {
+        let types: Vec<PgOid> = key.1.iter().map(|o| PgOid::from(*o)).collect();
+        let plan = client.prepare(sql, &types)?.keep();
+        PLANS.with(|p| {
+            let mut plans = p.borrow_mut();
+            if plans.len() >= PLAN_CACHE_LIMIT {
+                plans.clear();
+            }
+            plans.insert(key.clone(), plan);
+        });
+    }
+    // The plan is removed from the map while it runs so an error unwinding
+    // through here (caught by the caller's subtransaction) can never observe
+    // a live borrow; it is put back afterwards.
+    let plan = PLANS.with(|p| p.borrow_mut().remove(&key)).expect("plan present");
+    let result = run(client, &plan);
+    PLANS.with(|p| p.borrow_mut().insert(key, plan));
+    result
 }
 
 /// Substitute unchanged-TOAST markers from the old tuple when available.
@@ -331,7 +385,7 @@ fn aggregate_row(view: &ViewTarget, sign: i32, row_json: &str, deltas: &mut Vec<
     if new_count > 0 {
         deltas.push(Delta { op: 'I', row_json: new_row.to_string() });
     } else {
-        Spi::run(&format!("DELETE FROM {} AS v WHERE v.{count} <= 0", view.name))
+        execute_cached(&format!("DELETE FROM {} AS v WHERE v.{count} <= 0", view.name), &[])
             .map_err(|e| format!("group cleanup failed: {e}"))?;
     }
     Ok(())

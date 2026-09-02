@@ -35,7 +35,7 @@ use pgrx::prelude::*;
 use pgrx::spi::quote_identifier;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::storage_name;
 use crate::apply::{self, Op, Planned, ViewTarget};
@@ -48,10 +48,6 @@ use crate::populate;
 
 const SLOT: &str = "nabla";
 const PUBLICATION: &str = "nabla";
-/// Starting `upto_nchanges` for a peek. PostgreSQL never splits a transaction
-/// across the limit (it is checked between WAL records), so a large transaction
-/// simply returns more rows than the limit.
-const PEEK_LIMIT: i64 = 1000;
 /// pgoutput tag of a complete old tuple (REPLICA IDENTITY FULL).
 const FULL_OLD_TUPLE: u8 = 79; // b'O'
 
@@ -170,7 +166,6 @@ struct LiveView {
     spec: ViewSpec,
     frontier: u64,
     last_seq: i64,
-    start_seq: i64,
     apply_failures: i32,
     definition: String,
     touched: bool,
@@ -179,6 +174,11 @@ struct LiveView {
     /// Set when a planning step failed: the view must retry the transaction.
     failed: Option<String>,
     stale: Option<String>,
+    /// Stopped absorbing for the rest of the round (failed or went stale).
+    dead: bool,
+    /// A failure was recorded for this view in the current round; the
+    /// round-end catalog update must not clear that bookkeeping.
+    failed_this_round: bool,
 }
 
 impl LiveView {
@@ -239,6 +239,8 @@ struct Shadow {
     columns: Vec<String>,
     column_types: Vec<String>,
     pk_columns: Vec<String>,
+    /// Frontier moved during this round (written once at the end).
+    advanced: bool,
 }
 
 fn load_live_views() -> Result<Vec<LiveView>, String> {
@@ -267,13 +269,14 @@ fn load_live_views() -> Result<Vec<LiveView>, String> {
                 spec,
                 frontier: lsn::parse(&r.get::<String>(4)?.expect("frontier")).unwrap_or(0),
                 last_seq,
-                start_seq: last_seq,
                 definition: r.get::<String>(6)?.expect("definition"),
                 apply_failures: r.get::<i32>(7)?.unwrap_or(0),
                 touched: false,
                 ops: Vec::new(),
                 failed: None,
                 stale: None,
+                dead: false,
+                failed_this_round: false,
             });
         }
         Ok(views)
@@ -301,6 +304,7 @@ fn load_shadows() -> Result<HashMap<u32, Shadow>, String> {
                     columns: r.get::<Vec<String>>(5)?.unwrap_or_default(),
                     column_types: r.get::<Vec<String>>(6)?.unwrap_or_default(),
                     pk_columns: r.get::<Vec<String>>(7)?.unwrap_or_default(),
+                    advanced: false,
                 },
             );
         }
@@ -413,7 +417,7 @@ fn shadow_apply(shadow: &Shadow, rel: &Relation, change: &Change, old_full: Opti
         let keys = key_values(&shadow.pk_columns, rel, old, new)?;
         let (conds, values) = key_predicate(rel, &keys, 1)?;
         let args: Vec<DatumWithOid> = values.into_iter().map(|v| v.into()).collect();
-        Spi::run_with_args(&format!("DELETE FROM {} WHERE {conds}", shadow.table), &args).map_err(spi_err)
+        apply::execute_cached(&format!("DELETE FROM {} WHERE {conds}", shadow.table), &args)
     };
     let insert = |row: &Tuple| -> Result<(), String> {
         let indexes = shadow_column_indexes(shadow, rel);
@@ -433,11 +437,10 @@ fn shadow_apply(shadow: &Shadow, rel: &Relation, change: &Change, old_full: Opti
                 _ => Option::<String>::None.into(),
             });
         }
-        Spi::run_with_args(
+        apply::execute_cached(
             &format!("INSERT INTO {} ({}) VALUES ({})", shadow.table, cols.join(", "), casts.join(", ")),
             &args,
         )
-        .map_err(spi_err)
     };
     match change {
         Change::Insert { .. } => insert(new_full.ok_or("missing new row")?),
@@ -496,28 +499,6 @@ fn shadow_drift(shadow: &mut Shadow, rel: &Relation, qualified: &str) -> Result<
 
 // --- catalog bookkeeping -------------------------------------------------------
 
-fn record_deltas(view: &mut LiveView, tx: &SourceTransaction, deltas: Vec<apply::Delta>) -> Result<(), String> {
-    for d in deltas {
-        view.last_seq += 1;
-        let args: [DatumWithOid; 6] = [
-            view.id.into(),
-            view.last_seq.into(),
-            lsn::format(tx.end_lsn).into(),
-            (tx.xid as i64).into(),
-            d.op.to_string().into(),
-            d.row_json.into(),
-        ];
-        Spi::run_with_args(
-            "INSERT INTO nabla.deltas (view_id, seq, lsn, xid, op, row) \
-             VALUES ($1, $2, $3::pg_lsn, $4, $5::\"char\", $6::jsonb)",
-            &args,
-        )
-        .map_err(spi_err)?;
-        view.touched = true;
-    }
-    Ok(())
-}
-
 fn mark_stale(view: &LiveView, reason: &str) -> Result<(), String> {
     pgrx::warning!("nabla worker: view {} marked stale: {reason}", view.name);
     let args: [DatumWithOid; 2] = [view.id.into(), reason.into()];
@@ -556,28 +537,6 @@ fn record_failure(view: &mut LiveView, tx: &SourceTransaction, message: &str) ->
     )
     .map_err(spi_err)?;
     Ok(true)
-}
-
-/// Advance a view that absorbed the transaction: frontier, sequence counter,
-/// failure bookkeeping reset, delta garbage collection and notification.
-fn record_success(view: &LiveView, tx: &SourceTransaction) -> Result<(), String> {
-    let args: [DatumWithOid; 3] = [lsn::format(tx.end_lsn).into(), view.last_seq.into(), view.id.into()];
-    Spi::run_with_args(
-        "UPDATE nabla.views SET frontier_lsn = $1::pg_lsn, last_seq = $2, \
-         apply_failures = 0, last_error = NULL, last_error_at = NULL WHERE id = $3",
-        &args,
-    )
-    .map_err(spi_err)?;
-    if view.touched {
-        let retain = guc::RETAIN_DELTAS.get() as i64;
-        let gc: [DatumWithOid; 2] = [view.id.into(), (view.last_seq - retain).into()];
-        Spi::run_with_args("DELETE FROM nabla.deltas WHERE view_id = $1 AND seq <= $2", &gc).map_err(spi_err)?;
-        let channel = format!("nabla:{}", view.name);
-        let payload = format!("{}:{}", view.last_seq, lsn::format(tx.end_lsn));
-        let notify: [DatumWithOid; 2] = [channel.into(), payload.into()];
-        Spi::run_with_args("SELECT pg_catalog.pg_notify($1, $2)", &notify).map_err(spi_err)?;
-    }
-    Ok(())
 }
 
 fn record_shadow_failure(shadow: &mut Shadow, message: &str) -> Result<(), String> {
@@ -683,45 +642,108 @@ fn plan_change(view: &mut LiveView, rel: &Relation, change: &Change, old_full: O
     Ok(Planned::Ops(ops))
 }
 
-struct ApplyStats {
-    deltas: usize,
-    /// A live view failed and must retry: the slot must not advance past `tx`.
-    blocked: bool,
+/// One delta row waiting for the round's batched insert.
+struct PendingDelta {
+    seq: i64,
+    lsn: u64,
+    xid: u32,
+    op: char,
+    row_json: String,
 }
 
-/// Apply one complete source transaction in one worker transaction.
+struct RoundStats {
+    deltas: usize,
+    /// Source transactions processed in this round (a blocked round stops
+    /// after the transaction that failed for some live view).
+    processed: usize,
+    /// Index of the first transaction some live view could not absorb.
+    blocked_at: Option<usize>,
+}
+
+fn record_shadow_failure_for_views(views: &mut [LiveView], relid: u32, rel: &Relation, message: &str) {
+    for view in views.iter_mut() {
+        if view.spec.is_join() && view.relation_index(relid).is_some() && view.stale.is_none() && !view.dead {
+            view.stale = Some(format!("shadow of {} could not be maintained: {message}", rel.name));
+        }
+    }
+}
+
+/// Append a view's netted deltas of the round in one multi-row INSERT
+/// (chunked to stay far below the parameter limit).
+fn insert_deltas(view_id: i32, deltas: &[PendingDelta]) -> Result<(), String> {
+    for chunk in deltas.chunks(200) {
+        let mut values = Vec::with_capacity(chunk.len());
+        let mut args: Vec<DatumWithOid> = Vec::with_capacity(chunk.len() * 6);
+        for (i, d) in chunk.iter().enumerate() {
+            let b = i * 6;
+            values.push(format!(
+                "(${}, ${}, ${}::pg_lsn, ${}, ${}::\"char\", ${}::jsonb)",
+                b + 1, b + 2, b + 3, b + 4, b + 5, b + 6
+            ));
+            args.push(view_id.into());
+            args.push(d.seq.into());
+            args.push(lsn::format(d.lsn).into());
+            args.push((d.xid as i64).into());
+            args.push(d.op.to_string().into());
+            args.push(d.row_json.clone().into());
+        }
+        Spi::run_with_args(
+            &format!("INSERT INTO nabla.deltas (view_id, seq, lsn, xid, op, row) VALUES {}", values.join(", ")),
+            &args,
+        )
+        .map_err(spi_err)?;
+    }
+    Ok(())
+}
+
+/// Apply every complete source transaction of a peek in ONE worker
+/// transaction, in commit order.
 ///
-/// Phase 1 walks the changes in stream order: for each change, every
-/// affected view plans its delta rows (join views against the shadows as
-/// they stand before this change), then the changed table's shadow absorbs
-/// the change. Views before shadow would only matter for self-joins, which
-/// are rejected. Phase 2 writes each view's planned rows in its own
-/// subtransaction and advances the frontiers.
-fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<ApplyStats, String> {
+/// Why one transaction per round is correct under deferred transactional
+/// consistency: a reader only ever sees the view at the state it had after
+/// the last applied source transaction, which is a committed snapshot of the
+/// base tables. Committing once per round means readers skip the
+/// intermediate committed states of the round; they never see a state that
+/// was not committed. The frontier still means "reflects the base tables at
+/// this LSN". Per-source-transaction delta batches and netting are unchanged:
+/// each source transaction is planned, executed and netted on its own; only
+/// the catalog bookkeeping (frontier update, delta insert, notification,
+/// garbage collection) happens once per view per round, and the slot is
+/// advanced once per round.
+///
+/// Failure isolation: each view's execution of each source transaction runs
+/// in its own subtransaction, so a failing view rolls back alone; it counts
+/// one failure per round and stops absorbing at the failing transaction,
+/// while the other views absorb the whole peek. The slot is then held right
+/// before the failing transaction, which is retried on the next poll.
+fn apply_round(decoder: &mut Decoder, txs: &[SourceTransaction]) -> Result<RoundStats, String> {
     Spi::run("SET LOCAL nabla.internal_write = on").map_err(spi_err)?;
     let mut views = load_live_views()?;
-    // Lock order view table -> shadows -> catalog, the same order a DROP of
-    // a view table takes (ACCESS EXCLUSIVE on the table, then its sql_drop
-    // trigger touches shadows and catalog rows). Taking the view locks first
-    // keeps the worker and concurrent DDL from deadlocking.
+    // Lock order storage table -> shadows -> catalog, the same order a DROP of
+    // a view takes (ACCESS EXCLUSIVE on the storage table, then its sql_drop
+    // trigger touches shadows and catalog rows). Taking the storage locks
+    // first keeps the worker and concurrent DDL from deadlocking.
     for view in &views {
         Spi::run(&format!("LOCK TABLE {} IN ROW EXCLUSIVE MODE", view.storage)).map_err(spi_err)?;
     }
     let mut shadows = load_shadows()?;
 
     let mut relations: HashMap<u32, Relation> = HashMap::new();
-    for change in &tx.changes {
-        for relid in change_relids(change) {
-            if relations.contains_key(&relid) {
-                continue;
+    for tx in txs {
+        for change in &tx.changes {
+            for relid in change_relids(change) {
+                if relations.contains_key(&relid) {
+                    continue;
+                }
+                let Some(rel) = decoder.relations.get_mut(&relid) else {
+                    return Err(format!("change for unknown relation {relid}"));
+                };
+                resolve_types(rel)?;
+                relations.insert(relid, rel.clone());
             }
-            let Some(rel) = decoder.relations.get_mut(&relid) else {
-                return Err(format!("change for unknown relation {relid}"));
-            };
-            resolve_types(rel)?;
-            relations.insert(relid, rel.clone());
         }
     }
+    let round_end = txs.last().map_or(0, |t| t.end_lsn);
 
     // Schema drift, once per relation: views lose exactly the columns they
     // use; shadows drop the columns from their active set (or fail on a key).
@@ -731,12 +753,12 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
             .find_map(|v| v.spec.relations.iter().find(|r| r.oid == *relid).map(|r| r.qualified.clone()))
             .unwrap_or_else(|| format!("{}.{}", rel.namespace, rel.name));
         if let Some(shadow) = shadows.get_mut(relid) {
-            if !shadow.failed && tx.end_lsn > shadow.frontier {
+            if !shadow.failed && round_end > shadow.frontier {
                 shadow_drift(shadow, rel, &qualified)?;
             }
         }
         for view in views.iter_mut() {
-            if view.stale.is_none() && tx.end_lsn > view.frontier {
+            if view.stale.is_none() && round_end > view.frontier {
                 if let Some(reason) = view.drift(*relid, rel) {
                     view.stale = Some(reason);
                 }
@@ -744,121 +766,171 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
         }
     }
 
-    // Phase 1: plan per change, maintain shadows in stream order.
-    for change in &tx.changes {
-        for relid in change_relids(change) {
-            let rel = &relations[&relid];
-            let shadow_active = shadows.get(&relid).map_or(false, |s| !s.failed && tx.end_lsn > s.frontier);
+    let mut pending: Vec<Vec<PendingDelta>> = views.iter().map(|_| Vec::new()).collect();
+    let mut absorbed: Vec<Option<u64>> = vec![None; views.len()];
+    let mut stats = RoundStats { deltas: 0, processed: 0, blocked_at: None };
 
-            // Old row from the shadow (before this change), full row for
-            // join deltas and for the shadow's own delete-by-key.
-            let mut old_full: Option<Tuple> = None;
-            let mut shadow_error: Option<String> = None;
-            if shadow_active && matches!(change, Change::Update { .. } | Change::Delete { .. }) {
-                let (old, new): (Option<&Tuple>, Option<&Tuple>) = match change {
-                    Change::Update { old, new, .. } => (old.as_ref().map(|(_, t)| t), Some(new)),
-                    Change::Delete { old, .. } => (Some(old), None),
-                    _ => (None, None),
-                };
-                let shadow = &shadows[&relid];
-                match in_subtransaction(AssertUnwindSafe(|| shadow_old_row(shadow, rel, old, new))) {
-                    Ok(row) => old_full = Some(row),
-                    Err(e) => shadow_error = Some(e),
-                }
-            }
+    for (ti, tx) in txs.iter().enumerate() {
+        // Phase 1: plan per change, maintain shadows in stream order.
+        for change in &tx.changes {
+            for relid in change_relids(change) {
+                let rel = &relations[&relid];
+                let shadow_active = shadows.get(&relid).map_or(false, |s| !s.failed && tx.end_lsn > s.frontier);
 
-            for view in views.iter_mut() {
-                if !view.active_for(relid, tx.end_lsn) {
-                    continue;
+                let mut old_full: Option<Tuple> = None;
+                let mut shadow_error: Option<String> = None;
+                if shadow_active && matches!(change, Change::Update { .. } | Change::Delete { .. }) {
+                    let (old, new): (Option<&Tuple>, Option<&Tuple>) = match change {
+                        Change::Update { old, new, .. } => (old.as_ref().map(|(_, t)| t), Some(new)),
+                        Change::Delete { old, .. } => (Some(old), None),
+                        _ => (None, None),
+                    };
+                    let shadow = &shadows[&relid];
+                    match in_subtransaction(AssertUnwindSafe(|| shadow_old_row(shadow, rel, old, new))) {
+                        Ok(row) => old_full = Some(row),
+                        Err(e) => shadow_error = Some(e),
+                    }
                 }
-                if let Some(e) = &shadow_error {
-                    if view.spec.is_join() {
-                        view.stale = Some(format!("shadow of {} could not provide the old row: {e}", rel.name));
+
+                for view in views.iter_mut() {
+                    if view.dead || !view.active_for(relid, tx.end_lsn) {
                         continue;
                     }
-                }
-                let old_ref = old_full.as_ref();
-                match in_subtransaction(AssertUnwindSafe(|| plan_change(view, rel, change, old_ref))) {
-                    Ok(Planned::Ops(ops)) => view.ops.extend(ops),
-                    Ok(Planned::Stale(s)) => view.stale = Some(s.0),
-                    Err(message) => view.failed = Some(message),
-                }
-            }
-
-            if shadow_active {
-                let new_full: Option<Tuple> = match change {
-                    Change::Insert { new, .. } => Some(new.clone()),
-                    Change::Update { new, .. } => {
-                        apply::resolve_unchanged(rel, new, old_full.as_ref(), |_| true).ok()
-                    }
-                    _ => None,
-                };
-                let outcome = if let Some(e) = shadow_error.take() {
-                    Err(e)
-                } else if matches!(change, Change::Update { .. }) && new_full.is_none() {
-                    Err("unchanged TOAST value could not be recovered from the shadow".to_string())
-                } else {
-                    let shadow = &shadows[&relid];
-                    let (old_ref, new_ref) = (old_full.as_ref(), new_full.as_ref());
-                    in_subtransaction(AssertUnwindSafe(|| shadow_apply(shadow, rel, change, old_ref, new_ref)))
-                };
-                if let Err(message) = outcome {
-                    let shadow = shadows.get_mut(&relid).expect("shadow present");
-                    record_shadow_failure(shadow, &message)?;
-                    for view in views.iter_mut() {
-                        if view.spec.is_join() && view.relation_index(relid).is_some() && view.stale.is_none() {
-                            view.stale = Some(format!("shadow of {} could not be maintained: {message}", rel.name));
+                    if let Some(e) = &shadow_error {
+                        if view.spec.is_join() {
+                            view.stale = Some(format!("shadow of {} could not provide the old row: {e}", rel.name));
+                            continue;
                         }
                     }
+                    let old_ref = old_full.as_ref();
+                    match in_subtransaction(AssertUnwindSafe(|| plan_change(view, rel, change, old_ref))) {
+                        Ok(Planned::Ops(ops)) => view.ops.extend(ops),
+                        Ok(Planned::Stale(s)) => view.stale = Some(s.0),
+                        Err(message) => view.failed = Some(message),
+                    }
+                }
+
+                if shadow_active {
+                    let new_full: Option<Tuple> = match change {
+                        Change::Insert { new, .. } => Some(new.clone()),
+                        Change::Update { new, .. } => {
+                            apply::resolve_unchanged(rel, new, old_full.as_ref(), |_| true).ok()
+                        }
+                        _ => None,
+                    };
+                    let outcome = if let Some(e) = shadow_error.take() {
+                        Err(e)
+                    } else if matches!(change, Change::Update { .. }) && new_full.is_none() {
+                        Err("unchanged TOAST value could not be recovered from the shadow".to_string())
+                    } else {
+                        let shadow = &shadows[&relid];
+                        let (old_ref, new_ref) = (old_full.as_ref(), new_full.as_ref());
+                        in_subtransaction(AssertUnwindSafe(|| shadow_apply(shadow, rel, change, old_ref, new_ref)))
+                    };
+                    if let Err(message) = outcome {
+                        let shadow = shadows.get_mut(&relid).expect("shadow present");
+                        record_shadow_failure(shadow, &message)?;
+                        record_shadow_failure_for_views(&mut views, relid, rel, &message);
+                    }
                 }
             }
         }
+
+        // Phase 2: execute each view's planned rows in its own subtransaction.
+        for (vi, view) in views.iter_mut().enumerate() {
+            if view.dead || tx.end_lsn <= view.frontier {
+                continue; // dead for this round, or already absorbed
+            }
+            if let Some(reason) = view.stale.take() {
+                mark_stale(view, &reason)?;
+                view.dead = true;
+                continue;
+            }
+            if let Some(message) = view.failed.take() {
+                if record_failure(view, tx, &message)? {
+                    stats.blocked_at.get_or_insert(ti);
+                }
+                view.failed_this_round = true;
+                view.dead = true;
+                continue;
+            }
+            let ops = std::mem::take(&mut view.ops);
+            let seq_before = view.last_seq;
+            let outcome = in_subtransaction(AssertUnwindSafe(|| {
+                let target = ViewTarget { name: &view.storage, spec: &view.spec };
+                // Storage writes stay per change; the log gets the transaction's
+                // net effect per identity key (see apply::net).
+                Ok(apply::net(&view.spec, apply::execute(&target, &ops)?))
+            }));
+            match outcome {
+                Ok(deltas) => {
+                    for d in deltas {
+                        view.last_seq += 1;
+                        pending[vi].push(PendingDelta { seq: view.last_seq, lsn: tx.end_lsn, xid: tx.xid, op: d.op, row_json: d.row_json });
+                    }
+                    view.touched = view.touched || view.last_seq > seq_before;
+                    view.frontier = tx.end_lsn;
+                    absorbed[vi] = Some(tx.end_lsn);
+                }
+                Err(message) => {
+                    view.last_seq = seq_before;
+                    if record_failure(view, tx, &message)? {
+                        stats.blocked_at.get_or_insert(ti);
+                    }
+                    view.failed_this_round = true;
+                    view.dead = true;
+                }
+            }
+        }
+        for shadow in shadows.values_mut() {
+            if !shadow.failed && tx.end_lsn > shadow.frontier {
+                shadow.frontier = tx.end_lsn;
+                shadow.advanced = true;
+            }
+        }
+        stats.processed = ti + 1;
+        // A blocked view stops absorbing (it is dead for the round) but the
+        // healthy views go on to the end of the peek; the slot is held right
+        // before the failing transaction and they skip the replay through
+        // their frontier.
     }
 
-    // Phase 2: write each view in its own subtransaction, then bookkeeping.
-    let mut stats = ApplyStats { deltas: 0, blocked: false };
-    for view in views.iter_mut() {
-        if tx.end_lsn <= view.frontier {
-            continue; // already absorbed (replay after a crash or a retry round)
-        }
-        if let Some(reason) = view.stale.take() {
-            mark_stale(view, &reason)?;
+    // Once per view per round: frontier, bookkeeping reset, deltas, GC, notify.
+    for (vi, view) in views.iter().enumerate() {
+        let Some(end) = absorbed[vi] else {
+            continue;
+        };
+        let args: [DatumWithOid; 3] = [lsn::format(end).into(), view.last_seq.into(), view.id.into()];
+        // A view that absorbed part of the round and then failed keeps the
+        // failure bookkeeping record_failure just wrote; a clean round resets it.
+        let sql = if view.failed_this_round {
+            "UPDATE nabla.views SET frontier_lsn = $1::pg_lsn, last_seq = $2 WHERE id = $3"
+        } else {
+            "UPDATE nabla.views SET frontier_lsn = $1::pg_lsn, last_seq = $2, \
+             apply_failures = 0, last_error = NULL, last_error_at = NULL WHERE id = $3"
+        };
+        Spi::run_with_args(sql, &args).map_err(spi_err)?;
+        if pending[vi].is_empty() {
             continue;
         }
-        if let Some(message) = view.failed.take() {
-            if record_failure(view, tx, &message)? {
-                stats.blocked = true;
-            }
-            continue;
-        }
-        let ops = std::mem::take(&mut view.ops);
-        let (seq_before, touched_before) = (view.last_seq, view.touched);
-        let outcome = in_subtransaction(AssertUnwindSafe(|| {
-            let target = ViewTarget { name: &view.storage, spec: &view.spec };
-            // Table writes stay per change; the log gets the transaction's
-            // net effect per identity key (see apply::net).
-            let deltas = apply::net(&view.spec, apply::execute(&target, &ops)?);
-            record_deltas(view, tx, deltas)
-        }));
-        match outcome {
-            Ok(()) => record_success(view, tx)?,
-            Err(message) => {
-                view.last_seq = seq_before;
-                view.touched = touched_before;
-                if record_failure(view, tx, &message)? {
-                    stats.blocked = true;
-                }
-            }
-        }
+        insert_deltas(view.id, &pending[vi])?;
+        stats.deltas += pending[vi].len();
+        let retain = guc::RETAIN_DELTAS.get() as i64;
+        let gc: [DatumWithOid; 2] = [view.id.into(), (view.last_seq - retain).into()];
+        Spi::run_with_args("DELETE FROM nabla.deltas WHERE view_id = $1 AND seq <= $2", &gc).map_err(spi_err)?;
+        let last = pending[vi].last().expect("non-empty");
+        let channel = format!("nabla:{}", view.name);
+        let payload = format!("{}:{}", last.seq, lsn::format(last.lsn));
+        let notify: [DatumWithOid; 2] = [channel.into(), payload.into()];
+        Spi::run_with_args("SELECT pg_catalog.pg_notify($1, $2)", &notify).map_err(spi_err)?;
     }
     for shadow in shadows.values() {
-        if !shadow.failed && tx.end_lsn > shadow.frontier {
-            let args: [DatumWithOid; 2] = [lsn::format(tx.end_lsn).into(), (shadow.relid as i64).into()];
+        if shadow.advanced {
+            let args: [DatumWithOid; 2] = [lsn::format(shadow.frontier).into(), (shadow.relid as i64).into()];
             Spi::run_with_args("UPDATE nabla.shadows SET frontier_lsn = $1::pg_lsn WHERE relid = $2::oid", &args)
                 .map_err(spi_err)?;
         }
     }
-    stats.deltas = views.iter().map(|v| (v.last_seq - v.start_seq).max(0)).sum::<i64>() as usize;
     Ok(stats)
 }
 
@@ -935,6 +1007,7 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
     }
 
     // Peek everything committed up to the current flush point.
+    let round_started = Instant::now();
     let (target, rows) = try_transaction(|| {
         let target = select_one::<String>("SELECT pg_catalog.pg_current_wal_flush_lsn()::text", &[])?
             .and_then(|t| lsn::parse(&t))
@@ -942,12 +1015,16 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
         if target <= confirmed {
             return Ok::<_, String>((target, Vec::new()));
         }
+        // PostgreSQL never splits a transaction across upto_nchanges (it is
+        // checked between WAL records), so a large transaction simply returns
+        // more rows than the limit.
+        let limit = guc::BATCH_CHANGES.get().max(1) as i64;
         let args: [DatumWithOid; 2] = [SLOT.into(), lsn::format(target).into()];
         let rows = Spi::connect(|client| {
             let mut rows: Vec<Vec<u8>> = Vec::new();
             for r in client.select(
                 &format!(
-                    "SELECT data FROM pg_catalog.pg_logical_slot_peek_binary_changes($1, $2::pg_lsn, {PEEK_LIMIT}, \
+                    "SELECT data FROM pg_catalog.pg_logical_slot_peek_binary_changes($1, $2::pg_lsn, {limit}, \
                      'proto_version', '1', 'publication_names', '{PUBLICATION}')"
                 ),
                 None,
@@ -961,7 +1038,7 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
         Ok((target, rows))
     })??;
 
-    let drained = (rows.len() as i64) < PEEK_LIMIT;
+    let drained = (rows.len() as i64) < guc::BATCH_CHANGES.get().max(1) as i64;
     if rows.is_empty() && target == state.self_flush {
         // Nothing decodable and no WAL beyond our own last commit: the
         // range (last_advance, target] holds no published change, so a
@@ -979,22 +1056,34 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
         state.decoder.discard_incomplete();
     }
 
+    let peek_ms = round_started.elapsed().as_millis();
     let transactions = state.decoder.take_complete();
     let mut applied = 0usize;
     let mut total_deltas = 0usize;
     let mut last_end = confirmed;
-    for tx in &transactions {
+    let mut apply_ms = 0u128;
+    if !transactions.is_empty() {
         let decoder = &mut state.decoder;
-        let stats = try_transaction(AssertUnwindSafe(|| apply_transaction(decoder, tx)))??;
+        let apply_started = Instant::now();
+        let stats = try_transaction(AssertUnwindSafe(|| apply_round(decoder, &transactions)))??;
+        apply_ms = apply_started.elapsed().as_millis();
         total_deltas += stats.deltas;
-        if stats.blocked {
-            // A live view must retry this transaction on the next poll: keep
-            // the slot here and do not touch the frontiers of anyone else.
+        applied = stats.processed;
+        if let Some(k) = stats.blocked_at {
+            // A live view must retry transaction k on the next poll: advance
+            // the slot to just before it (the healthy views absorbed the whole
+            // peek and skip the replay through their frontier). No idle
+            // advance: the blocked view does not reflect `target`.
+            if k > 0 {
+                let end = transactions[k - 1].end_lsn;
+                try_transaction(|| advance_slot(end))??;
+            }
             return Ok(Round::Idle);
         }
-        try_transaction(|| advance_slot(tx.end_lsn))??;
-        last_end = last_end.max(tx.end_lsn);
-        applied += 1;
+        // One slot advance per round, to the end of the last applied transaction.
+        last_end = last_end.max(transactions[applied - 1].end_lsn);
+        let end = last_end;
+        try_transaction(|| advance_slot(end))??;
     }
 
     if drained {
@@ -1024,8 +1113,10 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
     }
     if applied > 0 {
         pgrx::log!(
-            "nabla worker: applied {applied} transaction(s), {total_deltas} delta(s), frontier {}",
-            lsn::format(target.max(last_end))
+            "nabla worker: applied {applied} transaction(s), {total_deltas} delta(s), frontier {} \
+             (peek+decode {peek_ms} ms, apply {apply_ms} ms, advance {} ms)",
+            lsn::format(target.max(last_end)),
+            round_started.elapsed().as_millis() - peek_ms - apply_ms
         );
     }
     Ok(if drained { Round::Idle } else { Round::MoreWork })
