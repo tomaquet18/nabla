@@ -8,6 +8,7 @@
 #   scripts/dev.sh client   build the reference client (clients/rust/nabla-client, release)
 #   scripts/dev.sh shell    interactive shell inside the container
 #   scripts/dev.sh run CMD  run an arbitrary command inside the container
+#   scripts/dev.sh playground  start a detached cluster with nabla for hands-on use
 #
 # target/ and the cargo registry live in named volumes: a bind-mounted target
 # directory on Windows is unusably slow.
@@ -55,6 +56,13 @@ case "$cmd" in
     ;;
   shell)
     run_in_container -it $(common_args) "$IMAGE" bash
+    ;;
+  playground)
+    # Detached cluster for hands-on use; see scripts/playground.sh for usage.
+    docker rm -f nabla-play >/dev/null 2>&1 || true
+    MSYS_NO_PATHCONV=1 docker run -d --name nabla-play $(common_args) "$IMAGE" \
+      bash scripts/playground.sh >/dev/null
+    echo "starting nabla-play; follow with: docker logs -f nabla-play"
     ;;
   run)
     run_in_container $(common_args) "$IMAGE" bash -c "$*"
