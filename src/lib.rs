@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! nabla: incrementally maintained views for PostgreSQL that never block writers.
 //!
 //! Changes are captured through logical decoding (a replication slot consumed

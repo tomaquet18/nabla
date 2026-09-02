@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Shape decisions for view definitions, made on PostgreSQL's own analyzed
 //! `Query` tree.
 //!

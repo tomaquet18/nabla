@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Delta computation for the two view shapes, in two phases:
 //!
 //! * planning (`plan_*`): evaluate the view's own select list over a

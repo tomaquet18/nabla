@@ -1,3 +1,4 @@
+-- SPDX-License-Identifier: AGPL-3.0-only
 -- nabla bootstrap: catalog tables and the direct-write guard.
 -- Runs first in the extension script (extension_sql_file! ... bootstrap).
 

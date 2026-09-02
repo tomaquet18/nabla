@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The background worker: consumes the `nabla` replication slot through the
 //! SQL peek/advance functions and applies each source transaction to the
 //! views (and the shadow tables join views depend on) in commit order.

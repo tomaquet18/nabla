@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! pg_lsn helpers. LSNs travel through SQL as text ("X/Y") and through Rust as u64.
 
 pub fn parse(text: &str) -> Option<u64> {

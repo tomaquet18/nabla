@@ -473,3 +473,20 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
 - Incremental `TRUNCATE`; unchanged TOAST values for columns a view needs
   (a view goes stale instead of being silently wrong).
 - Only one worker and one database per cluster (`nabla.database`).
+
+## License
+
+nabla is licensed per component:
+
+| Component | Path | License |
+|---|---|---|
+| PostgreSQL extension | `src/`, `sql/`, `nabla.control` | [AGPL-3.0-only](LICENSE) |
+| Reference client and subscription protocol | `clients/` | [MIT](clients/rust/nabla-client/LICENSE-MIT) OR [Apache-2.0](clients/rust/nabla-client/LICENSE-APACHE) |
+| Delta engine crate (once split out of the extension) | — | Apache-2.0 |
+
+Applications talk to nabla over SQL and the subscription protocol; the client
+libraries are permissive so that embedding them never affects an application's
+own license. Every source file carries an `SPDX-License-Identifier` header.
+
+Contributions require a signed [Contributor License Agreement](CLA.md); see
+[CONTRIBUTING.md](CONTRIBUTING.md).

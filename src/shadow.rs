@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Shadow tables: a copy of the columns of every base table that join views
 //! need, kept at the same position in the change stream as the views.
 //! Invariant after the worker absorbs transaction T: shadow(X) == X as of

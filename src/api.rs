@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! SQL-callable API, all in schema `nabla`.
 //!
 //! `create_view` and `refresh` only record intent and return immediately; the

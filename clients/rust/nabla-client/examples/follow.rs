@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! `follow [--rows] <connection-string> <view>`: print the snapshot, then one
 //! block per source transaction, and every resync. Exit on Ctrl-C.
 

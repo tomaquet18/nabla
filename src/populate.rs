@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Asynchronous population of views: `create_view` and `refresh` only record
 //! intent; the worker builds the table here, under a snapshot that is exactly
 //! consistent with a logical-decoding consistent point, the way PostgreSQL's

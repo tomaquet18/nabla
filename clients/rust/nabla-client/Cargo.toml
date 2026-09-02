@@ -3,7 +3,8 @@ name = "nabla-client"
 version = "0.1.0"
 edition = "2021"
 description = "Reference client for nabla view subscriptions"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
 
 # Standalone crate: not a member of the extension's workspace. Build it with
 # `scripts/dev.sh client` (its own target directory lives in a named volume).

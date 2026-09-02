@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: AGPL-3.0-only
 //! Configuration parameters, all under the `nabla.` prefix.
 
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
