@@ -12,6 +12,8 @@ pub static RETAIN_DELTAS: GucSetting<i32> = GucSetting::<i32>::new(100_000);
 /// Maximum WAL the slot may retain before the worker drops it and marks views stale.
 /// pgrx 0.17 only exposes 32-bit integer GUCs, so the cap tops out just under 2 GiB.
 pub static MAX_SLOT_LAG_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1 << 30);
+/// Consecutive failed applies of one source transaction before a view goes stale.
+pub static MAX_APPLY_FAILURES: GucSetting<i32> = GucSetting::<i32>::new(3);
 /// Session flag that lets the worker and nabla.refresh write to view tables.
 pub static INTERNAL_WRITE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
@@ -51,6 +53,16 @@ pub fn register() {
         &MAX_SLOT_LAG_BYTES,
         1_048_576,
         i32::MAX,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        c"nabla.max_apply_failures",
+        c"Failed apply attempts of one transaction before a view is marked stale.",
+        c"Each failure is retried on the next poll; the other views are not blocked.",
+        &MAX_APPLY_FAILURES,
+        1,
+        1_000_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );

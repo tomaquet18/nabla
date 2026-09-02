@@ -31,6 +31,32 @@ Two safety rules keep everything bounded:
   worker marks every view `stale` and drops the slot rather than fill the disk;
   `nabla.refresh()` rebuilds a view and recreates the slot.
 
+### Failure isolation
+
+Each view is applied in its own subtransaction of the worker's transaction.
+If applying a source transaction to one view raises (for example `100 / k`
+meeting `k = 0`), only that view's subtransaction is rolled back; the other
+views absorb the transaction and advance. The failing view keeps its previous
+`frontier_lsn`; `apply_failures` is incremented and `last_error` /
+`last_error_at` record the PostgreSQL error. The slot is not advanced past a
+transaction that a live view has not absorbed, so the view is retried on the
+next poll while healthy views skip the transaction through their frontier.
+After `nabla.max_apply_failures` consecutive failures (default 3) the view is
+marked `stale` with `stale_reason = 'apply failed N times: <error>'`, one
+WARNING is logged, the slot advances and everything else continues. Damage is
+bounded to `max_apply_failures x poll_interval`. A success on retry resets the
+counter.
+
+Observe it with
+`SELECT name, status, apply_failures, last_error, last_error_at, stale_reason FROM nabla.views`.
+`nabla.changes()` and `nabla.wait_for()` on a stale view raise
+`nabla: view "<name>" is stale: <reason>` with a hint to run
+`nabla.refresh('<name>')` after fixing the cause; `nabla.frontier()` keeps
+returning the last absorbed LSN. `refresh` rebuilds the table from the current
+data and clears the bookkeeping; if the definition still fails on the current
+rows, refresh surfaces PostgreSQL's error and the view stays stale, which is
+the correct outcome until the data or the definition is fixed.
+
 ## v0.1 scope: two accepted shapes
 
 One base table per view. Definitions are parsed and analyzed by PostgreSQL
@@ -107,7 +133,8 @@ View names must be schema-qualified. View tables reject direct DML
 (`nabla: cannot modify a nabla view directly`).
 
 GUCs: `nabla.database`, `nabla.poll_interval_ms` (100),
-`nabla.retain_deltas` (100000), `nabla.max_slot_lag_bytes` (1 GiB).
+`nabla.retain_deltas` (100000), `nabla.max_slot_lag_bytes` (1 GiB),
+`nabla.max_apply_failures` (3).
 
 ## Build and test
 
@@ -162,6 +189,4 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
   `SHARE`-locked rebuild.
 - Incremental `TRUNCATE`; unchanged TOAST values for columns a view needs
   (a view goes stale instead of being silently wrong).
-- A failing apply (for example a type cast error) is retried every poll and
-  logged as a warning; it does not yet mark the affected view stale.
 - Only one worker and one database per cluster (`nabla.database`).

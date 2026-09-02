@@ -6,11 +6,18 @@
 //! COMMIT, then advance the slot in a separate transaction. A crash between
 //! the two replays the transaction, and the per-view frontier check makes the
 //! replay a no-op (at-least-once delivery, effectively exactly-once).
+//!
+//! Failure isolation: every view is applied inside its own subtransaction. A
+//! failing view is rolled back alone, its failure is recorded in the catalog,
+//! and the slot is held back until the view either absorbs the transaction
+//! on a later poll or exceeds `nabla.max_apply_failures` and goes stale.
 
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::datum::{DatumWithOid, JsonB};
 use pgrx::pg_sys::panic::CaughtError;
+use pgrx::pg_sys::pg_try::PgTryBuilder;
 use pgrx::prelude::*;
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
@@ -44,6 +51,13 @@ pub fn register() {
         .load();
 }
 
+fn describe(e: &CaughtError) -> String {
+    match e {
+        CaughtError::PostgresError(r) | CaughtError::ErrorReport(r) => r.message().to_string(),
+        CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+    }
+}
+
 /// Run `body` in its own transaction. Errors abort the transaction and are
 /// returned instead of terminating the worker.
 fn try_transaction<R>(body: impl FnOnce() -> R) -> Result<R, String> {
@@ -52,14 +66,8 @@ fn try_transaction<R>(body: impl FnOnce() -> R) -> Result<R, String> {
         pg_sys::StartTransactionCommand();
         pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
     }
-    let result = pgrx::pg_sys::pg_try::PgTryBuilder::new(AssertUnwindSafe(|| Ok(body())))
-        .catch_others(|e| {
-            let message = match &e {
-                CaughtError::PostgresError(r) | CaughtError::ErrorReport(r) => r.message().to_string(),
-                CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
-            };
-            Err(message)
-        })
+    let result = PgTryBuilder::new(AssertUnwindSafe(|| Ok(body())))
+        .catch_others(|e| Err(describe(&e)))
         .execute();
     unsafe {
         match &result {
@@ -71,6 +79,25 @@ fn try_transaction<R>(body: impl FnOnce() -> R) -> Result<R, String> {
         }
     }
     result
+}
+
+/// Run `body` in a subtransaction of the current transaction. A PostgreSQL
+/// error or an `Err` from the body rolls the subtransaction back and returns
+/// the message; the enclosing transaction stays usable.
+fn in_subtransaction<R>(body: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
+    unsafe {
+        let memory_context = pg_sys::CurrentMemoryContext;
+        let resource_owner = pg_sys::CurrentResourceOwner;
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        let result = PgTryBuilder::new(AssertUnwindSafe(body)).catch_others(|e| Err(describe(&e))).execute();
+        match &result {
+            Ok(_) => pg_sys::ReleaseCurrentSubTransaction(),
+            Err(_) => pg_sys::RollbackAndReleaseCurrentSubTransaction(),
+        }
+        pg_sys::MemoryContextSwitchTo(memory_context);
+        pg_sys::CurrentResourceOwner = resource_owner;
+        result
+    }
 }
 
 fn spi_err(e: pgrx::spi::Error) -> String {
@@ -116,6 +143,7 @@ struct LiveView {
     frontier: u64,
     last_seq: i64,
     start_seq: i64,
+    apply_failures: i32,
     definition: String,
     touched: bool,
     stale: Option<String>,
@@ -132,7 +160,7 @@ fn load_live_views() -> Result<Vec<LiveView>, String> {
     Spi::connect(|client| {
         let mut views = Vec::new();
         for r in client.select(
-            "SELECT id, name, base_table::oid::int8, spec, frontier_lsn::text, last_seq, definition \
+            "SELECT id, name, base_table::oid::int8, spec, frontier_lsn::text, last_seq, definition, apply_failures \
              FROM nabla.views WHERE status = 'live' ORDER BY id",
             None,
             &[],
@@ -145,15 +173,17 @@ fn load_live_views() -> Result<Vec<LiveView>, String> {
                     continue;
                 }
             };
+            let last_seq = r.get::<i64>(6)?.expect("last_seq");
             views.push(LiveView {
                 id: r.get::<i32>(1)?.expect("id"),
                 name: r.get::<String>(2)?.expect("name"),
                 base_oid: r.get::<i64>(3)?.expect("base") as u32,
                 spec,
                 frontier: lsn::parse(&r.get::<String>(5)?.expect("frontier")).unwrap_or(0),
-                last_seq: r.get::<i64>(6)?.expect("last_seq"),
-                start_seq: r.get::<i64>(6)?.expect("last_seq"),
+                last_seq,
+                start_seq: last_seq,
                 definition: r.get::<String>(7)?.expect("definition"),
+                apply_failures: r.get::<i32>(8)?.unwrap_or(0),
                 touched: false,
                 stale: None,
             });
@@ -249,60 +279,140 @@ fn apply_change(view: &mut LiveView, rel: &Relation, change: &Change, tx: &Sourc
     Ok(())
 }
 
-struct ApplyStats {
-    deltas: usize,
+fn change_relids(change: &Change) -> Vec<u32> {
+    match change {
+        Change::Insert { relid, .. } | Change::Update { relid, .. } | Change::Delete { relid, .. } => vec![*relid],
+        Change::Truncate { relids } => relids.clone(),
+    }
 }
 
-/// Apply one complete source transaction in one worker transaction.
+fn mark_stale(view: &LiveView, reason: &str) -> Result<(), String> {
+    pgrx::warning!("nabla worker: view {} marked stale: {reason}", view.name);
+    let args: [DatumWithOid; 2] = [view.id.into(), reason.into()];
+    Spi::run_with_args("UPDATE nabla.views SET status = 'stale', stale_reason = $2 WHERE id = $1", &args)
+        .map_err(spi_err)
+}
+
+/// Record a failed apply. Returns true when the view is still live (and the
+/// transaction must be retried), false when it just went stale.
+fn record_failure(view: &mut LiveView, tx: &SourceTransaction, message: &str) -> Result<bool, String> {
+    let max = guc::MAX_APPLY_FAILURES.get().max(1);
+    let failures = view.apply_failures + 1;
+    view.apply_failures = failures;
+    if failures >= max {
+        let reason = format!("apply failed {failures} times: {message}");
+        pgrx::warning!("nabla worker: view {} marked stale: {reason}", view.name);
+        let args: [DatumWithOid; 4] = [view.id.into(), reason.as_str().into(), failures.into(), message.into()];
+        Spi::run_with_args(
+            "UPDATE nabla.views SET status = 'stale', stale_reason = $2, apply_failures = $3, \
+             last_error = $4, last_error_at = now() WHERE id = $1",
+            &args,
+        )
+        .map_err(spi_err)?;
+        view.stale = Some(reason);
+        return Ok(false);
+    }
+    pgrx::log!(
+        "nabla worker: view {} failed to apply the transaction ending at {} (attempt {failures} of {max}): {message}",
+        view.name,
+        lsn::format(tx.end_lsn)
+    );
+    let args: [DatumWithOid; 3] = [view.id.into(), failures.into(), message.into()];
+    Spi::run_with_args(
+        "UPDATE nabla.views SET apply_failures = $2, last_error = $3, last_error_at = now() WHERE id = $1",
+        &args,
+    )
+    .map_err(spi_err)?;
+    Ok(true)
+}
+
+/// Advance a view that absorbed the transaction: frontier, sequence counter,
+/// failure bookkeeping reset, delta garbage collection and notification.
+fn record_success(view: &LiveView, tx: &SourceTransaction) -> Result<(), String> {
+    let args: [DatumWithOid; 3] = [lsn::format(tx.end_lsn).into(), view.last_seq.into(), view.id.into()];
+    Spi::run_with_args(
+        "UPDATE nabla.views SET frontier_lsn = $1::pg_lsn, last_seq = $2, \
+         apply_failures = 0, last_error = NULL, last_error_at = NULL WHERE id = $3",
+        &args,
+    )
+    .map_err(spi_err)?;
+    if view.touched {
+        let retain = guc::RETAIN_DELTAS.get() as i64;
+        let gc: [DatumWithOid; 2] = [view.id.into(), (view.last_seq - retain).into()];
+        Spi::run_with_args("DELETE FROM nabla.deltas WHERE view_id = $1 AND seq <= $2", &gc).map_err(spi_err)?;
+        let channel = format!("nabla:{}", view.name);
+        let payload = format!("{}:{}", view.last_seq, lsn::format(tx.end_lsn));
+        let notify: [DatumWithOid; 2] = [channel.into(), payload.into()];
+        Spi::run_with_args("SELECT pg_catalog.pg_notify($1, $2)", &notify).map_err(spi_err)?;
+    }
+    Ok(())
+}
+
+struct ApplyStats {
+    deltas: usize,
+    /// A live view failed and must retry: the slot must not advance past `tx`.
+    blocked: bool,
+}
+
+/// Apply one complete source transaction in one worker transaction, each view
+/// in its own subtransaction.
 fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<ApplyStats, String> {
     Spi::run("SET LOCAL nabla.internal_write = on").map_err(spi_err)?;
     let mut views = load_live_views()?;
-    let mut stats = ApplyStats { deltas: 0 };
 
+    let mut relations: HashMap<u32, Relation> = HashMap::new();
     for change in &tx.changes {
-        let relids: Vec<u32> = match change {
-            Change::Insert { relid, .. } | Change::Update { relid, .. } | Change::Delete { relid, .. } => vec![*relid],
-            Change::Truncate { relids } => relids.clone(),
-        };
-        for relid in relids {
+        for relid in change_relids(change) {
+            if relations.contains_key(&relid) {
+                continue;
+            }
             let Some(rel) = decoder.relations.get_mut(&relid) else {
                 return Err(format!("change for unknown relation {relid}"));
             };
             resolve_types(rel)?;
-            let rel = rel.clone();
-            for view in views.iter_mut() {
-                if view.base_oid != relid || view.stale.is_some() || tx.end_lsn <= view.frontier {
-                    continue;
-                }
-                apply_change(view, &rel, change, tx)?;
-            }
+            relations.insert(relid, rel.clone());
         }
     }
 
-    let retain = guc::RETAIN_DELTAS.get() as i64;
+    let mut stats = ApplyStats { deltas: 0, blocked: false };
     for view in views.iter_mut() {
-        if let Some(reason) = &view.stale {
-            pgrx::warning!("nabla worker: view {} marked stale: {reason}", view.name);
-            Spi::run_with_args("UPDATE nabla.views SET status = 'stale' WHERE id = $1", &[view.id.into()])
-                .map_err(spi_err)?;
-            continue;
-        }
         if tx.end_lsn <= view.frontier {
-            continue;
+            continue; // already absorbed (replay after a crash or a retry round)
         }
-        let args: [DatumWithOid; 3] = [lsn::format(tx.end_lsn).into(), view.last_seq.into(), view.id.into()];
-        Spi::run_with_args(
-            "UPDATE nabla.views SET frontier_lsn = $1::pg_lsn, last_seq = $2 WHERE id = $3",
-            &args,
-        )
-        .map_err(spi_err)?;
-        if view.touched {
-            let gc: [DatumWithOid; 2] = [view.id.into(), (view.last_seq - retain).into()];
-            Spi::run_with_args("DELETE FROM nabla.deltas WHERE view_id = $1 AND seq <= $2", &gc).map_err(spi_err)?;
-            let channel = format!("nabla:{}", view.name);
-            let payload = format!("{}:{}", view.last_seq, lsn::format(tx.end_lsn));
-            let notify: [DatumWithOid; 2] = [channel.into(), payload.into()];
-            Spi::run_with_args("SELECT pg_catalog.pg_notify($1, $2)", &notify).map_err(spi_err)?;
+        let touched = tx.changes.iter().any(|c| change_relids(c).contains(&view.base_oid));
+        let (seq_before, touched_before) = (view.last_seq, view.touched);
+        let outcome = if touched {
+            in_subtransaction(AssertUnwindSafe(|| {
+                for change in &tx.changes {
+                    for relid in change_relids(change) {
+                        if relid == view.base_oid {
+                            apply_change(view, &relations[&relid], change, tx)?;
+                        }
+                    }
+                }
+                Ok(())
+            }))
+        } else {
+            Ok(())
+        };
+        match outcome {
+            Ok(()) => {
+                if let Some(reason) = view.stale.take() {
+                    mark_stale(view, &reason)?;
+                    continue;
+                }
+                record_success(view, tx)?;
+            }
+            Err(message) => {
+                // The subtransaction rolled back the view's rows and deltas;
+                // undo the in-memory bookkeeping as well.
+                view.last_seq = seq_before;
+                view.touched = touched_before;
+                view.stale = None;
+                if record_failure(view, tx, &message)? {
+                    stats.blocked = true;
+                }
+            }
         }
     }
     stats.deltas = views.iter().map(|v| (v.last_seq - v.start_seq).max(0)).sum::<i64>() as usize;
@@ -361,7 +471,12 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
     let confirmed = lsn::parse(&confirmed_text).unwrap_or(0);
     if lag > guc::MAX_SLOT_LAG_BYTES.get() as i64 {
         try_transaction(|| {
-            Spi::run("UPDATE nabla.views SET status = 'stale' WHERE status = 'live'").map_err(spi_err)?;
+            Spi::run(
+                "UPDATE nabla.views SET status = 'stale', \
+                 stale_reason = 'replication slot lag exceeded nabla.max_slot_lag_bytes; slot dropped' \
+                 WHERE status = 'live'",
+            )
+            .map_err(spi_err)?;
             Spi::run_with_args("SELECT pg_catalog.pg_drop_replication_slot($1)", &[SLOT.into()]).map_err(spi_err)
         })??;
         pgrx::warning!(
@@ -417,6 +532,11 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
         let decoder = &mut state.decoder;
         let stats = try_transaction(AssertUnwindSafe(|| apply_transaction(decoder, tx)))??;
         total_deltas += stats.deltas;
+        if stats.blocked {
+            // A live view must retry this transaction on the next poll: keep
+            // the slot here and do not touch the frontiers of anyone else.
+            return Ok(Round::Idle);
+        }
         try_transaction(|| advance_slot(tx.end_lsn))??;
         last_end = last_end.max(tx.end_lsn);
         applied += 1;
@@ -425,7 +545,7 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
     if drained {
         // Everything up to `target` was decoded: views reflect the base at `target`.
         let frontier = target.max(last_end);
-        let after_flush = try_transaction(|| {
+        try_transaction(|| {
             let args: [DatumWithOid; 1] = [lsn::format(frontier).into()];
             Spi::run_with_args(
                 "UPDATE nabla.views SET frontier_lsn = $1::pg_lsn WHERE status = 'live' AND frontier_lsn < $1::pg_lsn",
@@ -434,7 +554,6 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
             .map_err(spi_err)?;
             advance_slot(frontier)
         })??;
-        let _ = after_flush;
         state.self_flush = try_transaction(|| {
             select_one::<String>("SELECT pg_catalog.pg_current_wal_flush_lsn()::text", &[])
                 .map(|t| t.and_then(|t| lsn::parse(&t)).unwrap_or(0))
@@ -477,6 +596,10 @@ fn worker_main() {
             }
         } else if BackgroundWorker::sigterm_received() {
             break;
+        }
+        if BackgroundWorker::sighup_received() {
+            // Pick up changed nabla.* settings (poll interval, retention, limits).
+            unsafe { pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP) };
         }
         busy = match run_round(&mut state) {
             Ok(Round::MoreWork) => true,

@@ -15,6 +15,12 @@ CREATE TABLE nabla.views (
   status        text NOT NULL DEFAULT 'live' CHECK (status IN ('live', 'stale')),
   last_seq      bigint NOT NULL DEFAULT 0,       -- last delta sequence number handed out
   resync_seq    bigint NOT NULL DEFAULT 0,       -- cursors below this must resync (set by refresh)
+  -- Failure isolation (see README "Failure isolation"). Added in v0.1 before
+  -- any release, so no upgrade script migrates older catalogs.
+  apply_failures int NOT NULL DEFAULT 0,          -- consecutive failed applies of the pending transaction
+  last_error    text,
+  last_error_at timestamptz,
+  stale_reason  text,                             -- why status became 'stale'
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 

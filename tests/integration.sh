@@ -67,6 +67,7 @@ shared_preload_libraries = 'nabla'
 nabla.database = '$DB'
 nabla.retain_deltas = 50
 nabla.poll_interval_ms = 50
+nabla.max_apply_failures = 3
 max_replication_slots = 4
 max_wal_senders = 4
 log_min_messages = warning
@@ -342,6 +343,70 @@ reject "syntax error surfaces PostgreSQL's text" "SELEC id FROM orders" "syntax 
 reject "missing column surfaces PostgreSQL's text" "SELECT nosuch FROM orders" "column \"nosuch\" does not exist"
 reject "two statements" "SELECT id FROM orders; SELECT id FROM orders" "exactly one SELECT statement"
 assert_eq "rejected definitions leave no view behind" "0" "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.rejected'")"
+
+# --- 13. failure isolation ---------------------------------------------------
+echo "== 13. failure isolation"
+q "CREATE TABLE t (id bigserial PRIMARY KEY, k int, amount numeric)" >/dev/null
+q "ALTER TABLE t REPLICA IDENTITY FULL" >/dev/null
+q "SELECT nabla.create_view('public.bad', 'SELECT id, 100 / k AS ratio FROM t')" >/dev/null || die "create_view(bad) failed"
+q "SELECT nabla.create_view('public.good', 'SELECT k, count(*) AS n FROM t GROUP BY k')" >/dev/null || die "create_view(good) failed"
+for k in 1 2 4; do q "INSERT INTO t (k, amount) VALUES ($k, 1)" >/dev/null; done
+wait_view public.bad
+wait_view public.good
+bad_diff() { q "SELECT count(*) FROM ((SELECT id, ratio FROM bad EXCEPT SELECT id, 100 / k FROM t) UNION ALL (SELECT id, 100 / k FROM t EXCEPT SELECT id, ratio FROM bad)) d"; }
+good_diff() { q "SELECT count(*) FROM ((SELECT k, n FROM good EXCEPT SELECT k, count(*) FROM t GROUP BY k) UNION ALL (SELECT k, count(*) FROM t GROUP BY k EXCEPT SELECT k, n FROM good)) d"; }
+assert_eq "bad and good equal their queries before the failure" "0|0" "$(bad_diff)|$(good_diff)"
+F0=$(q "SELECT nabla.frontier('public.bad')")
+# Slow the worker down so the intermediate failure count is observable.
+q "ALTER SYSTEM SET nabla.poll_interval_ms = 1000" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+sleep 0.5
+q "INSERT INTO t (k, amount) VALUES (0, 1)" >/dev/null
+L0=$(q "SELECT pg_current_wal_lsn()")
+q "INSERT INTO t (k, amount) VALUES (5, 1)" >/dev/null
+SEEN_LIVE_FAILURE=no
+STATUS=live
+for _ in $(seq 1 150); do
+  ROW=$(q "SELECT status || '|' || apply_failures FROM nabla.views WHERE name = 'public.bad'")
+  STATUS=${ROW%%|*}
+  FAILS=${ROW##*|}
+  if [ "$STATUS" = live ] && [ "$FAILS" -ge 1 ]; then SEEN_LIVE_FAILURE=yes; fi
+  [ "$STATUS" = stale ] && break
+  sleep 0.1
+done
+q "ALTER SYSTEM RESET nabla.poll_interval_ms" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+assert_eq "bad goes stale after repeated failures" "stale" "$STATUS"
+assert_eq "an intermediate failure count was observed while still live" "yes" "$SEEN_LIVE_FAILURE"
+assert_eq "failure bookkeeping" "3|true|true|true" \
+  "$(q "SELECT apply_failures || '|' || (last_error LIKE '%division by zero%') || '|' || (stale_reason LIKE 'apply failed 3 times:%division by zero%') || '|' || (last_error_at IS NOT NULL) FROM nabla.views WHERE name = 'public.bad'")"
+assert_eq "exactly one stale WARNING for bad in the server log" "1" "$(grep -c 'nabla worker: view public.bad marked stale' "$LOG")"
+wait_view public.good
+assert_eq "good was never blocked and includes k = 0 and k = 5" "0|1|1" "$(good_diff)|$(q "SELECT n FROM good WHERE k = 0")|$(q "SELECT n FROM good WHERE k = 5")"
+assert_eq "good's frontier passed the failing transaction" "t" "$(q "SELECT nabla.frontier('public.good') >= '$L0'::pg_lsn")"
+SLOT_OK=no
+for _ in $(seq 1 50); do
+  if [ "$(q "SELECT confirmed_flush_lsn >= '$L0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'nabla'")" = t ]; then SLOT_OK=yes; break; fi
+  sleep 0.1
+done
+assert_eq "the slot advanced past the failing transaction" "yes" "$SLOT_OK"
+ERR=$(q_err "SELECT count(*) FROM nabla.changes('public.bad', 0)")
+assert_contains "changes() on a stale view names the reason" 'nabla: view "public.bad" is stale: apply failed 3 times: division by zero' "$ERR"
+assert_contains "changes() on a stale view carries the refresh hint" "Run nabla.refresh('public.bad') after fixing the cause" "$ERR"
+ERR=$(q_err "SELECT nabla.wait_for('public.bad', pg_current_wal_lsn(), 100)")
+assert_contains "wait_for() on a stale view raises the stale error" 'nabla: view "public.bad" is stale: apply failed 3 times' "$ERR"
+assert_eq "frontier('bad') still returns the last absorbed LSN" "t" \
+  "$(q "SELECT nabla.frontier('public.bad') >= '$F0'::pg_lsn AND nabla.frontier('public.bad') < '$L0'::pg_lsn")"
+ERR=$(q_err "SELECT nabla.refresh('public.bad')")
+assert_contains "refresh() fails with PostgreSQL's error while the bad row exists" "division by zero" "$ERR"
+assert_eq "bad stays stale after a failed refresh" "stale" "$(q "SELECT status FROM nabla.views WHERE name = 'public.bad'")"
+q "DELETE FROM t WHERE k = 0" >/dev/null
+q "SELECT nabla.refresh('public.bad')" >/dev/null || die "refresh(bad) failed after removing the bad row"
+assert_eq "refresh() recovers the view" "live|0|true|true" \
+  "$(q "SELECT status || '|' || apply_failures || '|' || (last_error IS NULL) || '|' || (stale_reason IS NULL) FROM nabla.views WHERE name = 'public.bad'")"
+q "INSERT INTO t (k, amount) VALUES (7, 1)" >/dev/null
+wait_view public.bad
+assert_eq "bad is maintained again after recovery" "0|1" "$(bad_diff)|$(q "SELECT count(*) FROM bad WHERE ratio = 14")"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

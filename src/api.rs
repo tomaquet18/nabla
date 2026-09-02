@@ -136,6 +136,15 @@ struct CatalogRow {
     status: String,
     last_seq: i64,
     resync_seq: i64,
+    stale_reason: Option<String>,
+}
+
+/// Raised by subscriber-facing functions on a stale view.
+fn stale_error(name: &str, reason: Option<&str>) -> ! {
+    errors::prerequisite(
+        format!("nabla: view \"{name}\" is stale: {}", reason.unwrap_or("reason not recorded")),
+        Some(&format!("Run nabla.refresh('{name}') after fixing the cause.")),
+    )
 }
 
 fn load_view(name: &str) -> CatalogRow {
@@ -143,7 +152,7 @@ fn load_view(name: &str) -> CatalogRow {
     let row = Spi::connect(|client| {
         let mut out = None;
         for r in client.select(
-            "SELECT id, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq \
+            "SELECT id, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq, stale_reason \
              FROM nabla.views WHERE name = $1",
             Some(1),
             &args,
@@ -159,6 +168,7 @@ fn load_view(name: &str) -> CatalogRow {
                 status: r.get::<String>(5)?.expect("status"),
                 last_seq: r.get::<i64>(6)?.expect("last_seq"),
                 resync_seq: r.get::<i64>(7)?.expect("resync_seq"),
+                stale_reason: r.get::<String>(8)?,
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -268,7 +278,7 @@ mod nabla {
         run(&format!("INSERT INTO {name} {}", view.spec.populate_sql));
         run_args(
             "UPDATE nabla.views SET frontier_lsn = pg_catalog.pg_current_wal_lsn(), epoch = epoch + 1, \
-             status = 'live', last_seq = last_seq + 1, resync_seq = last_seq + 1 WHERE id = $1",
+             status = 'live', last_seq = last_seq + 1, resync_seq = last_seq + 1, apply_failures = 0, last_error = NULL, last_error_at = NULL, stale_reason = NULL WHERE id = $1",
             &[view.id.into()],
         );
         run_args("DELETE FROM nabla.deltas WHERE view_id = $1", &[view.id.into()]);
@@ -284,14 +294,14 @@ mod nabla {
         current_frontier(&name).0 as i64
     }
 
-    /// (frontier, status) read with a fresh snapshot.
-    fn current_frontier(name: &str) -> (u64, String) {
+    /// (frontier, status, stale_reason) read with a fresh snapshot.
+    fn current_frontier(name: &str) -> (u64, String, Option<String>) {
         // Read-only SPI runs under the active snapshot, so push the latest one
         // to observe the worker's commits while polling.
         unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot()) };
         let found = Spi::connect(|client| {
             let table = client.select(
-                "SELECT frontier_lsn::text, status FROM nabla.views WHERE name = $1",
+                "SELECT frontier_lsn::text, status, stale_reason FROM nabla.views WHERE name = $1",
                 Some(1),
                 &[name.into()],
             )?;
@@ -299,11 +309,12 @@ mod nabla {
                 Ok(None)
             } else {
                 let table = table.first();
-                Ok(Some((table.get::<String>(1)?, table.get::<String>(2)?)))
+                Ok(Some((table.get::<String>(1)?, table.get::<String>(2)?, table.get::<String>(3)?)))
             }
         });
         unsafe { pg_sys::PopActiveSnapshot() };
-        let (lsn_text, status) = found.unwrap_or_else(|e| spi_fail(e)).unwrap_or((None, None));
+        let (lsn_text, status, stale_reason) =
+            found.unwrap_or_else(|e| spi_fail(e)).unwrap_or((None, None, None));
         let lsn_text = lsn_text.unwrap_or_else(|| {
             errors::raise(
                 PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
@@ -311,7 +322,7 @@ mod nabla {
                 None,
             )
         });
-        (lsn::parse(&lsn_text).unwrap_or(0), status.unwrap_or_default())
+        (lsn::parse(&lsn_text).unwrap_or(0), status.unwrap_or_default(), stale_reason)
     }
 
     #[pg_extern(sql = r#"
@@ -323,12 +334,9 @@ mod nabla {
         let target = lsn as u64;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
         loop {
-            let (frontier, status) = current_frontier(&name);
+            let (frontier, status, stale_reason) = current_frontier(&name);
             if status == "stale" {
-                errors::prerequisite(
-                    format!("nabla: view \"{name}\" is stale and is no longer maintained"),
-                    Some("Run nabla.refresh(name) to rebuild it."),
-                );
+                stale_error(&name, stale_reason.as_deref());
             }
             if frontier >= target {
                 return true;
@@ -360,10 +368,7 @@ mod nabla {
         let name = require_qualified_name(name);
         let view = load_view(&name);
         if view.status == "stale" {
-            errors::prerequisite(
-                format!("nabla: view \"{name}\" is stale and is no longer maintained"),
-                Some("Run nabla.refresh(name) to rebuild it."),
-            );
+            stale_error(&name, view.stale_reason.as_deref());
         }
         let oldest = read_one::<i64>("SELECT min(seq) FROM nabla.deltas WHERE view_id = $1", &[view.id.into()]);
         let oldest_available = oldest.unwrap_or(view.last_seq + 1) - 1;
