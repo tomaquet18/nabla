@@ -205,6 +205,7 @@ fn aggregate_adjust(view: &ViewTarget, rel: &Relation, row: &Tuple, sign: i32) -
         .sums
         .iter()
         .map(|s| format!("{} AS {}", s.expr, quote_identifier(&s.alias)))
+        .chain(spec.counts.iter().map(|c| format!("{} AS {}", c.expr, quote_identifier(&c.alias))))
         .collect();
     let mut cte_select = group_select.clone();
     cte_select.extend(sum_select);
@@ -230,18 +231,35 @@ fn aggregate_adjust(view: &ViewTarget, rel: &Relation, row: &Tuple, sign: i32) -
 
     let group_aliases: Vec<String> = spec.columns.iter().map(|c| quote_identifier(&c.alias)).collect();
     let mut insert_cols = group_aliases.clone();
-    insert_cols.push(count.clone());
-    insert_cols.extend(spec.sums.iter().map(|s| quote_identifier(&s.alias)));
     let mut insert_select = group_aliases.clone();
+    let mut updates: Vec<String> = Vec::new();
+    // count(*): every row contributes 1.
+    insert_cols.push(count.clone());
     insert_select.push(format!("{sign}"));
-    insert_select.extend(spec.sums.iter().map(|s| format!("({sign}) * {}", quote_identifier(&s.alias))));
-    let mut updates = vec![format!("{count} = v.{count} + EXCLUDED.{count}")];
-    for s in &spec.sums {
-        let a = quote_identifier(&s.alias);
-        // sum() ignores NULLs: a NULL contribution leaves the running sum untouched.
+    updates.push(format!("{count} = v.{count} + EXCLUDED.{count}"));
+    // count(expr): the number of non-NULL values.
+    for c in &spec.counts {
+        let a = quote_identifier(&c.alias);
+        insert_cols.push(a.clone());
+        insert_select.push(format!("({sign}) * ({a} IS NOT NULL)::int"));
+        updates.push(format!("{a} = v.{a} + EXCLUDED.{a}"));
+    }
+    // sum(expr) with its hidden non-NULL counter. sum() ignores NULLs and is
+    // NULL when nothing non-NULL contributed, so the stored sum is NULL exactly
+    // when the counter is 0; the CASE keeps that atomic with the row update.
+    for su in &spec.sums {
+        let a = quote_identifier(&su.alias);
+        let nn = quote_identifier(&su.counter);
+        insert_cols.push(a.clone());
+        insert_select.push(format!("({sign}) * {a}"));
+        insert_cols.push(nn.clone());
+        insert_select.push(format!("({sign}) * ({a} IS NOT NULL)::int"));
         updates.push(format!(
-            "{a} = CASE WHEN EXCLUDED.{a} IS NULL THEN v.{a} WHEN v.{a} IS NULL THEN EXCLUDED.{a} ELSE v.{a} + EXCLUDED.{a} END"
+            "{a} = CASE WHEN v.{nn} + EXCLUDED.{nn} = 0 THEN NULL \
+             WHEN EXCLUDED.{a} IS NULL THEN v.{a} WHEN v.{a} IS NULL THEN EXCLUDED.{a} \
+             ELSE v.{a} + EXCLUDED.{a} END"
         ));
+        updates.push(format!("{nn} = v.{nn} + EXCLUDED.{nn}"));
     }
     let upsert = format!(
         "{cte} INSERT INTO {view} AS v ({cols}) SELECT {sel} FROM src \

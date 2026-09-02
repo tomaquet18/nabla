@@ -69,12 +69,18 @@ exactly as in `psql`; the shape decision is made on the analyzed query tree
    Output expressions may be plain columns or IMMUTABLE expressions over the
    base table's columns. The base table's primary key columns must be selected
    as plain columns (they may be aliased).
-2. **Aggregate**: `SELECT key [AS alias][, ...], count(*) [AS a][, sum(expr) [AS b]]...
-   FROM table [WHERE predicate] GROUP BY key[, ...]`. Keys and sum arguments may
-   be IMMUTABLE expressions; every `GROUP BY` expression must be selected. The
-   base table needs `REPLICA IDENTITY FULL`. If the definition has no
-   `count(*)`, nabla adds a column `_nabla_n bigint` carrying the group count;
-   it is part of the view table and of every delta row.
+2. **Aggregate**: `SELECT key [AS alias][, ...], <aggregate> [AS a][, ...]
+   FROM table [WHERE predicate] GROUP BY key[, ...]`. Accepted aggregates are
+   `count(*)`, `count(<expr>)` and `sum(<expr>)`, with PostgreSQL's NULL
+   semantics: `count(<expr>)` counts non-NULL values and `sum(<expr>)` is NULL
+   while no non-NULL value contributes. Keys and aggregate arguments may be
+   IMMUTABLE expressions; every `GROUP BY` expression must be selected. The
+   base table needs `REPLICA IDENTITY FULL`. nabla appends hidden columns to
+   the view table: `_nabla_nn_<n> bigint` for every `sum` (its non-NULL
+   counter; n is the sum's 0-based position among the aggregates) and, when
+   the definition has no `count(*)`, `_nabla_n bigint` with the group count.
+   They appear in the view table and in every delta row; clients should
+   ignore all `_nabla_*` columns, and definitions may not use such names.
 
 Everything else is rejected with `ERROR: nabla: unsupported view definition:
 <reason>` and a hint listing the two shapes: joins, subqueries, CTEs, set
@@ -180,10 +186,8 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
 
 - Joins, multiple base tables, subqueries, expressions, other aggregates
   (`avg`, `min`, `max`, ...), `HAVING`, `DISTINCT`.
-- Single-group aggregates without `GROUP BY` (`SELECT count(*) FROM t`),
-  `count(expr)`, and `min`/`max`/`avg`.
-- `sum()` over a group whose only remaining rows have NULL values yields 0
-  rather than NULL (no per-column non-null counter yet).
+- Single-group aggregates without `GROUP BY` (`SELECT count(*) FROM t`) and
+  `min`/`max`/`avg`.
 - A streaming transport for subscribers; `changes()` is pull-based.
 - Snapshot export at `create_view` so subscribers can start without a
   `SHARE`-locked rebuild.

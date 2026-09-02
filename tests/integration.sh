@@ -408,6 +408,53 @@ q "INSERT INTO t (k, amount) VALUES (7, 1)" >/dev/null
 wait_view public.bad
 assert_eq "bad is maintained again after recovery" "0|1" "$(bad_diff)|$(q "SELECT count(*) FROM bad WHERE ratio = 14")"
 
+# --- 14. NULL semantics of sum() and count(expr) -----------------------------
+echo "== 14. sum()/count(expr) NULL semantics"
+q "CREATE TABLE s (id bigserial PRIMARY KEY, k int, v numeric, w int)" >/dev/null
+q "ALTER TABLE s REPLICA IDENTITY FULL" >/dev/null
+q "SELECT nabla.create_view('public.agg_s', 'SELECT k, count(*) AS n, sum(v) AS sv, count(w) AS cw, sum(w) AS sw FROM s GROUP BY k')" >/dev/null \
+  || die "create_view(agg_s) failed"
+s_diff() { q "SELECT count(*) FROM ((SELECT k, n, sv, cw, sw FROM agg_s EXCEPT SELECT k, count(*), sum(v), count(w), sum(w) FROM s GROUP BY k)
+  UNION ALL (SELECT k, count(*), sum(v), count(w), sum(w) FROM s GROUP BY k EXCEPT SELECT k, n, sv, cw, sw FROM agg_s)) d"; }
+s_row() { q "SELECT n || '|' || coalesce(sv::text, 'NULL') || '|' || cw || '|' || coalesce(sw::text, 'NULL') FROM agg_s WHERE k = $1"; }
+assert_eq "hidden sum counters exist after the user's columns" "k,n,sv,cw,sw,_nabla_nn_1,_nabla_nn_3" \
+  "$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'agg_s'")"
+q "INSERT INTO s (k, v, w) VALUES (1, NULL, NULL), (1, NULL, NULL)" >/dev/null
+wait_view public.agg_s
+assert_eq "group of only NULLs: n=2, sums NULL, count(w)=0" "2|NULL|0|NULL|0" "$(s_row 1)|$(s_diff)"
+q "INSERT INTO s (k, v, w) VALUES (1, 5, 7)" >/dev/null
+wait_view public.agg_s
+assert_eq "first non-NULL contribution" "3|5|1|7|0" "$(s_row 1)|$(s_diff)"
+q "DELETE FROM s WHERE k = 1 AND v = 5" >/dev/null
+wait_view public.agg_s
+assert_eq "sums return to NULL when the last non-NULL row is deleted" "2|NULL|0|NULL|0" "$(s_row 1)|$(s_diff)"
+q "UPDATE s SET v = 3 WHERE id = (SELECT min(id) FROM s WHERE k = 1)" >/dev/null
+wait_view public.agg_s
+assert_eq "update NULL -> 3 is followed" "2|3|0|NULL|0" "$(s_row 1)|$(s_diff)"
+q "UPDATE s SET v = NULL WHERE k = 1" >/dev/null
+wait_view public.agg_s
+assert_eq "update 3 -> NULL is followed" "2|NULL|0|NULL|0" "$(s_row 1)|$(s_diff)"
+q "INSERT INTO s (k, v, w) VALUES (2, NULL, NULL), (2, 1, 1), (2, 2, NULL), (2, NULL, 4)" >/dev/null
+wait_view public.agg_s
+assert_eq "mixed group" "4|3|2|5|0" "$(s_row 2)|$(s_diff)"
+q "DELETE FROM s WHERE k = 2 AND (v IS NOT NULL OR w IS NOT NULL)" >/dev/null
+wait_view public.agg_s
+assert_eq "deleting the non-NULL rows leaves NULL sums with n > 0" "1|NULL|0|NULL|0" "$(s_row 2)|$(s_diff)"
+q "DELETE FROM s WHERE k = 2" >/dev/null
+wait_view public.agg_s
+assert_eq "empty group disappears" "0|0" "$(q "SELECT count(*) FROM agg_s WHERE k = 2")|$(s_diff)"
+q "INSERT INTO s (k, v, w) VALUES (3, 1.5, NULL), (3, NULL, 2), (1, 2.5, 9)" >/dev/null
+wait_view public.agg_s
+q "CREATE TABLE agg_s_snapshot AS SELECT * FROM agg_s" >/dev/null
+q "SELECT nabla.refresh('public.agg_s')" >/dev/null || die "refresh(agg_s) failed"
+assert_eq "refresh reproduces the maintained table exactly, hidden counters included" "0" \
+  "$(q "SELECT count(*) FROM ((SELECT * FROM agg_s_snapshot EXCEPT SELECT * FROM agg_s) UNION ALL (SELECT * FROM agg_s EXCEPT SELECT * FROM agg_s_snapshot)) d")"
+reject "count(DISTINCT w) still rejected" "SELECT k, count(DISTINCT w) AS c FROM s GROUP BY k" "DISTINCT inside aggregates is not supported"
+reject "sum(w) FILTER still rejected" "SELECT k, sum(w) FILTER (WHERE w > 1) AS f FROM s GROUP BY k" "FILTER on aggregates is not supported"
+reject "count(expr) with a mutable expression rejected" "SELECT k, count(w + random()::int) AS c FROM s GROUP BY k" "the argument of count() in column \"c\" uses \"random\", which is not IMMUTABLE"
+reject "count(w) without GROUP BY rejected" "SELECT count(w) AS c FROM s" "aggregates require a GROUP BY clause"
+reject "reserved _nabla_ names rejected" "SELECT k AS _nabla_key, count(*) FROM s GROUP BY k" "column names starting with _nabla_ are reserved"
+
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"
 grep -E 'WARNING|ERROR|FATAL|PANIC' "$LOG" | tail -n 20 || true

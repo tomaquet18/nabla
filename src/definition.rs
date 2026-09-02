@@ -27,6 +27,10 @@ use crate::errors;
 /// Name of the group-count column added when an aggregate definition has no
 /// count(*). It is a real column of the view table and appears in deltas.
 pub const HIDDEN_COUNT_COLUMN: &str = "_nabla_n";
+/// Prefix of the hidden non-NULL counter that accompanies every sum():
+/// `_nabla_nn_<n>`, where n is the 0-based position of that sum among the
+/// view's aggregates in select-list order. Clients ignore `_nabla_*` columns.
+pub const HIDDEN_SUM_COUNTER_PREFIX: &str = "_nabla_nn_";
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -52,6 +56,16 @@ pub struct OutputColumn {
     pub alias: String,
 }
 
+/// A sum() aggregate: the deparsed argument, the output column, and the
+/// hidden column counting its non-NULL contributions (the stored sum is
+/// NULL exactly when that counter is 0, matching PostgreSQL).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SumSpec {
+    pub expr: String,
+    pub alias: String,
+    pub counter: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ViewSpec {
     pub shape: Shape,
@@ -71,8 +85,10 @@ pub struct ViewSpec {
     pub count_alias: Option<String>,
     /// True when `count_alias` is the hidden column nabla added.
     pub hidden_count: bool,
-    /// sum() aggregates: `expr` is the deparsed argument.
-    pub sums: Vec<OutputColumn>,
+    /// count(<expr>) aggregates: the output column is the non-NULL counter itself.
+    pub counts: Vec<OutputColumn>,
+    /// sum() aggregates with their hidden non-NULL counters.
+    pub sums: Vec<SumSpec>,
     /// SELECT that fills the view table (create and refresh).
     pub populate_sql: String,
 }
@@ -384,10 +400,11 @@ unsafe fn group_refs(query: *mut pg_sys::Query) -> Vec<u32> {
 
 enum AggKind {
     Count,
+    CountExpr(*mut pg_sys::Node),
     Sum(*mut pg_sys::Node),
 }
 
-/// Accept only count(*) and sum(<expression>) in their plain forms.
+/// Accept only count(*), count(<expression>) and sum(<expression>) in their plain forms.
 unsafe fn classify_aggregate(node: *mut pg_sys::Node, alias: &str) -> AggKind {
     let agg = &*(node as *mut pg_sys::Aggref);
     let name = func_name(agg.aggfnoid);
@@ -406,10 +423,16 @@ unsafe fn classify_aggregate(node: *mut pg_sys::Node, alias: &str) -> AggKind {
     let builtin = pg_sys::get_func_namespace(agg.aggfnoid) == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE);
     match (builtin, name.as_str()) {
         (true, "count") => {
-            if !agg.aggstar {
-                reject("count(expression) is not supported; use count(*)");
+            if agg.aggstar {
+                return AggKind::Count;
             }
-            AggKind::Count
+            let args = list_items(agg.args);
+            if args.len() != 1 {
+                reject("count() must be count(*) or count(expression)");
+            }
+            let arg = (*(args[0] as *mut pg_sys::TargetEntry)).expr as *mut pg_sys::Node;
+            require_immutable(arg, &format!("the argument of count() in column \"{alias}\""));
+            AggKind::CountExpr(arg)
         }
         (true, "sum") => {
             let args = list_items(agg.args);
@@ -421,7 +444,7 @@ unsafe fn classify_aggregate(node: *mut pg_sys::Node, alias: &str) -> AggKind {
             AggKind::Sum(arg)
         }
         _ => reject(format!(
-            "aggregate \"{name}\" is not supported; only count(*) and sum(expression) are accepted"
+            "aggregate \"{name}\" is not supported; only count(*), count(expression) and sum(expression) are accepted"
         )),
     }
 }
@@ -461,6 +484,9 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
         }
         let mut seen = std::collections::HashSet::new();
         for t in &visible {
+            if t.alias.starts_with("_nabla_") {
+                reject(format!("column names starting with _nabla_ are reserved (\"{}\")", t.alias));
+            }
             if !seen.insert(t.alias.as_str()) {
                 reject(format!("output column names must be unique; add AS aliases (duplicate: \"{}\")", t.alias));
             }
@@ -478,6 +504,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             pk_view_columns: Vec::new(),
             count_alias: None,
             hidden_count: false,
+            counts: Vec::new(),
             sums: Vec::new(),
             populate_sql: String::new(),
         };
@@ -489,6 +516,9 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             if !has_group {
                 reject("aggregates require a GROUP BY clause");
             }
+            // Hidden columns go after the user's columns in the view table.
+            let mut hidden_targets: Vec<String> = Vec::new();
+            let mut agg_index = 0usize;
             for t in &visible {
                 let quoted_alias = pgrx::spi::quote_identifier(&t.alias);
                 if t.sortgroupref != 0 && refs.contains(&t.sortgroupref) {
@@ -498,6 +528,8 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                     group_exprs.push(expr.clone());
                     spec.columns.push(OutputColumn { expr, alias: t.alias.clone() });
                 } else if tag(t.node as *const c_void) == Some(NodeTag::T_Aggref) {
+                    let index = agg_index;
+                    agg_index += 1;
                     match classify_aggregate(t.node, &t.alias) {
                         AggKind::Count => {
                             if spec.count_alias.is_some() {
@@ -506,10 +538,17 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                             populate_targets.push(format!("count(*) AS {quoted_alias}"));
                             spec.count_alias = Some(t.alias.clone());
                         }
+                        AggKind::CountExpr(arg) => {
+                            let expr = deparser.expr(arg);
+                            populate_targets.push(format!("count({expr}) AS {quoted_alias}"));
+                            spec.counts.push(OutputColumn { expr, alias: t.alias.clone() });
+                        }
                         AggKind::Sum(arg) => {
                             let expr = deparser.expr(arg);
+                            let counter = format!("{HIDDEN_SUM_COUNTER_PREFIX}{index}");
                             populate_targets.push(format!("sum({expr}) AS {quoted_alias}"));
-                            spec.sums.push(OutputColumn { expr, alias: t.alias.clone() });
+                            hidden_targets.push(format!("count({expr}) AS {counter}"));
+                            spec.sums.push(SumSpec { expr, alias: t.alias.clone(), counter });
                         }
                     }
                 } else if pg_sys::contain_agg_clause(t.node) {
@@ -524,6 +563,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             if spec.columns.is_empty() {
                 reject("at least one GROUP BY key must be selected");
             }
+            populate_targets.extend(hidden_targets);
             if spec.count_alias.is_none() {
                 if seen.contains(HIDDEN_COUNT_COLUMN) {
                     reject(format!("the column name {HIDDEN_COUNT_COLUMN} is reserved for the group count"));
