@@ -173,6 +173,7 @@ struct CatalogRow {
     name: String,
     base_oid: u32,
     spec: ViewSpec,
+    frontier: u64,
     epoch: i32,
     status: String,
     last_seq: i64,
@@ -193,7 +194,8 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
         let mut out = Vec::new();
         for r in client.select(
             &format!(
-                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq, stale_reason \
+                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq, stale_reason, \
+                        frontier_lsn::text \
                  FROM nabla.views WHERE {clause} ORDER BY id"
             ),
             None,
@@ -212,6 +214,7 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
                 last_seq: r.get::<i64>(7)?.expect("last_seq"),
                 resync_seq: r.get::<i64>(8)?.expect("resync_seq"),
                 stale_reason: r.get::<String>(9)?,
+                frontier: lsn::parse(&r.get::<String>(10)?.unwrap_or_default()).unwrap_or(0),
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -495,6 +498,22 @@ mod nabla {
             pgrx::pg_sys::check_for_interrupts!();
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Everything a subscriber needs to bootstrap, in one row read from the
+    /// caller's snapshot (so it can share a REPEATABLE READ transaction with
+    /// `SELECT * FROM <view>`).
+    #[pg_extern(sql = r#"
+    CREATE FUNCTION nabla.status(name text)
+    RETURNS TABLE (status text, epoch int, frontier_lsn pg_lsn, current_seq bigint, stale_reason text)
+    STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+    "#)]
+    fn status(
+        name: &str,
+    ) -> TableIterator<'static, (name!(status, String), name!(epoch, i32), name!(frontier_lsn, i64), name!(current_seq, i64), name!(stale_reason, Option<String>))> {
+        let name = require_qualified_name(name);
+        let view = load_view(&name);
+        TableIterator::once((view.status, view.epoch, view.frontier as i64, view.last_seq, view.stale_reason))
     }
 
     #[pg_extern]

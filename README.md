@@ -134,6 +134,7 @@ SQL API (schema `nabla`): `create_view(name, definition)`, `drop_view(name)`,
 `refresh(name)`, `frontier(name) -> pg_lsn`,
 `wait_for(name, lsn, timeout_ms default 5000) -> bool`,
 `current_seq(name) -> bigint`,
+`status(name) -> TABLE(status, epoch, frontier_lsn, current_seq, stale_reason)`,
 `changes(name, after_seq, max_rows default 1000) -> TABLE(seq, lsn, xid, op, row, epoch)`.
 
 View names must be schema-qualified. View tables reject direct DML
@@ -179,6 +180,42 @@ itself enters the join as a one-row VALUES built from the decoded row.
 Not yet: outer joins, self-joins, column pruning of views, shadow column
 pruning.
 
+## Subscribing from a client
+
+The reference implementation is `clients/rust/nabla-client` (library plus
+the `follow` example); clients in other languages follow the same steps.
+
+1. Connect and `LISTEN "nabla:<view>"`. The channel name is the qualified
+   view name exactly as stored in `nabla.views.name` (lowercase), quoted as
+   one identifier. Notifications are only wake-ups; their payload
+   (`<seq>:<lsn>`) is informational.
+2. Bootstrap atomically: in one `REPEATABLE READ` transaction run
+   `SELECT * FROM nabla.status('<view>')` and `SELECT * FROM <view>`. Keep
+   `epoch` and `current_seq` (the cursor) from the same snapshot as the rows.
+   Ignore `_nabla_*` columns. If `status` is `stale`, wait with backoff and
+   bootstrap again; `stale_reason` says why.
+3. Follow: on every notification, and on a fallback timer (about one second)
+   so a lost notification cannot stall you, call
+   `nabla.changes('<view>', cursor, batch)` until it returns fewer rows than
+   `batch`. Rows are contiguous in `seq`; consecutive rows with the same
+   `(xid, lsn)` are one source transaction and should be applied atomically
+   (`D` before `I` for an update). Advance the cursor to the last `seq` only
+   after the transaction was handed to the application.
+4. Resync: the error `nabla: subscriber lagged behind retention` (cursor older
+   than `nabla.retain_deltas` or the view was refreshed), the error
+   `nabla: view "..." is stale: <reason>`, or a row whose `epoch` differs
+   from the bootstrap epoch mean the local copy is no longer continuable:
+   discard it and bootstrap again. On a lost connection, reconnect, `LISTEN`
+   again and bootstrap again.
+5. Read-your-writes: after committing, take `pg_current_wal_lsn()` and call
+   `nabla.wait_for('<view>', lsn, timeout_ms)`; when it returns true the view
+   (and the delta log) include your transaction.
+
+Events a client should surface: `Snapshot { epoch, frontier, cursor, rows }`,
+`Transaction { xid, lsn, epoch, deltas[] }` and `Resync { reason }` where the
+reason is one of lagged, epoch changed, stale (with the reason) or
+disconnected. Keep buffers bounded: one batch plus the trailing transaction.
+
 ## Build and test
 
 Everything compiles and runs inside the `nabla-dev:17` Docker image
@@ -188,6 +225,7 @@ Everything compiles and runs inside the `nabla-dev:17` Docker image
 docker build -t nabla-dev:17 -f docker/Dockerfile.dev .
 scripts/dev.sh build     # cargo build inside the container
 scripts/dev.sh test      # install the extension, start a throwaway cluster, run tests/integration.sh
+scripts/dev.sh client    # build the reference client (clients/rust/nabla-client)
 scripts/dev.sh shell     # interactive shell in the container
 ```
 
@@ -225,7 +263,8 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
   `max`, ...), `HAVING`, `DISTINCT`.
 - Single-group aggregates without `GROUP BY` (`SELECT count(*) FROM t`) and
   `min`/`max`/`avg`.
-- A streaming transport for subscribers; `changes()` is pull-based.
+- A streaming transport for subscribers; `changes()` is pull-based
+  (see `clients/rust/nabla-client` for the pull protocol).
 - Snapshot export at `create_view` so subscribers can start without a
   `SHARE`-locked rebuild.
 - Incremental `TRUNCATE`; unchanged TOAST values for columns a view needs

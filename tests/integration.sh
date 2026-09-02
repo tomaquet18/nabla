@@ -16,6 +16,7 @@ WAIT_MS=15000
 FAILED=0
 POLLER_PID=""
 WRITER_PID=""
+CLIENT_PID=""
 
 pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; printf '      %s\n' "$2"; FAILED=1; }
@@ -36,6 +37,7 @@ assert_contains() { # label needle haystack
 cleanup() {
   [ -n "$POLLER_PID" ] && kill "$POLLER_PID" 2>/dev/null
   [ -n "$WRITER_PID" ] && kill "$WRITER_PID" 2>/dev/null
+  [ -n "$CLIENT_PID" ] && { kill -CONT "$CLIENT_PID" 2>/dev/null; kill "$CLIENT_PID" 2>/dev/null; }
   if [ -f "$PGDATA/postmaster.pid" ]; then
     "$PG_BIN/pg_ctl" -D "$PGDATA" -m immediate stop >/dev/null 2>&1
   fi
@@ -569,6 +571,81 @@ reject "join to a partitioned table" "SELECT o.id FROM shop.orders o JOIN parted
 reject "join to a table without a primary key" "SELECT o.id FROM shop.orders o JOIN nopk n ON n.a = o.customer_id" "public.nopk has no primary key; every table in a join view needs one"
 reject "SELECT * over a join with duplicate output names" "SELECT * FROM shop.customers c JOIN shop.products p ON p.id = c.id" "output column names must be unique"
 reject "join over a nabla view" "SELECT o.id FROM shop.orders o JOIN order_lines l ON l.order_id = o.id" "is a nabla view"
+
+# --- 19. reference client ------------------------------------------------------
+echo "== 19. reference client (clients/rust/nabla-client)"
+CLIENT_DIR=/work/clients/rust/nabla-client
+(cd "$CLIENT_DIR" && cargo build --release --example follow >/tmp/nabla-client-build.log 2>&1) \
+  || die "client build failed: $(tail -n 30 /tmp/nabla-client-build.log)"
+FOLLOW="$CLIENT_DIR/target/release/examples/follow"
+CONN="host=/tmp port=$PORT dbname=$DB user=$(whoami)"
+assert_eq "nabla.status() reports the view in one row" "live|true|true|true" \
+  "$(q "SELECT status || '|' || (epoch >= 1) || '|' || (current_seq >= 0) || '|' || (frontier_lsn > '0/0') FROM nabla.status('public.order_lines')")"
+assert_contains "nabla.status() on a missing view is an error" 'view "public.nothing" does not exist' "$(q_err "SELECT * FROM nabla.status('public.nothing')")"
+wait_view public.order_lines
+ROWS0=$(q "SELECT count(*) FROM order_lines")
+OUT=/tmp/follow.out
+: > "$OUT"
+"$FOLLOW" --rows "$CONN" public.order_lines > "$OUT" 2>/tmp/follow.err &
+CLIENT_PID=$!
+wait_line() { # pattern timeout_seconds
+  local i
+  for i in $(seq 1 $(( $2 * 10 ))); do grep -qE "$1" "$OUT" && return 0; sleep 0.1; done
+  return 1
+}
+wait_line '^snapshot:' 20 || die "client produced no snapshot: $(cat /tmp/follow.err)"
+assert_eq "snapshot row count" "rows=$ROWS0" "$(grep -m1 -oE 'rows=[0-9]+' "$OUT")"
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 50, 'paid')" >/dev/null
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 2, 51, 'paid'), (1, 3, 52, 'paid'), (2, 1, 53, 'paid')" >/dev/null
+q "BEGIN; UPDATE shop.customers SET name = 'Roberta' WHERE id = 2; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (2, 2, 54, 'paid'); COMMIT" >/dev/null
+wait_view public.order_lines
+wait_line 'Roberta' 20 || die "client did not receive the two-table transaction: $(tail -n 20 "$OUT")"
+sleep 0.5
+assert_eq "three transactions received" "3" "$(grep -cE '^tx ' "$OUT")"
+assert_eq "the multi-row transaction is one line with 3 inserts" "deltas=3|3"   "$(grep -E '^tx ' "$OUT" | sed -n 2p | grep -oE 'deltas=[0-9]+')|$(awk '/^tx / { n++ } n == 2 && /^  [0-9]+ \+/ { c++ } END { print c + 0 }' "$OUT")"
+assert_eq "the two-table transaction rewrites the customer's rows plus the new order" \
+  "deltas=$(q "SELECT 2 * (SELECT count(*) FROM order_lines WHERE customer = 'Roberta') - 1")" \
+  "$(grep -E '^tx ' "$OUT" | tail -n 1 | grep -oE 'deltas=[0-9]+')"
+q "SELECT nabla.refresh('public.order_lines')" >/dev/null || die "refresh(order_lines) failed"
+# No write follows the refresh: the client must notice it through its fallback poll.
+wait_line 'resync: epoch changed' 20 || die "no epoch resync after refresh: $(tail -n 20 "$OUT")"
+L_RESYNC=$(grep -n -m1 'resync: epoch changed' "$OUT" | cut -d: -f1)
+for _ in $(seq 1 100); do awk -v s="$L_RESYNC" 'NR > s && /^snapshot:/ { found = 1 } END { exit !found }' "$OUT" && break; sleep 0.1; done
+L_SNAP2=$(awk -v s="$L_RESYNC" 'NR > s && /^snapshot:/ { print NR; exit }' "$OUT")
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 60, 'paid')" >/dev/null
+wait_view public.order_lines
+wait_line '^  [0-9]+ \+.*"total":120' 20 || die "transaction after the refresh not received: $(tail -n 20 "$OUT")"
+L_TX2=$(awk -v s="${L_SNAP2:-0}" 'NR > s && /^tx / { print NR; exit }' "$OUT")
+assert_eq "epoch resync is followed by a fresh snapshot and then the later transaction" "yes" \
+  "$( [ -n "$L_SNAP2" ] && [ -n "$L_TX2" ] && echo yes || echo no )"
+assert_eq "epoch resync names the epochs" "1" "$(grep -cE 'resync: epoch changed \([0-9]+ -> [0-9]+\)' "$OUT")"
+# Lagged: freeze the client, push more deltas than nabla.retain_deltas (50), resume.
+kill -STOP "$CLIENT_PID"
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) SELECT 1, 1, 100 + i, 'paid' FROM generate_series(1, 61) i" >/dev/null
+wait_view public.order_lines
+kill -CONT "$CLIENT_PID"
+wait_line 'resync: lagged' 20 || die "no lagged resync: $(tail -n 20 "$OUT")"
+L_LAG=$(grep -n -m1 'resync: lagged' "$OUT" | cut -d: -f1)
+for _ in $(seq 1 100); do awk -v s="$L_LAG" 'NR > s && /^snapshot:/ { found = 1 } END { exit !found }' "$OUT" && break; sleep 0.1; done
+sleep 0.5
+L_SNAP3=$(awk -v s="$L_LAG" 'NR > s && /^snapshot:/ { print NR; exit }' "$OUT")
+ROWS_SQL=$(awk -v s="${L_SNAP3:-0}" 'NR > s && /^= /' "$OUT" | sed 's/^= //' | awk '{ printf "%s$j$%s$j$", (NR > 1 ? "," : ""), $0 }')
+STRIP="to_jsonb(v) - ARRAY(SELECT k FROM jsonb_object_keys(to_jsonb(v)) k WHERE k LIKE '\_nabla\_%')"
+SNAP_DIFF=$(q "SELECT count(*) FROM ((SELECT x FROM unnest(ARRAY[$ROWS_SQL]::jsonb[]) x EXCEPT SELECT $STRIP FROM order_lines v)
+  UNION ALL (SELECT $STRIP FROM order_lines v EXCEPT SELECT x FROM unnest(ARRAY[$ROWS_SQL]::jsonb[]) x)) d")
+assert_eq "snapshot after the lagged resync equals the view (hidden columns stripped)" "0|$(q "SELECT count(*) FROM order_lines")" \
+  "$SNAP_DIFF|$(awk -v s="${L_SNAP3:-0}" 'NR > s && /^= /' "$OUT" | wc -l | tr -d ' ')"
+LSNS=$(grep -oE '^tx lsn=[0-9A-F]+/[0-9A-F]+' "$OUT" | sed "s/^tx lsn=//" | awk '{ printf "%s'"'"'%s'"'"'", (NR > 1 ? "," : ""), $0 }')
+assert_eq "transaction lsns strictly increase across the whole run" "0" \
+  "$(q "SELECT count(*) FROM (SELECT l, lag(l) OVER (ORDER BY ord) prev FROM unnest(ARRAY[$LSNS]::pg_lsn[]) WITH ORDINALITY t(l, ord)) s WHERE prev IS NOT NULL AND l <= prev")"
+assert_eq "no delta seq is printed twice" "0" "$(grep -oE '^  [0-9]+ ' "$OUT" | sort | uniq -d | wc -l | tr -d ' ')"
+assert_eq "client stderr is empty" "" "$(cat /tmp/follow.err)"
+kill -0 "$CLIENT_PID" 2>/dev/null && pass "client is still running at the end" || fail "client alive" "client exited early: $(tail -n 5 "$OUT")"
+kill -INT "$CLIENT_PID"
+wait "$CLIENT_PID"
+CLIENT_RC=$?
+CLIENT_PID=""
+assert_eq "client exits cleanly on SIGINT" "0|1" "$CLIENT_RC|$(grep -c '^interrupted$' "$OUT")"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

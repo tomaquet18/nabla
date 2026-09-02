@@ -1,0 +1,18 @@
+[package]
+name = "nabla-client"
+version = "0.1.0"
+edition = "2021"
+description = "Reference client for nabla view subscriptions"
+license = "Apache-2.0"
+
+# Standalone crate: not a member of the extension's workspace. Build it with
+# `scripts/dev.sh client` (its own target directory lives in a named volume).
+
+[dependencies]
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+tokio-postgres = { version = "0.7.13", features = ["with-serde_json-1"] }
+serde_json = "1"
+futures = "0.3"
+
+[[example]]
+name = "follow"
