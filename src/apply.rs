@@ -1,6 +1,9 @@
 //! Delta computation for the two view shapes. Everything runs as SQL over SPI
 //! inside the worker's apply transaction; decoded values are bound as text
-//! parameters and cast to the base column types, never interpolated.
+//! parameters and cast to the base column types, never interpolated. Output
+//! expressions, sum arguments and the predicate arrive already deparsed from
+//! the analyzed query (src/definition.rs) with bare quoted column references,
+//! which bind against the `(VALUES ...) AS rel(cols)` row built here.
 
 use pgrx::datum::DatumWithOid;
 use pgrx::prelude::*;
@@ -145,7 +148,7 @@ fn projection_insert(view: &ViewTarget, rel: &Relation, new: &Tuple) -> Result<O
     let select: Vec<String> = spec
         .columns
         .iter()
-        .map(|c| format!("{} AS {}", quote_identifier(&c.base), quote_identifier(&c.alias)))
+        .map(|c| format!("{} AS {}", c.expr, quote_identifier(&c.alias)))
         .collect();
     let sql = format!(
         "INSERT INTO {view} AS v ({targets}) SELECT {select} FROM {src}{where} RETURNING to_jsonb(v)::text",
@@ -161,10 +164,9 @@ fn projection_insert(view: &ViewTarget, rel: &Relation, new: &Tuple) -> Result<O
 
 fn projection_delete(view: &ViewTarget, rel: &Relation, old: &Tuple) -> Result<Outcome, String> {
     let spec = view.spec;
-    let view_cols = spec.pk_view_columns();
     let mut conds = Vec::new();
     let mut args = Vec::new();
-    for (pk, view_col) in spec.pk_columns.iter().zip(view_cols.iter()) {
+    for (pk, view_col) in spec.pk_columns.iter().zip(spec.pk_view_columns.iter()) {
         let idx = rel_column_index(rel, pk).ok_or_else(|| format!("primary key column {pk} missing"))?;
         let col = &rel.columns[idx];
         let ty = col.type_name.as_deref().ok_or("type not resolved")?;
@@ -197,12 +199,12 @@ fn aggregate_adjust(view: &ViewTarget, rel: &Relation, row: &Tuple, sign: i32) -
     let group_select: Vec<String> = spec
         .columns
         .iter()
-        .map(|c| format!("{} AS {}", quote_identifier(&c.base), quote_identifier(&c.alias)))
+        .map(|c| format!("{} AS {}", c.expr, quote_identifier(&c.alias)))
         .collect();
     let sum_select: Vec<String> = spec
         .sums
         .iter()
-        .map(|s| format!("{} AS {}", quote_identifier(&s.base), quote_identifier(&s.alias)))
+        .map(|s| format!("{} AS {}", s.expr, quote_identifier(&s.alias)))
         .collect();
     let mut cte_select = group_select.clone();
     cte_select.extend(sum_select);

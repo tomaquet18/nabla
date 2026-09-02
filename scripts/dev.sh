@@ -4,6 +4,7 @@
 # Usage:
 #   scripts/dev.sh build    compile the extension (cargo build, debug profile)
 #   scripts/dev.sh test     install the extension and run tests/integration.sh
+#   scripts/dev.sh unit     run the Rust unit tests (cargo test --lib)
 #   scripts/dev.sh shell    interactive shell inside the container
 #   scripts/dev.sh run CMD  run an arbitrary command inside the container
 #
@@ -41,6 +42,11 @@ case "$cmd" in
     run_in_container $(common_args) "$IMAGE" bash -c \
       "sudo chown -R dev:dev /work/target /usr/local/cargo/registry && bash tests/integration.sh"
     ;;
+  unit)
+    # Plain Rust unit tests. cargo pgrx test (the #[pg_test] harness) does not
+    # run reliably in this container; SQL-level coverage lives in tests/integration.sh.
+    run_in_container $(common_args) "$IMAGE" bash -c       "sudo chown -R dev:dev /work/target /usr/local/cargo/registry && cargo test --lib"
+    ;;
   shell)
     run_in_container -it $(common_args) "$IMAGE" bash
     ;;
@@ -48,7 +54,7 @@ case "$cmd" in
     run_in_container $(common_args) "$IMAGE" bash -c "$*"
     ;;
   *)
-    echo "usage: $0 {build|test|shell|run CMD}" >&2
+    echo "usage: $0 {build|test|unit|shell|run CMD}" >&2
     exit 2
     ;;
 esac

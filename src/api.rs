@@ -120,7 +120,7 @@ fn require_logical_wal() {
 
 fn view_index_sql(name: &str, spec: &ViewSpec) -> String {
     let cols: Vec<String> = match spec.shape {
-        Shape::Projection => spec.pk_view_columns().iter().map(quote_identifier).collect(),
+        Shape::Projection => spec.pk_view_columns.iter().map(quote_identifier).collect(),
         Shape::Aggregate => spec.columns.iter().map(|c| quote_identifier(&c.alias)).collect(),
     };
     // GROUP BY treats NULLs as equal, so the group key index must as well.
@@ -131,7 +131,6 @@ fn view_index_sql(name: &str, spec: &ViewSpec) -> String {
 struct CatalogRow {
     id: i32,
     base_oid: u32,
-    definition: String,
     spec: ViewSpec,
     epoch: i32,
     status: String,
@@ -144,23 +143,22 @@ fn load_view(name: &str) -> CatalogRow {
     let row = Spi::connect(|client| {
         let mut out = None;
         for r in client.select(
-            "SELECT id, base_table::oid::int8, definition, spec, epoch, status, last_seq, resync_seq \
+            "SELECT id, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq \
              FROM nabla.views WHERE name = $1",
             Some(1),
             &args,
         )? {
-            let spec: JsonB = r.get::<JsonB>(4)?.expect("spec");
+            let spec: JsonB = r.get::<JsonB>(3)?.expect("spec");
             let spec: ViewSpec = serde_json::from_value(spec.0)
                 .unwrap_or_else(|e| errors::invalid(format!("nabla: corrupt spec: {e}"), None));
             out = Some(CatalogRow {
                 id: r.get::<i32>(1)?.expect("id"),
                 base_oid: r.get::<i64>(2)?.expect("base") as u32,
-                definition: r.get::<String>(3)?.expect("definition"),
                 spec,
-                epoch: r.get::<i32>(5)?.expect("epoch"),
-                status: r.get::<String>(6)?.expect("status"),
-                last_seq: r.get::<i64>(7)?.expect("last_seq"),
-                resync_seq: r.get::<i64>(8)?.expect("resync_seq"),
+                epoch: r.get::<i32>(4)?.expect("epoch"),
+                status: r.get::<String>(5)?.expect("status"),
+                last_seq: r.get::<i64>(6)?.expect("last_seq"),
+                resync_seq: r.get::<i64>(7)?.expect("resync_seq"),
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -212,7 +210,7 @@ mod nabla {
         // Brief, documented write pause on the base table: SHARE waits for
         // in-flight writers to finish so the starting snapshot is exact.
         run(&format!("LOCK TABLE {} IN SHARE MODE", base.qualified));
-        run(&format!("CREATE TABLE {name} AS {definition}"));
+        run(&format!("CREATE TABLE {name} AS {}", spec.populate_sql));
         run(&view_index_sql(&name, &spec));
         run(&format!(
             "CREATE TRIGGER nabla_guard BEFORE INSERT OR UPDATE OR DELETE ON {name} \
@@ -267,7 +265,7 @@ mod nabla {
         run(&format!("LOCK TABLE {} IN SHARE MODE", view.spec.base_table));
         run("SET LOCAL nabla.internal_write = on");
         run(&format!("DELETE FROM {name}"));
-        run(&format!("INSERT INTO {name} {}", view.definition));
+        run(&format!("INSERT INTO {name} {}", view.spec.populate_sql));
         run_args(
             "UPDATE nabla.views SET frontier_lsn = pg_catalog.pg_current_wal_lsn(), epoch = epoch + 1, \
              status = 'live', last_seq = last_seq + 1, resync_seq = last_seq + 1 WHERE id = $1",

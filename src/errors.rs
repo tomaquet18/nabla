@@ -3,11 +3,7 @@
 use pgrx::pg_sys::panic::ErrorReport;
 use pgrx::prelude::*;
 
-pub const SHAPES_HINT: &str = "Accepted shapes: \
-(1) projection: SELECT col[, col ...] FROM table [WHERE predicate], where every col is a bare column \
-(optionally AS alias) and the primary key columns are included; \
-(2) aggregate: SELECT groupcol[, ...], count(*) [AS a][, sum(col) [AS b]]... FROM table [WHERE predicate] \
-GROUP BY groupcol[, ...].";
+pub const SHAPES_HINT: &str = "Accepted shapes: (1) projection: SELECT expr [AS alias][, ...] FROM table [WHERE predicate], where the primary key columns are selected as plain columns; (2) aggregate: SELECT key [AS alias][, ...], count(*) [AS a][, sum(expr) [AS b]]... FROM table [WHERE predicate] GROUP BY key[, ...]. Expressions may only use IMMUTABLE functions and operators over the base table's columns.";
 
 pub fn raise(code: PgSqlErrorCode, message: impl Into<String>, hint: Option<&str>) -> ! {
     let mut report = ErrorReport::new(code, message, pgrx::pg_sys::function_name!());

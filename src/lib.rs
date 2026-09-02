@@ -24,3 +24,4 @@ pub extern "C-unwind" fn _PG_init() {
     guc::register();
     worker::register();
 }
+

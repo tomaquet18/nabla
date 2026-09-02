@@ -237,6 +237,112 @@ for _ in 1 2 3; do
 done
 assert_eq "worker generates no WAL while idle (one quiet 1 s window out of 3)" "yes" "$QUIET"
 
+# --- 10. identifiers, aliases, comments, literals ----------------------------
+echo "== 10. parser: identifiers, aliases, comments, literals"
+q 'CREATE TABLE "Orders" ("Id" bigserial PRIMARY KEY, "Amount" numeric, "Status" text)' >/dev/null
+q "SELECT nabla.create_view('public.paid_mixed', 'SELECT \"Id\", \"Amount\" FROM \"Orders\" WHERE \"Status\" = ''paid''')" >/dev/null \
+  || die "create_view(paid_mixed) failed"
+q "INSERT INTO \"Orders\" (\"Amount\", \"Status\") VALUES (1, 'paid'), (2, 'new'), (3, 'paid')" >/dev/null
+q "UPDATE \"Orders\" SET \"Status\" = 'paid' WHERE \"Id\" = 2" >/dev/null
+q 'DELETE FROM "Orders" WHERE "Id" = 1' >/dev/null
+wait_view public.paid_mixed
+DIFF=$(q "SELECT count(*) FROM ((SELECT \"Id\", \"Amount\" FROM paid_mixed EXCEPT SELECT \"Id\", \"Amount\" FROM \"Orders\" WHERE \"Status\" = 'paid')
+  UNION ALL (SELECT \"Id\", \"Amount\" FROM \"Orders\" WHERE \"Status\" = 'paid' EXCEPT SELECT \"Id\", \"Amount\" FROM paid_mixed)) d")
+assert_eq "quoted mixed-case identifiers" "0|2" "$DIFF|$(q 'SELECT count(*) FROM paid_mixed')"
+assert_eq "catalog records the fully qualified base table" "t" \
+  "$(q "SELECT base_table = '\"Orders\"'::regclass AND spec->>'base_table' = 'public.\"Orders\"' FROM nabla.views WHERE name = 'public.paid_mixed'")"
+assert_eq "unqualified name resolved through search_path is stored qualified" "t" \
+  "$(q "SELECT base_table = 'public.orders'::regclass AND spec->>'base_table' = 'public.orders' FROM nabla.views WHERE name = 'public.paid_orders'")"
+
+q "SELECT nabla.create_view('public.paid_aliased', 'SELECT o.id AS order_id, /* keep the amount */ o.amount
+   FROM public.orders AS o
+   WHERE o.status = ''paid'' -- only paid rows')" >/dev/null || die "create_view(paid_aliased) failed"
+q "INSERT INTO orders (k, amount, status) VALUES (21, 7, 'paid'), (21, 8, 'new')" >/dev/null
+wait_view public.paid_aliased
+DIFF=$(q "SELECT count(*) FROM ((SELECT order_id, amount FROM paid_aliased EXCEPT SELECT id, amount FROM orders WHERE status = 'paid')
+  UNION ALL (SELECT id, amount FROM orders WHERE status = 'paid' EXCEPT SELECT order_id, amount FROM paid_aliased)) d")
+assert_eq "aliases, schema qualification and comments" "0" "$DIFF"
+
+q "SELECT nabla.create_view('public.odd_status', 'SELECT id, k FROM orders WHERE status = ''order by limit''')" >/dev/null \
+  || die "create_view(odd_status) failed"
+q "INSERT INTO orders (k, amount, status) VALUES (22, 1, 'order by limit'), (22, 2, 'paid')" >/dev/null
+wait_view public.odd_status
+assert_eq "keywords inside a string literal" "1" "$(q "SELECT count(*) FROM odd_status WHERE k = 22")"
+
+# --- 11. expressions ---------------------------------------------------------
+echo "== 11. parser: immutable expressions"
+q "SELECT nabla.create_view('public.orders_expr', 'SELECT id, amount * 2 AS doubled, upper(status) AS s FROM orders WHERE status <> ''void''')" >/dev/null \
+  || die "create_view(orders_expr) failed"
+q "INSERT INTO orders (k, amount, status) VALUES (23, 5, 'paid'), (23, 6, 'void')" >/dev/null
+q "UPDATE orders SET amount = amount + 1, status = 'paid' WHERE k = 23" >/dev/null
+q "DELETE FROM orders WHERE k = 22" >/dev/null
+wait_view public.orders_expr
+DIFF=$(q "SELECT count(*) FROM ((SELECT id, doubled, s FROM orders_expr EXCEPT SELECT id, amount * 2, upper(status) FROM orders WHERE status <> 'void')
+  UNION ALL (SELECT id, amount * 2, upper(status) FROM orders WHERE status <> 'void' EXCEPT SELECT id, doubled, s FROM orders_expr)) d")
+assert_eq "projection with immutable expressions equals its query" "0" "$DIFF"
+
+q "SELECT nabla.create_view('public.paid_parity', 'SELECT k % 2 AS parity, sum(amount * 2) AS total FROM orders WHERE status = ''paid'' GROUP BY k % 2')" >/dev/null \
+  || die "create_view(paid_parity) failed"
+assert_eq "hidden group count column is present" "t" "$(q "SELECT bool_and(_nabla_n > 0) AND count(*) = 2 FROM paid_parity")"
+q "INSERT INTO orders (k, amount, status) VALUES (31, 10, 'paid'), (32, 20, 'paid')" >/dev/null
+q "UPDATE orders SET status = 'new' WHERE k = 31" >/dev/null
+wait_view public.paid_parity
+DIFF=$(q "SELECT count(*) FROM ((SELECT parity, total, _nabla_n FROM paid_parity EXCEPT SELECT k % 2, sum(amount * 2), count(*) FROM orders WHERE status = 'paid' GROUP BY k % 2)
+  UNION ALL (SELECT k % 2, sum(amount * 2), count(*) FROM orders WHERE status = 'paid' GROUP BY k % 2 EXCEPT SELECT parity, total, _nabla_n FROM paid_parity)) d")
+assert_eq "aggregate with expression keys and hidden count equals its query" "0" "$DIFF"
+q "DELETE FROM orders WHERE status = 'paid' AND k % 2 = 1" >/dev/null
+wait_view public.paid_parity
+assert_eq "empty group disappears without count(*) in the definition" "0|1" \
+  "$(q "SELECT count(*) FILTER (WHERE parity = 1) || '|' || count(*) FROM paid_parity")"
+
+# --- 12. rejections by the query-tree walker ---------------------------------
+echo "== 12. parser: rejections"
+q "CREATE TABLE orders2 (id int PRIMARY KEY, amount int, created_at timestamptz)" >/dev/null
+q "CREATE TABLE nopk (a int, b int)" >/dev/null
+q "CREATE TABLE parted (id int, k int) PARTITION BY RANGE (id)" >/dev/null
+q "CREATE VIEW v_orders AS SELECT * FROM orders" >/dev/null
+reject() { # label definition expected-substring
+  local err
+  err=$(q_err "SELECT nabla.create_view('public.rejected', \$def\$$2\$def\$)")
+  assert_contains "$1" "$3" "$err"
+}
+reject "now() in WHERE" "SELECT id FROM orders2 WHERE created_at < now()" "the WHERE clause uses \"now\", which is not IMMUTABLE"
+reject "random() in the select list" "SELECT id, random() AS r FROM orders" "column \"r\" uses \"random\", which is not IMMUTABLE"
+reject "STABLE to_char() rejected" "SELECT id, to_char(created_at, 'YYYY') AS y FROM orders2" "column \"y\" uses \"to_char\", which is not IMMUTABLE"
+q "SELECT nabla.create_view('public.lower_ok', 'SELECT id, lower(status) AS s FROM orders')" >/dev/null \
+  || die "create_view(lower_ok) failed"
+pass "lower() is accepted"
+reject "subquery in WHERE" "SELECT id FROM orders WHERE k IN (SELECT a FROM nopk)" "subqueries are not supported"
+reject "EXISTS" "SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM nopk)" "subqueries are not supported"
+reject "CTE" "WITH c AS (SELECT 1) SELECT id FROM orders" "common table expressions (WITH) are not supported"
+reject "UNION" "SELECT id FROM orders UNION SELECT id FROM orders2" "UNION, INTERSECT and EXCEPT are not supported"
+reject "window function" "SELECT id, row_number() OVER () AS rn FROM orders" "window functions are not supported"
+reject "DISTINCT" "SELECT DISTINCT id FROM orders" "DISTINCT is not supported"
+reject "ORDER BY" "SELECT id FROM orders ORDER BY id" "ORDER BY is not supported"
+reject "LIMIT" "SELECT id FROM orders LIMIT 1" "LIMIT and OFFSET are not supported"
+reject "HAVING" "SELECT k, count(*) FROM orders GROUP BY k HAVING count(*) > 1" "HAVING is not supported"
+reject "GROUPING SETS" "SELECT k, count(*) FROM orders GROUP BY GROUPING SETS ((k), ())" "GROUPING SETS, CUBE and ROLLUP are not supported"
+reject "FOR UPDATE" "SELECT id FROM orders FOR UPDATE" "FOR UPDATE and FOR SHARE are not supported"
+reject "join" "SELECT o.id FROM orders o JOIN orders2 x ON x.id = o.k" "joins are not supported"
+reject "comma join" "SELECT o.id FROM orders o, orders2 x" "joins are not supported"
+reject "LATERAL" "SELECT o.id FROM orders o, LATERAL (SELECT o.k) l" "LATERAL is not supported"
+reject "set-returning function" "SELECT g FROM generate_series(1, 3) g" "set-returning functions are not supported"
+reject "SRF in select list" "SELECT id, generate_series(1, 2) AS g FROM orders" "set-returning functions are not supported"
+reject "SELECT * without a primary key" "SELECT * FROM nopk" "public.nopk has no primary key"
+reject "partitioned table" "SELECT id FROM parted" "public.parted is a partitioned table"
+reject "plain view as source" "SELECT id FROM v_orders" "public.v_orders is a view"
+reject "nabla view as source" "SELECT id FROM paid_orders" "public.paid_orders is a nabla view"
+reject "count(DISTINCT)" "SELECT k, count(DISTINCT k) FROM orders GROUP BY k" "DISTINCT inside aggregates is not supported"
+reject "FILTER" "SELECT k, count(*), sum(amount) FILTER (WHERE amount > 1) AS f FROM orders GROUP BY k" "FILTER on aggregates is not supported"
+reject "avg()" "SELECT k, avg(amount) FROM orders GROUP BY k" "aggregate \"avg\" is not supported"
+reject "max()" "SELECT k, max(amount) FROM orders GROUP BY k" "aggregate \"max\" is not supported"
+reject "expression over an aggregate" "SELECT k, sum(amount) + 1 AS t FROM orders GROUP BY k" "is an expression over an aggregate"
+reject "GROUP BY key not selected" "SELECT sum(amount) AS t FROM orders GROUP BY k" "every GROUP BY expression must also appear in the select list"
+reject "syntax error surfaces PostgreSQL's text" "SELEC id FROM orders" "syntax error at or near \"SELEC\""
+reject "missing column surfaces PostgreSQL's text" "SELECT nosuch FROM orders" "column \"nosuch\" does not exist"
+reject "two statements" "SELECT id FROM orders; SELECT id FROM orders" "exactly one SELECT statement"
+assert_eq "rejected definitions leave no view behind" "0" "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.rejected'")"
+
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"
 grep -E 'WARNING|ERROR|FATAL|PANIC' "$LOG" | tail -n 20 || true

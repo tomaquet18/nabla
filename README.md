@@ -33,20 +33,33 @@ Two safety rules keep everything bounded:
 
 ## v0.1 scope: two accepted shapes
 
-One base table per view, plain column names, no quoted identifiers.
+One base table per view. Definitions are parsed and analyzed by PostgreSQL
+itself (`raw_parser` + `parse_analyze`), so quoted and mixed-case identifiers,
+aliases, schema-qualified names, comments and string literals all behave
+exactly as in `psql`; the shape decision is made on the analyzed query tree
+(`src/definition.rs`).
 
-1. **Projection**: `SELECT col[, col ...] FROM table [WHERE predicate]`. Every
-   column is a bare column name (optionally `AS alias`). The base table's
-   primary key columns must be in the select list.
-2. **Aggregate**: `SELECT groupcol[, ...], count(*) [AS a][, sum(col) [AS b]]...
-   FROM table [WHERE predicate] GROUP BY groupcol[, ...]`. Group columns first,
-   then aggregates; the `GROUP BY` list must equal the group columns. The base
-   table needs `REPLICA IDENTITY FULL`.
+1. **Projection**: `SELECT expr [AS alias][, ...] FROM table [WHERE predicate]`.
+   Output expressions may be plain columns or IMMUTABLE expressions over the
+   base table's columns. The base table's primary key columns must be selected
+   as plain columns (they may be aliased).
+2. **Aggregate**: `SELECT key [AS alias][, ...], count(*) [AS a][, sum(expr) [AS b]]...
+   FROM table [WHERE predicate] GROUP BY key[, ...]`. Keys and sum arguments may
+   be IMMUTABLE expressions; every `GROUP BY` expression must be selected. The
+   base table needs `REPLICA IDENTITY FULL`. If the definition has no
+   `count(*)`, nabla adds a column `_nabla_n bigint` carrying the group count;
+   it is part of the view table and of every delta row.
 
-Anything else (joins, subqueries, other aggregates, `DISTINCT`, `ORDER BY`,
-`LIMIT`, `HAVING`, expressions, functions) fails with
-`ERROR: nabla: unsupported view definition: <reason>` and a hint listing the
-two shapes. `TRUNCATE` of a base table marks its views stale.
+Everything else is rejected with `ERROR: nabla: unsupported view definition:
+<reason>` and a hint listing the two shapes: joins, subqueries, CTEs, set
+operations, window functions, set-returning functions, `DISTINCT`, `ORDER BY`,
+`LIMIT`, `HAVING`, grouping sets, `FOR UPDATE`, other aggregates, `DISTINCT`/
+`FILTER`/`ORDER BY` inside aggregates, expressions over aggregates, any
+STABLE or VOLATILE function (`now()`, `random()`, `to_char(timestamptz, ...)`),
+and base relations that are not ordinary tables (partitioned tables, views,
+materialized views, foreign tables, tables with inheritance children, nabla
+views and catalog tables). Syntax errors and unknown columns surface
+PostgreSQL's own error text. `TRUNCATE` of a base table marks its views stale.
 
 ## Prerequisites
 
@@ -140,9 +153,8 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
 
 - Joins, multiple base tables, subqueries, expressions, other aggregates
   (`avg`, `min`, `max`, ...), `HAVING`, `DISTINCT`.
-- Parse-tree analysis: definitions are matched with regular expressions and
-  validated by preparing the statement. Quoted identifiers and SQL comments are
-  not supported.
+- Single-group aggregates without `GROUP BY` (`SELECT count(*) FROM t`),
+  `count(expr)`, and `min`/`max`/`avg`.
 - `sum()` over a group whose only remaining rows have NULL values yields 0
   rather than NULL (no per-column non-null counter yet).
 - A streaming transport for subscribers; `changes()` is pull-based.
