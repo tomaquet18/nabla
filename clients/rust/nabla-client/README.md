@@ -28,7 +28,9 @@ loop {
   `REPEATABLE READ` transaction, with the cursor to continue from), a
   `Transaction` (all deltas of one source transaction: same `xid` and `lsn`,
   contiguous `seq`), or a `Resync` (`lagged`, `epoch changed`, `stale`,
-  `disconnected`), always followed by a fresh `Snapshot`. Server conditions are
+  `disconnected`), always followed by a fresh `Snapshot`. While the view is
+  `initializing` or `refreshing` the client waits silently; a `failed` view
+  is returned as `Error::ViewFailed`. Server conditions are
   recognized by SQLSTATE (`NB001`, `NB002`, `NB003`) only.
 - `wait_for(lsn, timeout)` blocks until the view has absorbed everything up to
   `lsn` (read-your-writes; pass `pg_current_wal_lsn()` taken after your commit).

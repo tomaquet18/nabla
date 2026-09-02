@@ -9,6 +9,7 @@
 //! | NB003 | view epoch changed (refresh)                 |
 //! | NB004 | unsupported view definition                  |
 //! | NB005 | direct write to a nabla-managed table (SQL)  |
+//! | NB006 | view population (create/refresh) failed      |
 //!
 //! pgrx 0.17's `ErrorReport` only accepts the `PgSqlErrorCode` enum, so the
 //! custom codes go through PostgreSQL's ereport entry points directly, the
@@ -22,6 +23,7 @@ pub const SQLSTATE_LAGGED: &str = "NB001";
 pub const SQLSTATE_STALE: &str = "NB002";
 pub const SQLSTATE_EPOCH_CHANGED: &str = "NB003";
 pub const SQLSTATE_UNSUPPORTED_DEFINITION: &str = "NB004";
+pub const SQLSTATE_FAILED: &str = "NB006";
 
 pub const SHAPES_HINT: &str = "Accepted shapes: \
 (1) projection: SELECT expr [AS alias][, ...] FROM table [JOIN ...] [WHERE predicate], where a single \
@@ -118,6 +120,16 @@ pub fn epoch_changed(name: &str, from: i32, to: i32) -> ! {
         &format!("nabla: view \"{name}\" epoch changed"),
         Some(&format!("epoch {from} -> {to}")),
         Some("resync from the view"),
+    )
+}
+
+/// NB006
+pub fn failed(name: &str, reason: Option<&str>) -> ! {
+    raise_sqlstate(
+        SQLSTATE_FAILED,
+        &format!("nabla: view \"{name}\" failed to build"),
+        Some(reason.unwrap_or("reason not recorded")),
+        Some(&format!("fix the cause, then run nabla.refresh('{name}') or nabla.drop_view('{name}')")),
     )
 }
 

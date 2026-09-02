@@ -5,7 +5,9 @@
 //! moved on since T.
 //!
 //! Shadow tables live in schema `nabla_shadow` as `t<oid>` and are written
-//! only by the worker (same guard trigger as views). They are not dumped by
+//! only by the worker (same guard trigger as views). They are created and
+//! re-snapshotted inside the worker's population transaction, under the
+//! consistent snapshot described in populate.rs. They are not dumped by
 //! pg_dump; after a restore, `nabla.refresh` rebuilds them.
 
 use pgrx::datum::DatumWithOid;
@@ -14,6 +16,7 @@ use pgrx::spi::quote_identifier;
 
 use crate::definition::BaseRelation;
 use crate::errors;
+use crate::lsn;
 
 pub const SCHEMA: &str = "nabla_shadow";
 
@@ -43,27 +46,26 @@ fn state(oid: u32) -> Option<(i32, Option<String>)> {
     .and_then(|(r, s)| r.map(|r| (r, s)))
 }
 
-/// Populate the shadow from the live table. The caller holds SHARE locks on
-/// every table involved, so the snapshot is exact.
-pub fn snapshot(rel: &BaseRelation) {
+/// Populate the shadow from the live table under the caller's snapshot and
+/// set its frontier to the snapshot's consistent point.
+pub fn snapshot(rel: &BaseRelation, frontier: u64) {
     let table = table_name(rel.oid);
     run("SET LOCAL nabla.internal_write = on");
     run(&format!("DELETE FROM {table}"));
     run(&format!("INSERT INTO {table} SELECT * FROM {}", rel.qualified));
     run_args(
-        "UPDATE nabla.shadows SET frontier_lsn = pg_catalog.pg_current_wal_lsn(), stale_reason = NULL \
-         WHERE relid = $1::oid",
-        &[(rel.oid as i64).into()],
+        "UPDATE nabla.shadows SET frontier_lsn = $2::pg_lsn, stale_reason = NULL WHERE relid = $1::oid",
+        &[(rel.oid as i64).into(), lsn::format(frontier).into()],
     );
 }
 
 /// Create the shadow of `rel` for one more view, or add a reference to the
 /// existing one. An existing healthy shadow is deliberately NOT re-snapshotted:
 /// it has its own frontier and the worker skips transactions at or below it,
-/// so it will absorb what the new view (populated later, at a higher LSN)
-/// already contains — see the skip rule in worker.rs. A shadow whose
+/// so it will absorb what the new view (populated at a higher consistent
+/// point) already contains — see the skip rule in worker.rs. A shadow whose
 /// maintenance failed has no live dependents any more and is rebuilt.
-pub fn ensure(rel: &BaseRelation) {
+pub fn ensure(rel: &BaseRelation, frontier: u64) {
     let table = table_name(rel.oid);
     match state(rel.oid) {
         Some((_, None)) => {
@@ -71,7 +73,7 @@ pub fn ensure(rel: &BaseRelation) {
         }
         Some((_, Some(_))) => {
             run_args("UPDATE nabla.shadows SET refcount = refcount + 1 WHERE relid = $1::oid", &[(rel.oid as i64).into()]);
-            snapshot(rel);
+            snapshot(rel, frontier);
         }
         None => {
             run(&format!("CREATE TABLE {table} AS SELECT * FROM {}", rel.qualified));
@@ -87,8 +89,8 @@ pub fn ensure(rel: &BaseRelation) {
             ));
             run_args(
                 "INSERT INTO nabla.shadows (relid, table_name, frontier_lsn, refcount) \
-                 VALUES ($1::oid, $2, pg_catalog.pg_current_wal_lsn(), 1)",
-                &[(rel.oid as i64).into(), table.as_str().into()],
+                 VALUES ($1::oid, $2, $3::pg_lsn, 1)",
+                &[(rel.oid as i64).into(), table.as_str().into(), lsn::format(frontier).into()],
             );
         }
     }

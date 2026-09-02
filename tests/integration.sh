@@ -29,6 +29,12 @@ q_err() { psql -X -q -A -t -p "$PORT" -d "$DB" -c "$1" 2>&1 >/dev/null; }
 
 # SQLSTATE of a failing statement (psql verbose error format: ERROR:  XX000: ...).
 sqlstate_of() { psql -X -q -A -t -v VERBOSITY=verbose -p "$PORT" -d "$DB" -c "$1" 2>&1 >/dev/null | grep -oE '^ERROR:  [A-Z0-9]{5}:' | head -n 1 | cut -c 9-13; }
+# Wait until the worker has built (or rebuilt) a view; die with its status otherwise.
+await_ready() { # name
+  local r
+  r=$(q "SELECT nabla.await_ready('$1', 60000)")
+  [ "$r" = t ] || die "view $1 did not become ready: $(q "SELECT status || ': ' || coalesce(last_error, '-') FROM nabla.views WHERE name = '$1'")"
+}
 # nabla.changes(view, after_seq) with the view's current epoch.
 CH() { echo "nabla.changes('$1', $2, (SELECT epoch FROM nabla.status('$1')))"; }
 
@@ -97,6 +103,7 @@ echo "== 1. projection view"
 q "CREATE TABLE orders (id bigserial PRIMARY KEY, k int, amount numeric, status text)" >/dev/null
 q "SELECT nabla.create_view('public.paid_orders', 'SELECT id, k, amount FROM orders WHERE status = ''paid''')" >/dev/null \
   || die "create_view(paid_orders) failed"
+await_ready public.paid_orders
 q "INSERT INTO orders (k, amount, status)
    SELECT i % 5, i * 1.5, CASE WHEN i % 2 = 0 THEN 'paid' ELSE 'new' END FROM generate_series(1, 20) i" >/dev/null
 for id in 1 3 5; do q "UPDATE orders SET status = 'paid' WHERE id = $id" >/dev/null; done
@@ -114,6 +121,7 @@ echo "== 2. aggregate view"
 q "ALTER TABLE orders REPLICA IDENTITY FULL" >/dev/null
 q "SELECT nabla.create_view('public.orders_by_k', 'SELECT k, count(*) AS n, sum(amount) AS total FROM orders WHERE status = ''paid'' GROUP BY k')" >/dev/null \
   || die "create_view(orders_by_k) failed"
+await_ready public.orders_by_k
 q "INSERT INTO orders (k, amount, status) VALUES (7, 100, 'paid'), (7, 50, 'new'), (8, 1, 'paid')" >/dev/null
 q "UPDATE orders SET status = 'paid' WHERE k = 7 AND status = 'new'" >/dev/null
 q "UPDATE orders SET amount = amount + 10 WHERE k = 8" >/dev/null
@@ -227,6 +235,7 @@ echo "== 8. refresh"
 EPOCH0=$(q "SELECT epoch FROM nabla.views WHERE name = 'public.orders_by_k'")
 CURSOR=$(q "SELECT nabla.current_seq('public.orders_by_k')")
 q "SELECT nabla.refresh('public.orders_by_k')" >/dev/null || die "refresh failed"
+await_ready public.orders_by_k
 EPOCH1=$(q "SELECT epoch FROM nabla.views WHERE name = 'public.orders_by_k'")
 CURSOR1=$(q "SELECT current_seq FROM nabla.status('public.orders_by_k')")
 assert_eq "refresh bumps the epoch" "$((EPOCH0 + 1))" "$EPOCH1"
@@ -258,6 +267,7 @@ echo "== 10. parser: identifiers, aliases, comments, literals"
 q 'CREATE TABLE "Orders" ("Id" bigserial PRIMARY KEY, "Amount" numeric, "Status" text)' >/dev/null
 q "SELECT nabla.create_view('public.paid_mixed', 'SELECT \"Id\", \"Amount\" FROM \"Orders\" WHERE \"Status\" = ''paid''')" >/dev/null \
   || die "create_view(paid_mixed) failed"
+await_ready public.paid_mixed
 q "INSERT INTO \"Orders\" (\"Amount\", \"Status\") VALUES (1, 'paid'), (2, 'new'), (3, 'paid')" >/dev/null
 q "UPDATE \"Orders\" SET \"Status\" = 'paid' WHERE \"Id\" = 2" >/dev/null
 q 'DELETE FROM "Orders" WHERE "Id" = 1' >/dev/null
@@ -273,6 +283,7 @@ assert_eq "unqualified name resolved through search_path is stored qualified" "t
 q "SELECT nabla.create_view('public.paid_aliased', 'SELECT o.id AS order_id, /* keep the amount */ o.amount
    FROM public.orders AS o
    WHERE o.status = ''paid'' -- only paid rows')" >/dev/null || die "create_view(paid_aliased) failed"
+await_ready public.paid_aliased
 q "INSERT INTO orders (k, amount, status) VALUES (21, 7, 'paid'), (21, 8, 'new')" >/dev/null
 wait_view public.paid_aliased
 DIFF=$(q "SELECT count(*) FROM ((SELECT order_id, amount FROM paid_aliased EXCEPT SELECT id, amount FROM orders WHERE status = 'paid')
@@ -281,6 +292,7 @@ assert_eq "aliases, schema qualification and comments" "0" "$DIFF"
 
 q "SELECT nabla.create_view('public.odd_status', 'SELECT id, k FROM orders WHERE status = ''order by limit''')" >/dev/null \
   || die "create_view(odd_status) failed"
+await_ready public.odd_status
 q "INSERT INTO orders (k, amount, status) VALUES (22, 1, 'order by limit'), (22, 2, 'paid')" >/dev/null
 wait_view public.odd_status
 assert_eq "keywords inside a string literal" "1" "$(q "SELECT count(*) FROM odd_status WHERE k = 22")"
@@ -289,6 +301,7 @@ assert_eq "keywords inside a string literal" "1" "$(q "SELECT count(*) FROM odd_
 echo "== 11. parser: immutable expressions"
 q "SELECT nabla.create_view('public.orders_expr', 'SELECT id, amount * 2 AS doubled, upper(status) AS s FROM orders WHERE status <> ''void''')" >/dev/null \
   || die "create_view(orders_expr) failed"
+await_ready public.orders_expr
 q "INSERT INTO orders (k, amount, status) VALUES (23, 5, 'paid'), (23, 6, 'void')" >/dev/null
 q "UPDATE orders SET amount = amount + 1, status = 'paid' WHERE k = 23" >/dev/null
 q "DELETE FROM orders WHERE k = 22" >/dev/null
@@ -299,6 +312,7 @@ assert_eq "projection with immutable expressions equals its query" "0" "$DIFF"
 
 q "SELECT nabla.create_view('public.paid_parity', 'SELECT k % 2 AS parity, sum(amount * 2) AS total FROM orders WHERE status = ''paid'' GROUP BY k % 2')" >/dev/null \
   || die "create_view(paid_parity) failed"
+await_ready public.paid_parity
 assert_eq "hidden group count column is present" "t" "$(q "SELECT bool_and(_nabla_n > 0) AND count(*) = 2 FROM paid_parity")"
 q "INSERT INTO orders (k, amount, status) VALUES (31, 10, 'paid'), (32, 20, 'paid')" >/dev/null
 q "UPDATE orders SET status = 'new' WHERE k = 31" >/dev/null
@@ -327,6 +341,7 @@ reject "random() in the select list" "SELECT id, random() AS r FROM orders" "col
 reject "STABLE to_char() rejected" "SELECT id, to_char(created_at, 'YYYY') AS y FROM orders2" "column \"y\" uses \"to_char\", which is not IMMUTABLE"
 q "SELECT nabla.create_view('public.lower_ok', 'SELECT id, lower(status) AS s FROM orders')" >/dev/null \
   || die "create_view(lower_ok) failed"
+await_ready public.lower_ok
 pass "lower() is accepted"
 reject "subquery in WHERE" "SELECT id FROM orders WHERE k IN (SELECT a FROM nopk)" "subqueries are not supported"
 reject "EXISTS" "SELECT id FROM orders WHERE EXISTS (SELECT 1 FROM nopk)" "subqueries are not supported"
@@ -364,7 +379,9 @@ echo "== 13. failure isolation"
 q "CREATE TABLE t (id bigserial PRIMARY KEY, k int, amount numeric)" >/dev/null
 q "ALTER TABLE t REPLICA IDENTITY FULL" >/dev/null
 q "SELECT nabla.create_view('public.bad', 'SELECT id, 100 / k AS ratio FROM t')" >/dev/null || die "create_view(bad) failed"
+await_ready public.bad
 q "SELECT nabla.create_view('public.good', 'SELECT k, count(*) AS n FROM t GROUP BY k')" >/dev/null || die "create_view(good) failed"
+await_ready public.good
 for k in 1 2 4; do q "INSERT INTO t (k, amount) VALUES ($k, 1)" >/dev/null; done
 wait_view public.bad
 wait_view public.good
@@ -414,11 +431,14 @@ ERR=$(q_err "SELECT nabla.wait_for('public.bad', pg_current_wal_lsn(), 100)")
 assert_contains "wait_for() on a stale view raises the stale error" 'nabla: view "public.bad" is stale' "$ERR"
 assert_eq "frontier('bad') still returns the last absorbed LSN" "t" \
   "$(q "SELECT nabla.frontier('public.bad') >= '$F0'::pg_lsn AND nabla.frontier('public.bad') < '$L0'::pg_lsn")"
-ERR=$(q_err "SELECT nabla.refresh('public.bad')")
-assert_contains "refresh() fails with PostgreSQL's error while the bad row exists" "division by zero" "$ERR"
-assert_eq "bad stays stale after a failed refresh" "stale" "$(q "SELECT status FROM nabla.views WHERE name = 'public.bad'")"
+q "SELECT nabla.refresh('public.bad')" >/dev/null || die "refresh(bad) failed to start"
+ERR=$(q_err "SELECT nabla.await_ready('public.bad', 60000)")
+assert_contains "await_ready() reports the rebuild error while the bad row exists" "DETAIL:  division by zero" "$ERR"
+assert_eq "a failed rebuild carries SQLSTATE NB006" "NB006" "$(sqlstate_of "SELECT nabla.await_ready('public.bad', 60000)")"
+assert_eq "bad is failed after the rebuild error (old content kept)" "failed|t" "$(q "SELECT status FROM nabla.views WHERE name = 'public.bad'")|$(q "SELECT to_regclass('public.bad') IS NOT NULL")"
 q "DELETE FROM t WHERE k = 0" >/dev/null
 q "SELECT nabla.refresh('public.bad')" >/dev/null || die "refresh(bad) failed after removing the bad row"
+await_ready public.bad
 assert_eq "refresh() recovers the view" "live|0|true|true" \
   "$(q "SELECT status || '|' || apply_failures || '|' || (last_error IS NULL) || '|' || (stale_reason IS NULL) FROM nabla.views WHERE name = 'public.bad'")"
 q "INSERT INTO t (k, amount) VALUES (7, 1)" >/dev/null
@@ -431,6 +451,7 @@ q "CREATE TABLE s (id bigserial PRIMARY KEY, k int, v numeric, w int)" >/dev/nul
 q "ALTER TABLE s REPLICA IDENTITY FULL" >/dev/null
 q "SELECT nabla.create_view('public.agg_s', 'SELECT k, count(*) AS n, sum(v) AS sv, count(w) AS cw, sum(w) AS sw FROM s GROUP BY k')" >/dev/null \
   || die "create_view(agg_s) failed"
+await_ready public.agg_s
 s_diff() { q "SELECT count(*) FROM ((SELECT k, n, sv, cw, sw FROM agg_s EXCEPT SELECT k, count(*), sum(v), count(w), sum(w) FROM s GROUP BY k)
   UNION ALL (SELECT k, count(*), sum(v), count(w), sum(w) FROM s GROUP BY k EXCEPT SELECT k, n, sv, cw, sw FROM agg_s)) d"; }
 s_row() { q "SELECT n || '|' || coalesce(sv::text, 'NULL') || '|' || cw || '|' || coalesce(sw::text, 'NULL') FROM agg_s WHERE k = $1"; }
@@ -464,6 +485,7 @@ q "INSERT INTO s (k, v, w) VALUES (3, 1.5, NULL), (3, NULL, 2), (1, 2.5, 9)" >/d
 wait_view public.agg_s
 q "CREATE TABLE agg_s_snapshot AS SELECT * FROM agg_s" >/dev/null
 q "SELECT nabla.refresh('public.agg_s')" >/dev/null || die "refresh(agg_s) failed"
+await_ready public.agg_s
 assert_eq "refresh reproduces the maintained table exactly, hidden counters included" "0" \
   "$(q "SELECT count(*) FROM ((SELECT * FROM agg_s_snapshot EXCEPT SELECT * FROM agg_s) UNION ALL (SELECT * FROM agg_s EXCEPT SELECT * FROM agg_s_snapshot)) d")"
 reject "count(DISTINCT w) still rejected" "SELECT k, count(DISTINCT w) AS c FROM s GROUP BY k" "DISTINCT inside aggregates is not supported"
@@ -483,6 +505,7 @@ q "INSERT INTO shop.products VALUES (1, 'pen', 1.5), (2, 'book', 12), (3, 'lamp'
 q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 2, 'paid'), (2, 2, 1, 'paid'), (3, 3, 1, 'new')" >/dev/null
 LINES_DEF="SELECT o.id AS order_id, c.name AS customer, p.name AS product, o.qty * p.price AS total FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id JOIN shop.products p ON p.id = o.product_id WHERE o.status = 'paid'"
 q "SELECT nabla.create_view('public.order_lines', \$d\$$LINES_DEF\$d\$)" >/dev/null || die "create_view(order_lines) failed"
+await_ready public.order_lines
 lines_diff() { q "SELECT count(*) FROM ((SELECT order_id, customer, product, total FROM order_lines EXCEPT $LINES_DEF)
   UNION ALL ($LINES_DEF EXCEPT SELECT order_id, customer, product, total FROM order_lines)) d"; }
 shadow_of() { q "SELECT table_name FROM nabla.shadows WHERE relid = '$1'::regclass"; }
@@ -515,6 +538,7 @@ assert_eq "shadows equal their base tables" "0|0|0" "$(shadow_diff shop.customer
 echo "== 16. aggregate join view"
 REV_DEF="SELECT c.region, count(*) AS n, sum(o.qty * p.price) AS revenue FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id JOIN shop.products p ON p.id = o.product_id WHERE o.status = 'paid' GROUP BY c.region"
 q "SELECT nabla.create_view('public.revenue_by_region', \$d\$$REV_DEF\$d\$)" >/dev/null || die "create_view(revenue_by_region) failed"
+await_ready public.revenue_by_region
 rev_diff() { q "SELECT count(*) FROM ((SELECT region, n, revenue FROM revenue_by_region EXCEPT $REV_DEF)
   UNION ALL ($REV_DEF EXCEPT SELECT region, n, revenue FROM revenue_by_region)) d"; }
 assert_eq "aggregate join view equals its query at creation" "0" "$(rev_diff)"
@@ -543,6 +567,7 @@ assert_eq "dropping the last view drops the shadows" "0|0|0" \
 # --- 17. the shadow proof ------------------------------------------------------
 echo "== 17. shadow proof"
 q "SELECT nabla.create_view('public.order_lines', \$d\$$LINES_DEF\$d\$)" >/dev/null || die "create_view(order_lines) failed"
+await_ready public.order_lines
 q "ALTER SYSTEM SET nabla.poll_interval_ms = 5000" >/dev/null
 q "SELECT pg_reload_conf()" >/dev/null
 sleep 0.5
@@ -622,6 +647,7 @@ assert_eq "the two-table transaction rewrites the customer's rows plus the new o
   "deltas=$(q "SELECT 2 * (SELECT count(*) FROM order_lines WHERE customer = 'Roberta') - 1")" \
   "$(grep -E '^tx ' "$OUT" | tail -n 1 | grep -oE 'deltas=[0-9]+')"
 q "SELECT nabla.refresh('public.order_lines')" >/dev/null || die "refresh(order_lines) failed"
+await_ready public.order_lines
 # No write follows the refresh: the client must notice it through its fallback poll.
 wait_line 'resync: epoch changed' 20 || die "no epoch resync after refresh: $(tail -n 20 "$OUT")"
 L_RESYNC=$(grep -n -m1 'resync: epoch changed' "$OUT" | cut -d: -f1)
@@ -665,6 +691,7 @@ assert_eq "client exits cleanly on SIGINT" "0|1" "$CLIENT_RC|$(grep -c '^interru
 # --- 20. API contract ----------------------------------------------------------
 echo "== 20. API contract (epochs, SQLSTATEs, whole transactions, hidden columns)"
 CANON=$(q "SELECT nabla.create_view('Public.Canon_Test', 'SELECT id, k FROM orders')")
+await_ready public.canon_test
 assert_eq "create_view returns the canonical name and status() agrees" "public.canon_test|public.canon_test" \
   "$CANON|$(q "SELECT name FROM nabla.status('PUBLIC.canon_test')")"
 wait_view public.canon_test
@@ -683,6 +710,7 @@ assert_eq "a result shorter than max_rows is drained" "2|0" \
 assert_eq "changes() rows use driver-friendly types" "bigint,text,bigint,text,jsonb" \
   "$(q "SELECT string_agg(format_type(t.oid, NULL), ',' ORDER BY a.ord) FROM pg_proc p, unnest(p.proallargtypes) WITH ORDINALITY a(oid, ord) JOIN pg_type t ON t.oid = a.oid WHERE p.proname = 'changes' AND p.pronamespace = 'nabla'::regnamespace AND a.ord > 5")"
 q "SELECT nabla.refresh('public.canon_test')" >/dev/null || die "refresh(canon_test) failed"
+await_ready public.canon_test
 assert_eq "a refresh with a live cursor is reported as NB003, never as lagged" "NB003" \
   "$(sqlstate_of "SELECT count(*) FROM nabla.changes('public.canon_test', $((CUR_C + 32)), $EPOCH_C)")"
 assert_contains "NB003 carries the epochs in DETAIL" "DETAIL:  epoch $EPOCH_C -> $((EPOCH_C + 1))" \
@@ -706,6 +734,105 @@ assert_eq "SQLSTATE NB005 for direct writes" "NB005" "$(sqlstate_of "DELETE FROM
 assert_eq "the client branches on SQLSTATEs, never on message text" "0" \
   "$(grep -cE 'lagged behind|is stale' /work/clients/rust/nabla-client/src/lib.rs)"
 q "SELECT nabla.drop_view('public.canon_test')" >/dev/null
+
+# --- 21. non-blocking create and refresh ------------------------------------
+echo "== 21. non-blocking create and refresh (consistent snapshot)"
+q "CREATE TABLE shop.events (id bigserial PRIMARY KEY, k int, amount numeric)" >/dev/null
+q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = 2000" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+sleep 0.3
+psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO shop.events (k, amount) VALUES (1, 10); SELECT pg_sleep(3); COMMIT" >/dev/null 2>&1 &
+WRITER_PID=$!
+sleep 0.4
+START_NS=$(date +%s%N)
+CREATED=$(q "SELECT nabla.create_view('public.events_view', 'SELECT id, k, amount FROM shop.events')")
+CREATE_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
+assert_eq "create_view returns immediately while a writer holds the table" "public.events_view|yes" \
+  "$CREATED|$( [ "$CREATE_MS" -lt 500 ] && echo yes || echo "no ($CREATE_MS ms)" )"
+assert_eq "the view is initializing" "initializing" "$(q "SELECT status FROM nabla.status('public.events_view')")"
+START_NS=$(date +%s%N)
+if q "SET lock_timeout = '1s'; INSERT INTO shop.events (k, amount) VALUES (2, 20)" >/dev/null 2>/tmp/nabla-c.err; then
+  ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
+  if [ "$ELAPSED_MS" -lt 1000 ]; then pass "a second writer committed in ${ELAPSED_MS} ms while the view initializes"
+  else fail "no lock during create" "commit took ${ELAPSED_MS} ms"; fi
+else
+  fail "no lock during create" "insert failed: $(cat /tmp/nabla-c.err)"
+fi
+wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
+# Let the consistent point be found without waiting for the bgwriter's periodic record.
+q "SELECT pg_log_standby_snapshot()" >/dev/null
+VIEW_ID=$(q "SELECT id FROM nabla.views WHERE name = 'public.events_view'")
+INVARIANT=unseen
+for _ in $(seq 1 300); do
+  ROW=$(q "SELECT ((SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'nabla') <= t.confirmed_flush_lsn) || '|' || t.temporary
+           FROM pg_replication_slots t WHERE t.slot_name = 'nabla_init_$VIEW_ID' AND t.confirmed_flush_lsn IS NOT NULL")
+  if [ -n "$ROW" ]; then INVARIANT=$ROW; break; fi
+  [ "$(q "SELECT status FROM nabla.status('public.events_view')")" = live ] && break
+  sleep 0.1
+done
+assert_eq "main slot confirmed_flush <= temporary init slot's consistent point (slot is temporary)" "true|true" "$INVARIANT"
+assert_eq "await_ready() returns true" "t" "$(q "SELECT nabla.await_ready('public.events_view', 60000)")"
+assert_eq "the temporary init slot is gone" "0" "$(q "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'nabla_init_%'")"
+assert_eq "the view has both rows: the one in flight during create and the concurrent one" "1,2|0" \
+  "$(q "SELECT string_agg(k::text, ',' ORDER BY k) FROM events_view")|$(q "SELECT count(*) FROM ((SELECT id, k, amount FROM events_view EXCEPT SELECT id, k, amount FROM shop.events) UNION ALL (SELECT id, k, amount FROM shop.events EXCEPT SELECT id, k, amount FROM events_view)) d")"
+q "INSERT INTO shop.events (k, amount) VALUES (3, 30)" >/dev/null
+wait_view public.events_view
+assert_eq "a row committed after await_ready is applied through the normal path" "1,2,3" "$(q "SELECT string_agg(k::text, ',' ORDER BY k) FROM events_view")"
+q "ALTER SYSTEM RESET nabla.debug_populate_delay_ms" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+
+# Refresh is non-disruptive: readers, writers and old-epoch subscribers are unaffected.
+q "SELECT nabla.create_view('public.revenue_by_region', \$d\$$REV_DEF\$d\$)" >/dev/null || die "create_view(revenue_by_region) failed"
+await_ready public.revenue_by_region
+wait_view public.revenue_by_region
+q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = 3000" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+sleep 0.3
+EPOCH_R=$(q "SELECT epoch FROM nabla.status('public.revenue_by_region')")
+EPOCH_L=$(q "SELECT epoch FROM nabla.status('public.order_lines')")
+CUR_R=$(q "SELECT current_seq FROM nabla.status('public.revenue_by_region')")
+CONTENT_R=$(q "SELECT string_agg(region || ':' || n || ':' || revenue, ',' ORDER BY region) FROM revenue_by_region")
+START_NS=$(date +%s%N)
+q "SELECT nabla.refresh('public.revenue_by_region')" >/dev/null || die "refresh(revenue_by_region) failed to start"
+REFRESH_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
+assert_eq "refresh returns immediately" "yes" "$( [ "$REFRESH_MS" -lt 500 ] && echo yes || echo "no ($REFRESH_MS ms)" )"
+assert_eq "the view and the views sharing its shadows are refreshing" "refreshing|refreshing" \
+  "$(q "SELECT status FROM nabla.status('public.revenue_by_region')")|$(q "SELECT status FROM nabla.status('public.order_lines')")"
+sleep 1
+assert_eq "readers still see the full old content and the old epoch while refreshing" "same|$EPOCH_R" \
+  "$( [ "$(q "SELECT string_agg(region || ':' || n || ':' || revenue, ',' ORDER BY region) FROM revenue_by_region")" = "$CONTENT_R" ] && echo same || echo different )|$(q "SELECT epoch FROM nabla.status('public.revenue_by_region')")"
+START_NS=$(date +%s%N)
+if q "SET lock_timeout = '1s'; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 9, 'paid')" >/dev/null 2>/tmp/nabla-r.err; then
+  ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
+  if [ "$ELAPSED_MS" -lt 1000 ]; then pass "a writer committed in ${ELAPSED_MS} ms while the view refreshes"
+  else fail "refresh non-disruptive" "commit took ${ELAPSED_MS} ms"; fi
+else
+  fail "refresh non-disruptive" "insert failed: $(cat /tmp/nabla-r.err)"
+fi
+assert_eq "changes() with the old epoch still works while refreshing" "0" \
+  "$(q "SELECT count(*) FROM nabla.changes('public.revenue_by_region', $CUR_R, $EPOCH_R)")"
+assert_eq "await_ready() after the rebuild" "t" "$(q "SELECT nabla.await_ready('public.revenue_by_region', 60000)")"
+wait_view public.revenue_by_region
+wait_view public.order_lines
+assert_eq "the epoch advanced by one on the view and on the cascaded view" "$((EPOCH_R + 1))|$((EPOCH_L + 1))" \
+  "$(q "SELECT epoch FROM nabla.status('public.revenue_by_region')")|$(q "SELECT epoch FROM nabla.status('public.order_lines')")"
+assert_eq "the rebuilt views equal their queries (including the write made during the rebuild)" "0|0" "$(rev_diff)|$(lines_diff)"
+assert_eq "a cursor with the old epoch gets NB003 after the switch" "NB003" \
+  "$(sqlstate_of "SELECT count(*) FROM nabla.changes('public.revenue_by_region', $CUR_R, $EPOCH_R)")"
+q "ALTER SYSTEM RESET nabla.debug_populate_delay_ms" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+
+# Failure: the definition errors on existing data.
+q "CREATE TABLE shop.divs (id serial PRIMARY KEY, k int)" >/dev/null
+q "INSERT INTO shop.divs (k) VALUES (0), (4)" >/dev/null
+q "SELECT nabla.create_view('public.bad_init', 'SELECT id, 100 / k AS ratio FROM shop.divs')" >/dev/null || die "create_view(bad_init) failed"
+ERR=$(q_err "SELECT nabla.await_ready('public.bad_init', 60000)")
+assert_contains "await_ready() raises the population error with PostgreSQL's message in DETAIL" "DETAIL:  division by zero" "$ERR"
+assert_eq "the population error carries SQLSTATE NB006" "NB006" "$(sqlstate_of "SELECT nabla.await_ready('public.bad_init', 60000)")"
+assert_eq "the view is failed and no table was left behind" "failed|t|0" \
+  "$(q "SELECT status FROM nabla.status('public.bad_init')")|$(q "SELECT to_regclass('public.bad_init') IS NULL")|$(q "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'nabla_init_%'")"
+q "SELECT nabla.drop_view('public.bad_init')" >/dev/null || die "drop_view(bad_init) failed"
+assert_eq "drop_view cleans a failed view" "0" "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.bad_init'")"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

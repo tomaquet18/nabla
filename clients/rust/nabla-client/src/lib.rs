@@ -8,6 +8,8 @@
 //!    `nabla.status(view)`, `nabla.visible_columns(view)` and the view's rows,
 //!    and emit [`Event::Snapshot`] whose `cursor` is the view's current
 //!    sequence number and whose `epoch` every later `changes()` call carries.
+//!    While the view is `initializing` or `refreshing` the client waits and
+//!    retries; a `failed` view is an error carrying the recorded reason.
 //! 3. Follow: on every notification, and on a fallback timer, call
 //!    `nabla.changes(view, cursor, epoch, batch)` until it returns fewer rows
 //!    than `batch` (the server never splits a transaction); consecutive rows
@@ -32,6 +34,7 @@ use tokio_postgres::{AsyncMessage, Client, IsolationLevel, NoTls};
 pub const SQLSTATE_LAGGED: &str = "NB001";
 pub const SQLSTATE_STALE: &str = "NB002";
 pub const SQLSTATE_EPOCH_CHANGED: &str = "NB003";
+pub const SQLSTATE_FAILED: &str = "NB006";
 
 #[derive(Debug)]
 pub enum Error {
@@ -40,6 +43,9 @@ pub enum Error {
     /// sequence numbers). Not recoverable by resync.
     Protocol(String),
     NotConnected,
+    /// The view's build or rebuild failed (status `failed`, NB006); not
+    /// recoverable by resync.
+    ViewFailed(String),
 }
 
 impl fmt::Display for Error {
@@ -48,6 +54,7 @@ impl fmt::Display for Error {
             Error::Postgres(e) => write!(f, "postgres: {e}"),
             Error::Protocol(m) => write!(f, "protocol violation: {m}"),
             Error::NotConnected => write!(f, "not connected"),
+            Error::ViewFailed(r) => write!(f, "view failed to build: {r}"),
         }
     }
 }
@@ -115,11 +122,19 @@ pub struct Options {
     pub keep_hidden: bool,
     /// Longest wait between bootstrap attempts on a stale view.
     pub max_backoff: Duration,
+    /// Wait between bootstrap attempts while the view is being built.
+    pub build_poll: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { batch: 1000, poll_interval: Duration::from_secs(1), keep_hidden: false, max_backoff: Duration::from_secs(30) }
+        Options {
+            batch: 1000,
+            poll_interval: Duration::from_secs(1),
+            keep_hidden: false,
+            max_backoff: Duration::from_secs(30),
+            build_poll: Duration::from_millis(200),
+        }
     }
 }
 
@@ -148,6 +163,15 @@ enum Failure {
     EpochChanged { from: i32, to: i32 },
     Disconnected,
     Other(Error),
+}
+
+/// Outcome of one bootstrap attempt.
+enum Boot {
+    Ready,
+    /// The view is being built or rebuilt: try again shortly, silently.
+    Building,
+    Stale(String),
+    Failed(String),
 }
 
 fn quote_ident(s: &str) -> String {
@@ -179,6 +203,7 @@ fn classify(e: tokio_postgres::Error, epoch: i32) -> Failure {
                 .unwrap_or(epoch);
             Failure::EpochChanged { from: epoch, to }
         }
+        SQLSTATE_FAILED => Failure::Other(Error::ViewFailed(db.detail().unwrap_or("reason not recorded").to_string())),
         _ => Failure::Other(Error::Postgres(e)),
     }
 }
@@ -285,11 +310,15 @@ impl Subscription {
             }
             match self.state {
                 State::NeedBootstrap => match self.bootstrap().await {
-                    Ok(None) => {}
-                    Ok(Some((reason, backoff))) => {
+                    Ok(Boot::Ready) => {}
+                    Ok(Boot::Building) => tokio::time::sleep(self.options.build_poll).await,
+                    Ok(Boot::Stale(reason)) => {
+                        let backoff = self.stale_backoff;
+                        self.stale_backoff = (self.stale_backoff * 2).min(self.options.max_backoff);
                         self.pending.push_back((Event::Resync { reason: ResyncReason::Stale { reason } }, None));
                         tokio::time::sleep(backoff).await;
                     }
+                    Ok(Boot::Failed(reason)) => return Err(Error::ViewFailed(reason)),
                     Err(Failure::Disconnected) => self.conn = None,
                     Err(Failure::Other(e)) => return Err(e),
                     Err(_) => {}
@@ -330,13 +359,12 @@ impl Subscription {
     }
 
     /// One REPEATABLE READ transaction: status, visible columns and content
-    /// from the same snapshot. Returns the stale reason and the backoff to
-    /// sleep for a stale view.
-    async fn bootstrap(&mut self) -> std::result::Result<Option<(String, Duration)>, Failure> {
+    /// from the same snapshot.
+    async fn bootstrap(&mut self) -> std::result::Result<Boot, Failure> {
         let keep = self.options.keep_hidden;
         let view = self.view.clone();
         let conn = self.conn.as_mut().ok_or(Failure::Other(Error::NotConnected))?;
-        let result: std::result::Result<Option<Event>, tokio_postgres::Error> = async {
+        let result: std::result::Result<(Boot, Option<Event>), tokio_postgres::Error> = async {
             let tx = conn
                 .client
                 .build_transaction()
@@ -351,12 +379,22 @@ impl Subscription {
                 )
                 .await?;
             let state: String = status.get(0);
-            if state == "stale" {
-                let reason: Option<String> = status.get(4);
-                tx.commit().await?;
-                return Ok(Some(Event::Resync {
-                    reason: ResyncReason::Stale { reason: reason.unwrap_or_else(|| "reason not recorded".into()) },
-                }));
+            let reason: Option<String> = status.get(4);
+            let reason = reason.unwrap_or_else(|| "reason not recorded".into());
+            match state.as_str() {
+                "initializing" | "refreshing" => {
+                    tx.commit().await?;
+                    return Ok((Boot::Building, None));
+                }
+                "failed" => {
+                    tx.commit().await?;
+                    return Ok((Boot::Failed(reason), None));
+                }
+                "stale" => {
+                    tx.commit().await?;
+                    return Ok((Boot::Stale(reason), None));
+                }
+                _ => {}
             }
             let epoch: i32 = status.get(1);
             let frontier: String = status.get(2);
@@ -371,25 +409,20 @@ impl Subscription {
             let rows = tx.query(&sql, &[]).await?;
             tx.commit().await?;
             let rows = rows.into_iter().map(|r| r.get::<_, Value>(0)).collect();
-            Ok(Some(Event::Snapshot { epoch, frontier, cursor, rows }))
+            Ok((Boot::Ready, Some(Event::Snapshot { epoch, frontier, cursor, rows })))
         }
         .await;
         match result {
-            Ok(Some(Event::Resync { reason: ResyncReason::Stale { reason } })) => {
-                let backoff = self.stale_backoff;
-                self.stale_backoff = (self.stale_backoff * 2).min(self.options.max_backoff);
-                Ok(Some((reason, backoff)))
-            }
-            Ok(Some(Event::Snapshot { epoch, frontier, cursor, rows })) => {
+            Ok((Boot::Ready, Some(Event::Snapshot { epoch, frontier, cursor, rows }))) => {
                 self.epoch = epoch;
                 self.cursor = cursor;
                 self.stale_backoff = Duration::from_secs(1);
                 self.state = State::Following;
                 self.tail.clear();
                 self.pending.push_back((Event::Snapshot { epoch, frontier, cursor, rows }, Some(cursor)));
-                Ok(None)
+                Ok(Boot::Ready)
             }
-            Ok(_) => Ok(None),
+            Ok((outcome, _)) => Ok(outcome),
             Err(e) => Err(classify(e, self.epoch)),
         }
     }

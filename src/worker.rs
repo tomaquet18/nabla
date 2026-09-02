@@ -36,6 +36,7 @@ use crate::guc;
 use crate::idle;
 use crate::lsn;
 use crate::pgoutput::{Change, ColumnValue, Decoder, Relation, SourceTransaction, Tuple};
+use crate::populate;
 
 const SLOT: &str = "nabla";
 const PUBLICATION: &str = "nabla";
@@ -740,6 +741,10 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
         return Ok(Round::Idle);
     }
     state.reported_missing_extension = false;
+
+    // Build or rebuild views that create_view/refresh queued, each group
+    // under its own consistent snapshot (populate.rs), before decoding.
+    populate::run_pending(&|body| try_transaction(|| body()).and_then(|r| r))?;
 
     // Slot presence and lag.
     let slot = try_transaction(|| {

@@ -1,4 +1,8 @@
 //! SQL-callable API, all in schema `nabla`.
+//!
+//! `create_view` and `refresh` only record intent and return immediately; the
+//! worker builds the tables under a consistent snapshot (see populate.rs).
+//! Status vocabulary: `initializing`, `refreshing`, `live`, `stale`, `failed`.
 
 use pgrx::datum::{DatumWithOid, JsonB};
 use pgrx::prelude::*;
@@ -148,28 +152,6 @@ fn require_logical_wal() {
     }
 }
 
-fn view_index_sql(name: &str, spec: &ViewSpec) -> String {
-    let cols: Vec<String> = match spec.shape {
-        Shape::Projection => spec.pk_view_columns.iter().map(quote_identifier).collect(),
-        Shape::Aggregate => spec.columns.iter().map(|c| quote_identifier(&c.alias)).collect(),
-    };
-    // GROUP BY treats NULLs as equal, so the group key index must as well.
-    let nulls = if spec.shape == Shape::Aggregate { " NULLS NOT DISTINCT" } else { "" };
-    format!("CREATE UNIQUE INDEX ON {name} ({}){nulls}", cols.join(", "))
-}
-
-/// Reset a view's bookkeeping after a rebuild: a new epoch invalidates every
-/// subscriber cursor (they get NB003 from changes()).
-fn record_refresh(view_id: i32) {
-    run_args(
-        "UPDATE nabla.views SET frontier_lsn = pg_catalog.pg_current_wal_lsn(), epoch = epoch + 1, \
-         status = 'live', apply_failures = 0, last_error = NULL, last_error_at = NULL, stale_reason = NULL \
-         WHERE id = $1",
-        &[view_id.into()],
-    );
-    run_args("DELETE FROM nabla.deltas WHERE view_id = $1", &[view_id.into()]);
-}
-
 struct CatalogRow {
     id: i32,
     name: String,
@@ -180,6 +162,9 @@ struct CatalogRow {
     status: String,
     last_seq: i64,
     stale_reason: Option<String>,
+    last_error: Option<String>,
+    /// A build has committed before (shadow references exist).
+    populated: bool,
 }
 
 fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
@@ -187,7 +172,8 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
         let mut out = Vec::new();
         for r in client.select(
             &format!(
-                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, stale_reason, frontier_lsn::text \
+                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, stale_reason, \
+                        frontier_lsn::text, last_error, populated_at IS NOT NULL \
                  FROM nabla.views WHERE {clause} ORDER BY id"
             ),
             None,
@@ -206,6 +192,8 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
                 last_seq: r.get::<i64>(7)?.expect("last_seq"),
                 stale_reason: r.get::<String>(8)?,
                 frontier: lsn::parse(&r.get::<String>(9)?.unwrap_or_default()).unwrap_or(0),
+                last_error: r.get::<String>(10)?,
+                populated: r.get::<bool>(11)?.unwrap_or(false),
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -228,10 +216,10 @@ fn oid_array(oids: &BTreeSet<u32>) -> String {
     format!("ARRAY[{}]::oid[]", items.join(", "))
 }
 
-/// The refresh set of a join view: it, every shadow it uses, and every other
-/// join view sharing any of those shadows — transitively, because a shadow
-/// re-snapshotted at a new LSN would be wrong for a view still at an older one.
-fn refresh_closure(view: &CatalogRow) -> (Vec<CatalogRow>, BTreeSet<u32>) {
+/// The refresh set of a join view: it and every other join view sharing any
+/// of its shadows — transitively, because a shadow re-snapshotted at a new
+/// consistent point would be wrong for a view still at an older one.
+fn refresh_closure(view: &CatalogRow) -> Vec<CatalogRow> {
     let mut view_ids: BTreeSet<i64> = BTreeSet::from([view.id as i64]);
     let mut relids: BTreeSet<u32> = view.spec.relations.iter().map(|r| r.oid).collect();
     loop {
@@ -260,30 +248,30 @@ fn refresh_closure(view: &CatalogRow) -> (Vec<CatalogRow>, BTreeSet<u32>) {
         }
     }
     let ids: Vec<String> = view_ids.iter().map(|i| i.to_string()).collect();
-    let views = load_view_where(&format!("id IN ({})", ids.join(", ")), &[]);
-    (views, relids)
+    load_view_where(&format!("id IN ({})", ids.join(", ")), &[])
 }
 
-/// (frontier, status, stale_reason) read with a fresh snapshot.
-fn current_frontier(name: &str) -> (u64, String, Option<String>) {
+/// (frontier, status, stale_reason, last_error) read with a fresh snapshot.
+fn current_state(name: &str) -> (u64, String, Option<String>, Option<String>) {
     // Read-only SPI runs under the active snapshot, so push the latest one
     // to observe the worker's commits while polling.
     unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot()) };
     let found = Spi::connect(|client| {
         let table = client.select(
-            "SELECT frontier_lsn::text, status, stale_reason FROM nabla.views WHERE name = $1",
+            "SELECT frontier_lsn::text, status, stale_reason, last_error FROM nabla.views WHERE name = $1",
             Some(1),
             &[name.into()],
         )?;
         if table.is_empty() {
             Ok(None)
         } else {
-            let table = table.first();
-            Ok(Some((table.get::<String>(1)?, table.get::<String>(2)?, table.get::<String>(3)?)))
+            let t = table.first();
+            Ok(Some((t.get::<String>(1)?, t.get::<String>(2)?, t.get::<String>(3)?, t.get::<String>(4)?)))
         }
     });
     unsafe { pg_sys::PopActiveSnapshot() };
-    let (lsn_text, status, stale_reason) = found.unwrap_or_else(|e| spi_fail(e)).unwrap_or((None, None, None));
+    let (lsn_text, status, stale_reason, last_error) =
+        found.unwrap_or_else(|e| spi_fail(e)).unwrap_or((None, None, None, None));
     let lsn_text = lsn_text.unwrap_or_else(|| {
         errors::raise(
             PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
@@ -291,16 +279,18 @@ fn current_frontier(name: &str) -> (u64, String, Option<String>) {
             None,
         )
     });
-    (lsn::parse(&lsn_text).unwrap_or(0), status.unwrap_or_default(), stale_reason)
+    (lsn::parse(&lsn_text).unwrap_or(0), status.unwrap_or_default(), stale_reason, last_error)
 }
 
 /// Poll the frontier every 10 ms until it reaches `target` or the timeout.
 fn wait_for_frontier(name: &str, target: u64, timeout_ms: i32) -> bool {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
-        let (frontier, status, stale_reason) = current_frontier(name);
-        if status == "stale" {
-            errors::stale(name, stale_reason.as_deref());
+        let (frontier, status, stale_reason, last_error) = current_state(name);
+        match status.as_str() {
+            "stale" => errors::stale(name, stale_reason.as_deref()),
+            "failed" => errors::failed(name, last_error.as_deref()),
+            _ => {}
         }
         if idle::effective_frontier(frontier) >= target {
             return true;
@@ -319,7 +309,9 @@ fn wait_for_frontier(name: &str, target: u64, timeout_ms: i32) -> bool {
 mod nabla {
     use super::*;
 
-    /// Returns the canonical (stored) view name; LISTEN on `'nabla:' || name`.
+    /// Records the view and returns its canonical name immediately; the
+    /// worker builds the table under a consistent snapshot (populate.rs).
+    /// LISTEN on `'nabla:' || name`; nabla.await_ready() waits for the build.
     #[pg_extern]
     fn create_view(name: &str, definition: &str) -> String {
         let name = require_qualified_name(name);
@@ -346,39 +338,16 @@ mod nabla {
             errors::invalid(format!("nabla: view \"{name}\" already exists"), None);
         }
 
-        // Order matters: the slot first (no writes yet), then locks, then writes.
+        // Order matters: the slot first (no writes yet), then catalog writes.
+        // No lock and no table here: the worker populates asynchronously.
         ensure_slot();
-
-        // Brief, documented write pause on the base tables: SHARE waits for
-        // in-flight writers to finish so the starting snapshot is exact and
-        // shared by the view table and every shadow.
-        for rel in &spec.relations {
-            run(&format!("LOCK TABLE {} IN SHARE MODE", rel.qualified));
-        }
-        if spec.is_join() {
-            for rel in &spec.relations {
-                shadow::ensure(rel);
-            }
-        }
         for rel in &spec.relations {
             ensure_publication_includes(rel.oid);
         }
-
-        run(&format!("CREATE TABLE {name} AS {}", spec.populate_sql));
-        run(&view_index_sql(&name, &spec));
-        run(&format!(
-            "CREATE TRIGGER nabla_guard BEFORE INSERT OR UPDATE OR DELETE ON {name} \
-             FOR EACH ROW EXECUTE FUNCTION nabla.guard_view()"
-        ));
-        run(&format!(
-            "CREATE TRIGGER nabla_guard_truncate BEFORE TRUNCATE ON {name} \
-             FOR EACH STATEMENT EXECUTE FUNCTION nabla.guard_view()"
-        ));
-
         let spec_json = serde_json::to_string(&spec).expect("spec serializes");
         let view_id = Spi::get_one_with_args::<i32>(
-            "INSERT INTO nabla.views (name, base_table, definition, shape, spec, frontier_lsn) \
-             VALUES ($1, $2::oid::regclass, $3, $4, $5::jsonb, pg_catalog.pg_current_wal_lsn()) RETURNING id",
+            "INSERT INTO nabla.views (name, base_table, definition, shape, spec, frontier_lsn, status) \
+             VALUES ($1, $2::oid::regclass, $3, $4, $5::jsonb, '0/0', 'initializing') RETURNING id",
             &[
                 name.as_str().into(),
                 (base.oid as i64).into(),
@@ -409,7 +378,8 @@ mod nabla {
         };
         run(&format!("DROP TABLE IF EXISTS {name}"));
         run_args("DELETE FROM nabla.views WHERE id = $1", &[view.id.into()]);
-        if view.spec.is_join() {
+        // Shadow references are taken when the first build commits.
+        if view.spec.is_join() && view.populated {
             for relid in &relids {
                 shadow::release(*relid);
             }
@@ -426,53 +396,51 @@ mod nabla {
         }
     }
 
+    /// Marks the view — and, for join views, every view sharing a shadow
+    /// with it — for rebuild and returns immediately. Until the worker
+    /// commits the rebuilt content the view is frozen: readable at its old
+    /// epoch and frontier, no new deltas. Afterwards the epoch is one higher.
+    /// nabla.await_ready() waits for it.
     #[pg_extern]
     fn refresh(name: &str) {
         let name = require_qualified_name(name);
         let view = load_view(&name);
         // The slot may have been dropped for lag; recreate it before any write.
         ensure_slot();
-        if !view.spec.is_join() {
-            ensure_publication_includes(view.base_oid);
-            run(&format!("LOCK TABLE {} IN SHARE MODE", view.spec.base_table));
-            run("SET LOCAL nabla.internal_write = on");
-            run(&format!("DELETE FROM {name}"));
-            run(&format!("INSERT INTO {name} {}", view.spec.populate_sql));
-            record_refresh(view.id);
-            return;
+        let ids: Vec<String> = if view.spec.is_join() {
+            refresh_closure(&view).iter().map(|v| v.id.to_string()).collect()
+        } else {
+            vec![view.id.to_string()]
+        };
+        for rel in &view.spec.relations {
+            ensure_publication_includes(rel.oid);
         }
+        run(&format!(
+            "UPDATE nabla.views SET status = 'refreshing' \
+             WHERE id IN ({}) AND status NOT IN ('initializing', 'refreshing')",
+            ids.join(", ")
+        ));
+    }
 
-        // Refresh cascades to views sharing a shadow: everything in the
-        // closure is re-snapshotted under SHARE locks, in one transaction.
-        let (views, relids) = refresh_closure(&view);
-        let mut names: Vec<(u32, String)> = Vec::new();
-        for v in &views {
-            for r in &v.spec.relations {
-                if relids.contains(&r.oid) && !names.iter().any(|(o, _)| *o == r.oid) {
-                    names.push((r.oid, r.qualified.clone()));
-                }
+    /// Blocks until the view is live (true), failed (NB006), stale (NB002),
+    /// or the timeout elapses (false).
+    #[pg_extern]
+    fn await_ready(name: &str, timeout_ms: default!(i32, 60000)) -> bool {
+        let name = require_qualified_name(name);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
+        loop {
+            let (_, status, stale_reason, last_error) = current_state(&name);
+            match status.as_str() {
+                "live" => return true,
+                "failed" => errors::failed(&name, last_error.as_deref()),
+                "stale" => errors::stale(&name, stale_reason.as_deref()),
+                _ => {}
             }
-        }
-        names.sort_by_key(|(o, _)| *o); // stable lock order across concurrent refreshes
-        for (oid, _) in &names {
-            ensure_publication_includes(*oid);
-        }
-        for (_, qualified) in &names {
-            run(&format!("LOCK TABLE {qualified} IN SHARE MODE"));
-        }
-        run("SET LOCAL nabla.internal_write = on");
-        let mut done: BTreeSet<u32> = BTreeSet::new();
-        for v in &views {
-            for r in &v.spec.relations {
-                if done.insert(r.oid) {
-                    shadow::snapshot(r);
-                }
+            if Instant::now() >= deadline {
+                return false;
             }
-        }
-        for v in &views {
-            run(&format!("DELETE FROM {}", v.name));
-            run(&format!("INSERT INTO {} {}", v.name, v.spec.populate_sql));
-            record_refresh(v.id);
+            pgrx::pg_sys::check_for_interrupts!();
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -483,7 +451,7 @@ mod nabla {
     fn frontier(name: &str) -> i64 {
         let name = require_qualified_name(name);
         load_view(&name);
-        current_frontier(&name).0 as i64
+        current_state(&name).0 as i64
     }
 
     #[pg_extern(sql = r#"
@@ -510,7 +478,8 @@ mod nabla {
     /// Everything a subscriber needs to bootstrap, in one row read from the
     /// caller's snapshot (so it composes with a REPEATABLE READ transaction
     /// that also reads the view table). `name` is the canonical view name:
-    /// LISTEN on `'nabla:' || name`.
+    /// LISTEN on `'nabla:' || name`. `status` is one of initializing,
+    /// refreshing, live, stale, failed.
     #[pg_extern(sql = r#"
     CREATE FUNCTION nabla.status(name text)
     RETURNS TABLE (name text, status text, epoch int, frontier_lsn pg_lsn, frontier text, current_seq bigint, stale_reason text)
@@ -532,6 +501,10 @@ mod nabla {
     > {
         let name = require_qualified_name(name);
         let view = load_view(&name);
+        let reason = match view.status.as_str() {
+            "failed" => view.last_error.clone(),
+            _ => view.stale_reason.clone(),
+        };
         TableIterator::once((
             view.name,
             view.status,
@@ -539,7 +512,7 @@ mod nabla {
             view.frontier as i64,
             lsn::format(view.frontier),
             view.last_seq,
-            view.stale_reason,
+            reason,
         ))
     }
 
@@ -560,8 +533,8 @@ mod nabla {
     /// Deltas after `after_seq`, whole source transactions only: a result with
     /// fewer rows than `max_rows` is drained; a trailing transaction that
     /// straddles `max_rows` is returned in full (so a result may exceed
-    /// `max_rows`). Raises NB002 (stale), NB003 (epoch differs) or NB001
-    /// (cursor older than retention), in that order.
+    /// `max_rows`). Raises NB002 (stale), NB006 (failed), NB003 (epoch
+    /// differs) or NB001 (cursor older than retention), in that order.
     #[pg_extern(sql = r#"
     CREATE FUNCTION nabla.changes(name text, after_seq bigint, epoch int, max_rows int DEFAULT 1000, include_hidden bool DEFAULT false)
     RETURNS TABLE (seq bigint, lsn text, xid bigint, op text, "row" jsonb)
@@ -576,8 +549,10 @@ mod nabla {
     ) -> TableIterator<'static, (name!(seq, i64), name!(lsn, String), name!(xid, Option<i64>), name!(op, String), name!(row, JsonB))> {
         let name = require_qualified_name(name);
         let view = load_view(&name);
-        if view.status == "stale" {
-            errors::stale(&name, view.stale_reason.as_deref());
+        match view.status.as_str() {
+            "stale" => errors::stale(&name, view.stale_reason.as_deref()),
+            "failed" => errors::failed(&name, view.last_error.as_deref()),
+            _ => {}
         }
         if epoch != view.epoch {
             errors::epoch_changed(&name, epoch, view.epoch);

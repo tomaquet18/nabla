@@ -14,8 +14,9 @@ accepts, explicit about what it rejects.
 2. **Logical decoding, never triggers.** A background worker consumes a
    replication slot (`pgoutput`) through the SQL peek/advance functions.
    Nothing runs in the writer's commit path, so writers never wait for view
-   maintenance. The only write pause is the brief `SHARE` lock taken while
-   `create_view` or `refresh` builds the starting snapshot.
+   maintenance, not even while a view is being created or rebuilt: the
+   starting snapshot comes from a logical-decoding consistent point, not
+   from a lock.
 3. **Delta-row subscriptions on a bounded durable log.** Each applied
    transaction appends its view-level deltas (`I`/`D` rows as JSON) to
    `nabla.deltas` in the same transaction that updates the view, so every delta
@@ -132,8 +133,21 @@ SELECT * FROM nabla.changes('public.orders_by_k', 42);    -- rows with seq > 42
 
 SQL API (schema `nabla`):
 
-- `create_view(name, definition) -> text` returns the canonical (stored) view
-  name; `drop_view(name)`; `refresh(name)`.
+- `create_view(name, definition) -> text` validates the definition, records
+  the view with status `initializing` and returns its canonical name at
+  once; the worker builds the table asynchronously. `refresh(name)` marks
+  the view (and, for join views, every view sharing a shadow with it)
+  `refreshing` and returns; until the rebuilt content is committed the view
+  is frozen at its old epoch and frontier, readers keep seeing the complete
+  old content (never an empty or half-built table), old-epoch cursors keep
+  working, and afterwards the epoch is one higher (`NB003` for old cursors).
+  `drop_view(name)` works in any status.
+- `await_ready(name, timeout_ms default 60000) -> bool`: waits until the
+  view is `live` (true), raises `NB006` if the build failed (DETAIL carries
+  PostgreSQL's error; the catalog row stays with status `failed` and
+  `last_error`, no table is left behind), or returns false on timeout.
+- Status vocabulary (`status()`): `initializing`, `refreshing`, `live`,
+  `stale`, `failed`.
 - `status(name) -> TABLE(name text, status text, epoch int, frontier_lsn pg_lsn,
   frontier text, current_seq bigint, stale_reason text)`: everything a
   subscriber needs, from the caller's snapshot. `LISTEN` on
@@ -161,6 +175,7 @@ Conditions a client must branch on carry nabla-specific SQLSTATEs:
 | `NB003` | epoch differs (the view was refreshed) | `nabla: view "<name>" epoch changed` / `epoch N -> M` / resync from the view |
 | `NB004` | unsupported view definition | `nabla: unsupported view definition: <reason>` / - / the accepted shapes |
 | `NB005` | direct write to a nabla-managed table | `nabla: cannot modify a nabla view directly` |
+| `NB006` | the build or rebuild of a view failed | `nabla: view "<name>" failed to build` / PostgreSQL's error / fix the cause, then `nabla.refresh('<name>')` or `nabla.drop_view('<name>')` |
 
 `changes()` checks stale, then epoch, then retention, so a refresh is always
 reported as `NB003`, never as `NB001`.
@@ -204,8 +219,8 @@ itself enters the join as a one-row VALUES built from the decoded row.
 - `refresh` of a join view re-snapshots the view, every shadow it uses and,
   because a shared shadow at a new LSN would be wrong for a view still at an
   older one, every other join view sharing any of those shadows
-  (transitively), all under SHARE locks in one transaction: refresh cascades
-  to views sharing a shadow.
+  (transitively), all from one consistent snapshot in one transaction:
+  refresh cascades to views sharing a shadow.
 - A shadow that cannot be maintained (schema drift) is flagged in
   `nabla.shadows.stale_reason`, its dependent views go stale, and
   `refresh` rebuilds it. Shadows are not dumped by pg_dump; refresh rebuilds
@@ -227,8 +242,10 @@ the `follow` example); clients in other languages follow the same steps.
    `SELECT * FROM nabla.status('<view>')`, `nabla.visible_columns('<view>')`
    and `SELECT <visible columns> FROM <view>`. Keep `epoch` and
    `current_seq` (the cursor) from the same snapshot as the rows. If
-   `status` is `stale`, wait with backoff and bootstrap again;
-   `stale_reason` says why.
+   `status` is `initializing` or `refreshing`, retry shortly (or call
+   `nabla.await_ready`); if it is `stale`, wait with backoff and bootstrap
+   again (`stale_reason` says why); if it is `failed`, stop and report the
+   recorded error.
 3. Follow: on every notification, and on a fallback timer (about one second)
    so a lost notification cannot stall you, call
    `nabla.changes('<view>', cursor, epoch, batch)` until it returns fewer
@@ -268,11 +285,16 @@ scripts/dev.sh shell     # interactive shell in the container
 ## How it works
 
 `create_view` parses the definition (`src/definition.rs`), creates the `nabla`
-replication slot if needed (before any write, as PostgreSQL requires), adds the
-base table to the `nabla` publication, takes a `SHARE` lock on the base table,
-runs `CREATE TABLE <name> AS <definition>`, adds a unique index (primary key or
-group columns), installs the write guard, and records `frontier_lsn =
-pg_current_wal_lsn()`.
+replication slot if needed (before any write, as PostgreSQL requires), adds
+the base tables to the `nabla` publication, records the view with status
+`initializing` and returns. The worker then builds the table under a
+consistent snapshot (`src/populate.rs`): it creates a temporary logical slot,
+lets PostgreSQL find a consistent point (waiting for transactions that were
+already running to complete, never blocking them), installs the slot's
+initial snapshot as its REPEATABLE READ transaction snapshot, runs
+`CREATE TABLE <name> AS <definition>`, adds the unique index and the write
+guard, and sets `frontier_lsn` to the consistent point; the main slot is at
+or below that point, so everything committed later is decoded normally.
 
 The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
 
@@ -299,8 +321,6 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
   `min`/`max`/`avg`.
 - A streaming transport for subscribers; `changes()` is pull-based
   (see `clients/rust/nabla-client` for the pull protocol).
-- Snapshot export at `create_view` so subscribers can start without a
-  `SHARE`-locked rebuild.
 - Incremental `TRUNCATE`; unchanged TOAST values for columns a view needs
   (a view goes stale instead of being silently wrong).
 - Only one worker and one database per cluster (`nabla.database`).

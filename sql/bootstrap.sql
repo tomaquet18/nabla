@@ -14,7 +14,8 @@ CREATE TABLE nabla.views (
   spec          jsonb NOT NULL,                  -- parsed structure, see src/definition.rs
   frontier_lsn  pg_lsn NOT NULL,                 -- the view equals its query at this WAL position
   epoch         int NOT NULL DEFAULT 1,          -- bumped by refresh; subscribers must resync
-  status        text NOT NULL DEFAULT 'live' CHECK (status IN ('live', 'stale')),
+  status        text NOT NULL DEFAULT 'initializing'
+                CHECK (status IN ('initializing', 'refreshing', 'live', 'stale', 'failed')),
   last_seq      bigint NOT NULL DEFAULT 0,       -- last delta sequence number handed out
   -- Failure isolation (see README "Failure isolation"). Added in v0.1 before
   -- any release, so no upgrade script migrates older catalogs.
@@ -22,6 +23,7 @@ CREATE TABLE nabla.views (
   last_error    text,
   last_error_at timestamptz,
   stale_reason  text,                             -- why status became 'stale'
+  populated_at  timestamptz,                      -- first successful build (shadow references exist)
   created_at    timestamptz NOT NULL DEFAULT now()
 );
 

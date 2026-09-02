@@ -14,6 +14,7 @@ mod guc;
 mod idle;
 mod lsn;
 mod pgoutput;
+mod populate;
 mod shadow;
 mod worker;
 

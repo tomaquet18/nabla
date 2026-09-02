@@ -14,6 +14,8 @@ pub static RETAIN_DELTAS: GucSetting<i32> = GucSetting::<i32>::new(100_000);
 pub static MAX_SLOT_LAG_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1 << 30);
 /// Consecutive failed applies of one source transaction before a view goes stale.
 pub static MAX_APPLY_FAILURES: GucSetting<i32> = GucSetting::<i32>::new(3);
+/// Test hook: hold the population snapshot for this long before building.
+pub static DEBUG_POPULATE_DELAY_MS: GucSetting<i32> = GucSetting::<i32>::new(0);
 /// Session flag that lets the worker and nabla.refresh write to view tables.
 pub static INTERNAL_WRITE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
@@ -63,6 +65,16 @@ pub fn register() {
         &MAX_APPLY_FAILURES,
         1,
         1_000_000,
+        GucContext::Sighup,
+        GucFlags::empty(),
+    );
+    GucRegistry::define_int_guc(
+        c"nabla.debug_populate_delay_ms",
+        c"Test hook: delay before a view is populated, while the consistent snapshot is held.",
+        c"Leave at 0 outside test suites.",
+        &DEBUG_POPULATE_DELAY_MS,
+        0,
+        600_000,
         GucContext::Sighup,
         GucFlags::empty(),
     );
