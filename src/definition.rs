@@ -6,10 +6,11 @@
 //! so name resolution and permission checks are PostgreSQL's), then walks the
 //! tree. Anything outside the two accepted shapes is rejected with a specific
 //! reason. Expressions apply.rs needs as SQL text (predicate, output
-//! expressions, sum arguments) are deparsed with `deparse_expression` against
-//! a single-relation context, so column references come out as bare quoted
-//! identifiers that bind against the `(VALUES ...) AS rel(cols)` row the
-//! worker builds.
+//! expressions, aggregate arguments) are deparsed with `deparse_expression`:
+//! single-table views use a one-relation context so columns come out bare;
+//! join views use a context over the whole range table so every column comes
+//! out as `alias.column`, matching the FROM list apply.rs builds from a
+//! one-row VALUES for the changed table and shadow tables for the others.
 //!
 //! Errors raised by PostgreSQL during parsing or analysis (syntax errors,
 //! unknown columns, missing tables, permissions) propagate unchanged: the
@@ -18,8 +19,9 @@
 
 use pgrx::pg_sys::{self, NodeTag};
 use pgrx::prelude::*;
-use pgrx::spi::quote_qualified_identifier;
+use pgrx::spi::{quote_identifier, quote_qualified_identifier};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CStr, CString};
 
 use crate::errors;
@@ -31,6 +33,10 @@ pub const HIDDEN_COUNT_COLUMN: &str = "_nabla_n";
 /// `_nabla_nn_<n>`, where n is the 0-based position of that sum among the
 /// view's aggregates in select-list order. Clients ignore `_nabla_*` columns.
 pub const HIDDEN_SUM_COUNTER_PREFIX: &str = "_nabla_nn_";
+/// Prefix of the hidden primary-key columns of a projection join view:
+/// `_nabla_pk<rti>_<column>`, rti being the base relation's 1-based position
+/// in the view's relation list (range-table order).
+pub const HIDDEN_PK_PREFIX: &str = "_nabla_pk";
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -48,8 +54,8 @@ impl Shape {
     }
 }
 
-/// One output column: a deparsed expression over the base table's columns and
-/// the (unquoted) name it has in the view table.
+/// One output column: a deparsed expression over base columns and the
+/// (unquoted) name it has in the view table.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct OutputColumn {
     pub expr: String,
@@ -66,20 +72,38 @@ pub struct SumSpec {
     pub counter: String,
 }
 
+/// One base relation of a view, in range-table order.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BaseRelation {
+    pub oid: u32,
+    /// 1-based position in the view's relation list.
+    pub rti: usize,
+    /// The alias the definition used for it (or the relation name), unquoted.
+    pub alias: String,
+    /// Quoted, schema-qualified name, ready for SQL.
+    pub qualified: String,
+    pub pk_columns: Vec<String>,
+    /// All column names in attribute order.
+    pub columns: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ViewSpec {
     pub shape: Shape,
-    /// Quoted, schema-qualified base table name, ready for SQL.
+    /// Quoted, schema-qualified name of the (first) base table.
     pub base_table: String,
-    /// Bare (unquoted) relation name; apply.rs aliases the decoded row with it.
+    /// Bare (unquoted) relation name of the single base table; apply.rs
+    /// aliases the decoded row with it for single-table views.
     pub base_relname: String,
-    /// Deparsed WHERE clause, if any.
+    /// Deparsed WHERE clause (for joins: the conjunction of every ON and WHERE).
     pub predicate: Option<String>,
-    /// Projection: every output column. Aggregate: the group keys.
+    /// Projection: every visible output column. Aggregate: the group keys.
     pub columns: Vec<OutputColumn>,
-    /// Base primary key column names (projection only).
+    /// Base primary key column names (single-table projection only).
     pub pk_columns: Vec<String>,
-    /// View column names carrying the primary key, in PK order (projection only).
+    /// View columns identifying a row of a projection view, in order:
+    /// the selected PK columns (single table) or the hidden `_nabla_pk*`
+    /// columns (join).
     pub pk_view_columns: Vec<String>,
     /// View column carrying the group count (aggregate only).
     pub count_alias: Option<String>,
@@ -91,9 +115,24 @@ pub struct ViewSpec {
     pub sums: Vec<SumSpec>,
     /// SELECT that fills the view table (create and refresh).
     pub populate_sql: String,
+    /// Base relations in range-table order (one entry for single-table views).
+    #[serde(default)]
+    pub relations: Vec<BaseRelation>,
+    /// The populate query's select list (visible and hidden columns).
+    #[serde(default)]
+    pub select_list: String,
+    /// GROUP BY expressions of the populate query, if any.
+    #[serde(default)]
+    pub group_by: Option<String>,
 }
 
-/// Base table facts from the catalog.
+impl ViewSpec {
+    pub fn is_join(&self) -> bool {
+        self.relations.len() > 1
+    }
+}
+
+/// Base table facts from the catalog (single-table API checks).
 pub struct BaseTable {
     pub oid: u32,
     pub qualified: String,
@@ -176,7 +215,7 @@ unsafe extern "C-unwind" fn find_mutable(node: *mut pg_sys::Node, ctx: *mut c_vo
 }
 
 /// Reject when `node` uses anything that is not IMMUTABLE: the view must be a
-/// pure function of the base table's rows.
+/// pure function of the base tables' rows.
 unsafe fn require_immutable(node: *mut pg_sys::Node, place: &str) {
     if node.is_null() || !pg_sys::contain_mutable_functions(node) {
         return;
@@ -188,6 +227,42 @@ unsafe fn require_immutable(node: *mut pg_sys::Node, place: &str) {
             "{place} uses \"{name}\", which is not IMMUTABLE; the view must be a pure function of the base table"
         )),
         None => reject(format!("{place} uses a function that is not IMMUTABLE")),
+    }
+}
+
+// --- unresolved Var search ---------------------------------------------------
+
+struct VarCheck {
+    allowed: Vec<i32>,
+    bad: bool,
+}
+
+/// After flattening join aliases every Var must point at a base relation of
+/// the current query level.
+unsafe extern "C-unwind" fn find_foreign_var(node: *mut pg_sys::Node, ctx: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    let check = &mut *(ctx as *mut VarCheck);
+    if (*node).type_ == NodeTag::T_Var {
+        let var = &*(node as *mut pg_sys::Var);
+        if var.varlevelsup != 0 || !check.allowed.contains(&var.varno) {
+            check.bad = true;
+            return true;
+        }
+        return false;
+    }
+    pg_sys::expression_tree_walker_impl(node, Some(find_foreign_var), ctx)
+}
+
+unsafe fn require_base_vars(node: *mut pg_sys::Node, allowed: &[i32]) {
+    if node.is_null() {
+        return;
+    }
+    let mut check = VarCheck { allowed: allowed.to_vec(), bad: false };
+    find_foreign_var(node, &mut check as *mut VarCheck as *mut c_void);
+    if check.bad {
+        reject("a column reference could not be resolved to one of the joined tables");
     }
 }
 
@@ -247,31 +322,74 @@ unsafe fn reject_unsupported_clauses(query: *mut pg_sys::Query) {
     }
 }
 
-/// The single base relation of the query, after rejecting every other kind
-/// of range table entry.
-unsafe fn single_relation(query: *mut pg_sys::Query) -> *mut pg_sys::RangeTblEntry {
+struct RelEntry {
+    /// 1-based index in the query's range table (what Vars use as varno).
+    rt_index: i32,
+    rte: *mut pg_sys::RangeTblEntry,
+}
+
+/// The base relations of the query, after rejecting every other kind of
+/// range table entry. Join entries (from explicit JOIN syntax) are allowed.
+unsafe fn collect_relations(query: *mut pg_sys::Query) -> Vec<RelEntry> {
     let mut relations = Vec::new();
-    for item in list_items((*query).rtable) {
+    for (i, item) in list_items((*query).rtable).into_iter().enumerate() {
         let rte = item as *mut pg_sys::RangeTblEntry;
         if (*rte).lateral {
             reject("LATERAL is not supported");
         }
         match (*rte).rtekind {
-            pg_sys::RTEKind::RTE_RELATION => relations.push(rte),
-            pg_sys::RTEKind::RTE_JOIN => reject("joins are not supported; a view has exactly one base table"),
+            pg_sys::RTEKind::RTE_RELATION => relations.push(RelEntry { rt_index: i as i32 + 1, rte }),
+            pg_sys::RTEKind::RTE_JOIN => {}
             pg_sys::RTEKind::RTE_SUBQUERY => reject("subqueries in FROM are not supported"),
             pg_sys::RTEKind::RTE_FUNCTION | pg_sys::RTEKind::RTE_TABLEFUNC => {
                 reject("set-returning functions are not supported")
             }
             pg_sys::RTEKind::RTE_VALUES => reject("VALUES lists are not supported"),
             pg_sys::RTEKind::RTE_CTE => reject("common table expressions (WITH) are not supported"),
-            _ => reject("a FROM clause with exactly one ordinary table is required"),
+            _ => reject("a FROM clause with one or more ordinary tables is required"),
         }
     }
-    match relations.len() {
-        0 => reject("a FROM clause with exactly one ordinary table is required"),
-        1 => relations[0],
-        _ => reject("joins are not supported; a view has exactly one base table"),
+    if relations.is_empty() {
+        reject("a FROM clause with one or more ordinary tables is required");
+    }
+    relations
+}
+
+/// Walk the join tree: reject anything but inner joins and collect every
+/// ON and WHERE qual. With only inner joins, cross product plus the
+/// conjunction of all quals is equivalent to the original nesting.
+unsafe fn collect_quals(node: *mut pg_sys::Node, out: &mut Vec<*mut pg_sys::Node>) {
+    match tag(node as *const c_void) {
+        Some(NodeTag::T_FromExpr) => {
+            let from = &*(node as *mut pg_sys::FromExpr);
+            for item in list_items(from.fromlist) {
+                collect_quals(item as *mut pg_sys::Node, out);
+            }
+            if !from.quals.is_null() {
+                out.push(from.quals);
+            }
+        }
+        Some(NodeTag::T_JoinExpr) => {
+            let join = &*(node as *mut pg_sys::JoinExpr);
+            let kind = match join.jointype {
+                pg_sys::JoinType::JOIN_INNER => None,
+                pg_sys::JoinType::JOIN_LEFT => Some("LEFT JOIN"),
+                pg_sys::JoinType::JOIN_RIGHT => Some("RIGHT JOIN"),
+                pg_sys::JoinType::JOIN_FULL => Some("FULL JOIN"),
+                pg_sys::JoinType::JOIN_SEMI => Some("SEMI JOIN"),
+                pg_sys::JoinType::JOIN_ANTI | pg_sys::JoinType::JOIN_RIGHT_ANTI => Some("ANTI JOIN"),
+                _ => Some("this join type"),
+            };
+            if let Some(kind) = kind {
+                reject(format!("{kind} is not supported; only inner joins are"));
+            }
+            collect_quals(join.larg, out);
+            collect_quals(join.rarg, out);
+            if !join.quals.is_null() {
+                out.push(join.quals);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -281,9 +399,9 @@ unsafe fn qualified_name(relid: pg_sys::Oid) -> (String, String) {
     (nspname, relname)
 }
 
-/// Catalog facts about the base table, read with read-only SPI so the calling
+/// Catalog facts about a base table, read with read-only SPI so the calling
 /// transaction stays free of an xid (create_view creates the slot afterwards).
-fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>) {
+fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>, Vec<String>) {
     let qualified = quote_qualified_identifier(nspname, relname);
     let args = [(relid as i64).into()];
     Spi::connect(|client| {
@@ -308,6 +426,15 @@ fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>
         if has_children {
             reject(format!("{qualified} has inheritance children, which logical decoding does not follow"));
         }
+        let mut columns = Vec::new();
+        for row in client.select(
+            "SELECT attname::text FROM pg_catalog.pg_attribute \
+             WHERE attrelid = $1::oid AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
+            None,
+            &args,
+        )? {
+            columns.push(row.get::<String>(1)?.unwrap_or_default());
+        }
         let mut pk_columns = Vec::new();
         let mut pk_attnums = Vec::new();
         for row in client.select(
@@ -324,6 +451,7 @@ fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>
         Ok::<_, pgrx::spi::Error>((
             BaseTable { oid: relid, qualified, replident, pk_columns },
             pk_attnums,
+            columns,
         ))
     })
     .unwrap_or_else(|e| errors::invalid(format!("nabla: catalog lookup failed: {e}"), None))
@@ -344,33 +472,56 @@ unsafe fn check_relation_kind(rte: *mut pg_sys::RangeTblEntry, qualified: &str, 
     if nspname == "nabla" {
         reject(format!("{qualified} is a nabla catalog table and cannot be a base table"));
     }
+    if nspname == crate::shadow::SCHEMA {
+        reject(format!("{qualified} is a nabla shadow table and cannot be a base table"));
+    }
 }
 
-/// Deparser bound to the single base relation: column references print as
-/// bare quoted identifiers.
+/// PostgreSQL's deparser bound to the definition's range table.
 struct Deparser {
     context: *mut pg_sys::List,
-    _alias: CString,
+    /// Prefix every column with its relation alias (needed for joins).
+    prefix: bool,
 }
 
 impl Deparser {
-    unsafe fn new(relid: pg_sys::Oid, relname: &str) -> Self {
+    /// Single relation: columns print as bare quoted identifiers.
+    unsafe fn single(relid: pg_sys::Oid, relname: &str) -> Self {
         let alias = CString::new(relname).expect("relation name without NUL");
         let context = pg_sys::deparse_context_for(alias.as_ptr(), relid);
-        Deparser { context, _alias: alias }
+        // The alias string is copied by deparse_context_for.
+        Deparser { context, prefix: false }
+    }
+
+    /// Whole range table: `deparse_context_for_plan_tree` is what EXPLAIN
+    /// uses; it only reads `rtable` from the plan, so a bare PlannedStmt
+    /// carrying the analyzed query's range table is enough.
+    unsafe fn for_rtable(rtable: *mut pg_sys::List, names: &[String]) -> Self {
+        let pstmt = pg_sys::palloc0(std::mem::size_of::<pg_sys::PlannedStmt>()) as *mut pg_sys::PlannedStmt;
+        (*pstmt).type_ = NodeTag::T_PlannedStmt;
+        (*pstmt).commandType = pg_sys::CmdType::CMD_SELECT;
+        (*pstmt).rtable = rtable;
+        let mut list: *mut pg_sys::List = std::ptr::null_mut();
+        for name in names {
+            let c = CString::new(name.as_str()).expect("alias without NUL");
+            // rtable_names is a List of plain C strings (as EXPLAIN builds it).
+            list = pg_sys::lappend(list, pg_sys::pstrdup(c.as_ptr()) as *mut c_void);
+        }
+        let context = pg_sys::deparse_context_for_plan_tree(pstmt, list);
+        Deparser { context, prefix: true }
     }
 
     unsafe fn expr(&self, node: *mut pg_sys::Node) -> String {
-        text(pg_sys::deparse_expression(node, self.context, false, false))
+        text(pg_sys::deparse_expression(node, self.context, self.prefix, false))
     }
 }
 
-unsafe fn is_plain_var(node: *mut pg_sys::Node, attnum: i16) -> bool {
+unsafe fn is_plain_var(node: *mut pg_sys::Node, varno: i32, attnum: i16) -> bool {
     if tag(node as *const c_void) != Some(NodeTag::T_Var) {
         return false;
     }
     let var = &*(node as *mut pg_sys::Var);
-    var.varno == 1 && var.varlevelsup == 0 && var.varattno == attnum
+    var.varno == varno && var.varlevelsup == 0 && var.varattno == attnum
 }
 
 struct Target {
@@ -451,7 +602,8 @@ unsafe fn classify_aggregate(node: *mut pg_sys::Node, alias: &str) -> AggKind {
 
 /// Parse, analyze and classify a definition. Raises `nabla: unsupported view
 /// definition: <reason>` for anything outside the two shapes; PostgreSQL's own
-/// errors (syntax, unknown column, permissions) propagate unchanged.
+/// errors (syntax, unknown column, permissions) propagate unchanged. Returns
+/// the spec and the catalog facts of the first base table.
 pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
     // SAFETY: every pointer comes from the parser in the current memory context
     // and is only read while it is alive; every FFI call is a documented
@@ -459,17 +611,85 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
     unsafe {
         let query = analyze(definition);
         reject_unsupported_clauses(query);
-        let rte = single_relation(query);
-        let relid = (*rte).relid;
-        let (nspname, relname) = qualified_name(relid);
-        let qualified = quote_qualified_identifier(&nspname, &relname);
-        check_relation_kind(rte, &qualified, &nspname);
-        let (base, pk_attnums) = lookup_base(relid.to_u32(), &nspname, &relname);
+        let entries = collect_relations(query);
+        let is_join = entries.len() > 1;
 
-        let deparser = Deparser::new(relid, &relname);
-        let quals = (*(*query).jointree).quals;
-        require_immutable(quals, "the WHERE clause");
-        let predicate = if quals.is_null() { None } else { Some(deparser.expr(quals)) };
+        // Base relations: catalog facts, kind checks, self-join rejection.
+        let mut relations: Vec<BaseRelation> = Vec::new();
+        let mut first_base: Option<BaseTable> = None;
+        let mut first_pk_attnums: Vec<i16> = Vec::new();
+        let mut seen_oids: HashSet<u32> = HashSet::new();
+        for (i, entry) in entries.iter().enumerate() {
+            let relid = (*entry.rte).relid;
+            let (nspname, relname) = qualified_name(relid);
+            let qualified = quote_qualified_identifier(&nspname, &relname);
+            check_relation_kind(entry.rte, &qualified, &nspname);
+            if !seen_oids.insert(relid.to_u32()) {
+                reject(format!("table {qualified} is referenced twice; self-joins are not supported"));
+            }
+            let (base, pk_attnums, columns) = lookup_base(relid.to_u32(), &nspname, &relname);
+            if is_join && pk_attnums.is_empty() {
+                reject(format!("{qualified} has no primary key; every table in a join view needs one"));
+            }
+            let eref = (*entry.rte).eref;
+            let alias = if eref.is_null() { relname.clone() } else { text((*eref).aliasname) };
+            relations.push(BaseRelation {
+                oid: relid.to_u32(),
+                rti: i + 1,
+                alias,
+                qualified,
+                pk_columns: base.pk_columns.clone(),
+                columns,
+            });
+            if i == 0 {
+                first_pk_attnums = pk_attnums;
+                first_base = Some(base);
+            }
+        }
+        let base = first_base.expect("at least one relation");
+        let base_relname = text(pg_sys::get_rel_name(pg_sys::Oid::from(base.oid)));
+        let allowed: Vec<i32> = entries.iter().map(|e| e.rt_index).collect();
+
+        // Quals: WHERE for a single table; every ON plus WHERE for joins.
+        let mut quals: Vec<*mut pg_sys::Node> = Vec::new();
+        collect_quals((*query).jointree as *mut pg_sys::Node, &mut quals);
+
+        // Join alias Vars (USING, SELECT * over a join) become base Vars.
+        if is_join {
+            (*query).targetList =
+                pg_sys::flatten_join_alias_vars(std::ptr::null_mut(), query, (*query).targetList as *mut pg_sys::Node)
+                    as *mut pg_sys::List;
+            for q in quals.iter_mut() {
+                *q = pg_sys::flatten_join_alias_vars(std::ptr::null_mut(), query, *q);
+            }
+        }
+
+        let deparser = if is_join {
+            let names: Vec<String> = list_items((*query).rtable)
+                .into_iter()
+                .map(|item| {
+                    let rte = item as *mut pg_sys::RangeTblEntry;
+                    let eref = (*rte).eref;
+                    if eref.is_null() { String::from("t") } else { text((*eref).aliasname) }
+                })
+                .collect();
+            Deparser::for_rtable((*query).rtable, &names)
+        } else {
+            Deparser::single(pg_sys::Oid::from(base.oid), &base_relname)
+        };
+
+        let mut predicate_parts = Vec::new();
+        let qual_place = if is_join { "the WHERE or ON clause" } else { "the WHERE clause" };
+        for q in &quals {
+            require_immutable(*q, qual_place);
+            require_base_vars(*q, &allowed);
+            predicate_parts.push(deparser.expr(*q));
+        }
+        let predicate = match predicate_parts.len() {
+            0 => None,
+            1 => Some(predicate_parts.remove(0)),
+            _ => Some(predicate_parts.iter().map(|p| format!("({p})")).collect::<Vec<_>>().join(" AND ")),
+        };
 
         let all_targets = targets(query);
         let refs = group_refs(query);
@@ -482,7 +702,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
         if visible.is_empty() {
             reject("the select list is empty");
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for t in &visible {
             if t.alias.starts_with("_nabla_") {
                 reject(format!("column names starting with _nabla_ are reserved (\"{}\")", t.alias));
@@ -490,14 +710,15 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             if !seen.insert(t.alias.as_str()) {
                 reject(format!("output column names must be unique; add AS aliases (duplicate: \"{}\")", t.alias));
             }
+            require_base_vars(t.node, &allowed);
         }
 
         let has_aggs = (*query).hasAggs;
         let has_group = !refs.is_empty();
         let mut spec = ViewSpec {
             shape: if has_aggs { Shape::Aggregate } else { Shape::Projection },
-            base_table: qualified.clone(),
-            base_relname: relname.clone(),
+            base_table: base.qualified.clone(),
+            base_relname: base_relname.clone(),
             predicate,
             columns: Vec::new(),
             pk_columns: Vec::new(),
@@ -507,6 +728,9 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             counts: Vec::new(),
             sums: Vec::new(),
             populate_sql: String::new(),
+            relations: relations.clone(),
+            select_list: String::new(),
+            group_by: None,
         };
         // Output columns of the populate query, in definition order.
         let mut populate_targets: Vec<String> = Vec::new();
@@ -520,7 +744,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             let mut hidden_targets: Vec<String> = Vec::new();
             let mut agg_index = 0usize;
             for t in &visible {
-                let quoted_alias = pgrx::spi::quote_identifier(&t.alias);
+                let quoted_alias = quote_identifier(&t.alias);
                 if t.sortgroupref != 0 && refs.contains(&t.sortgroupref) {
                     require_immutable(t.node, &format!("the GROUP BY key \"{}\"", t.alias));
                     let expr = deparser.expr(t.node);
@@ -565,9 +789,6 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             }
             populate_targets.extend(hidden_targets);
             if spec.count_alias.is_none() {
-                if seen.contains(HIDDEN_COUNT_COLUMN) {
-                    reject(format!("the column name {HIDDEN_COUNT_COLUMN} is reserved for the group count"));
-                }
                 populate_targets.push(format!("count(*) AS {HIDDEN_COUNT_COLUMN}"));
                 spec.count_alias = Some(HIDDEN_COUNT_COLUMN.to_string());
                 spec.hidden_count = true;
@@ -576,42 +797,72 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             if has_group {
                 reject("GROUP BY without an aggregate is not supported");
             }
-            if pk_attnums.is_empty() {
-                reject(format!(
-                    "{qualified} has no primary key; a projection view needs one to locate deleted rows"
-                ));
-            }
             for t in &visible {
                 require_immutable(t.node, &format!("column \"{}\"", t.alias));
                 let expr = deparser.expr(t.node);
-                populate_targets.push(format!("{expr} AS {}", pgrx::spi::quote_identifier(&t.alias)));
+                populate_targets.push(format!("{expr} AS {}", quote_identifier(&t.alias)));
                 spec.columns.push(OutputColumn { expr, alias: t.alias.clone() });
             }
-            let mut missing = Vec::new();
-            for (attnum, name) in pk_attnums.iter().zip(base.pk_columns.iter()) {
-                match visible.iter().find(|t| is_plain_var(t.node, *attnum)) {
-                    Some(t) => spec.pk_view_columns.push(t.alias.clone()),
-                    None => missing.push(name.clone()),
+            if is_join {
+                // Row identity of a join row: every base table's primary key,
+                // carried in hidden columns so the user's select list is free.
+                for rel in &relations {
+                    for col in &rel.pk_columns {
+                        let hidden = format!("{HIDDEN_PK_PREFIX}{}_{}", rel.rti, col);
+                        populate_targets.push(format!(
+                            "{}.{} AS {}",
+                            quote_identifier(&rel.alias),
+                            quote_identifier(col),
+                            quote_identifier(&hidden)
+                        ));
+                        spec.pk_view_columns.push(hidden);
+                    }
                 }
+            } else {
+                if first_pk_attnums.is_empty() {
+                    reject(format!(
+                        "{} has no primary key; a projection view needs one to locate deleted rows",
+                        base.qualified
+                    ));
+                }
+                let mut missing = Vec::new();
+                for (attnum, name) in first_pk_attnums.iter().zip(base.pk_columns.iter()) {
+                    match visible.iter().find(|t| is_plain_var(t.node, entries[0].rt_index, *attnum)) {
+                        Some(t) => spec.pk_view_columns.push(t.alias.clone()),
+                        None => missing.push(name.clone()),
+                    }
+                }
+                if !missing.is_empty() {
+                    reject(format!(
+                        "the select list must include the primary key column(s) of {} as plain columns: missing {}",
+                        base.qualified,
+                        missing.join(", ")
+                    ));
+                }
+                spec.pk_columns = base.pk_columns.clone();
             }
-            if !missing.is_empty() {
-                reject(format!(
-                    "the select list must include the primary key column(s) of {qualified} as plain columns: missing {}",
-                    missing.join(", ")
-                ));
-            }
-            spec.pk_columns = base.pk_columns.clone();
         }
 
-        let mut populate = format!("SELECT {} FROM {qualified}", populate_targets.join(", "));
+        let from_list = if is_join {
+            relations
+                .iter()
+                .map(|r| format!("{} AS {}", r.qualified, quote_identifier(&r.alias)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            base.qualified.clone()
+        };
+        spec.select_list = populate_targets.join(", ");
+        let mut populate = format!("SELECT {} FROM {from_list}", spec.select_list);
         if let Some(p) = &spec.predicate {
             populate.push_str(&format!(" WHERE {p}"));
         }
         if !group_exprs.is_empty() {
-            populate.push_str(&format!(" GROUP BY {}", group_exprs.join(", ")));
+            let group_by = group_exprs.join(", ");
+            populate.push_str(&format!(" GROUP BY {group_by}"));
+            spec.group_by = Some(group_by);
         }
         spec.populate_sql = populate;
         (spec, base)
     }
 }
-

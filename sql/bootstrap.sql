@@ -2,6 +2,8 @@
 -- Runs first in the extension script (extension_sql_file! ... bootstrap).
 
 CREATE SCHEMA IF NOT EXISTS nabla;
+-- Shadow copies of base tables used by join views (see README "Joins and shadow tables").
+CREATE SCHEMA IF NOT EXISTS nabla_shadow;
 
 CREATE TABLE nabla.views (
   id            serial PRIMARY KEY,
@@ -34,7 +36,28 @@ CREATE TABLE nabla.deltas (
   PRIMARY KEY (view_id, seq)
 );
 
+-- Shadow tables: one per base table used by any join view. The shadow itself
+-- (nabla_shadow.t<oid>) is not dumped; nabla.refresh rebuilds it after a restore.
+CREATE TABLE nabla.shadows (
+  relid         oid PRIMARY KEY,
+  table_name    text NOT NULL,                  -- nabla_shadow.t<oid>
+  frontier_lsn  pg_lsn NOT NULL,
+  refcount      int NOT NULL,                   -- join views using it
+  stale_reason  text,                           -- set when maintenance failed; rebuilt by refresh
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Which base tables each view reads (rti = position in the definition's range table).
+CREATE TABLE nabla.view_relations (
+  view_id  int NOT NULL REFERENCES nabla.views(id) ON DELETE CASCADE,
+  relid    oid NOT NULL,
+  rti      int NOT NULL,
+  PRIMARY KEY (view_id, relid)
+);
+
 SELECT pg_catalog.pg_extension_config_dump('nabla.views', '');
+SELECT pg_catalog.pg_extension_config_dump('nabla.shadows', '');
+SELECT pg_catalog.pg_extension_config_dump('nabla.view_relations', '');
 SELECT pg_catalog.pg_extension_config_dump('nabla.views_id_seq', '');
 SELECT pg_catalog.pg_extension_config_dump('nabla.deltas', '');
 

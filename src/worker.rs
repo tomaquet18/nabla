@@ -1,31 +1,40 @@
 //! The background worker: consumes the `nabla` replication slot through the
 //! SQL peek/advance functions and applies each source transaction to the
-//! views in commit order.
+//! views (and the shadow tables join views depend on) in commit order.
 //!
 //! Ordering per source transaction: apply deltas + advance frontiers and
 //! COMMIT, then advance the slot in a separate transaction. A crash between
-//! the two replays the transaction, and the per-view frontier check makes the
-//! replay a no-op (at-least-once delivery, effectively exactly-once).
+//! the two replays the transaction, and the per-object frontier check makes
+//! the replay a no-op (at-least-once delivery, effectively exactly-once).
 //!
-//! Failure isolation: every view is applied inside its own subtransaction. A
-//! failing view is rolled back alone, its failure is recorded in the catalog,
-//! and the slot is held back until the view either absorbs the transaction
-//! on a later poll or exceeds `nabla.max_apply_failures` and goes stale.
+//! Skip rule: an object (view or shadow) with `frontier >= T.end_lsn` has
+//! already absorbed T and is skipped. This is also what lets a new view share
+//! an existing shadow without re-snapshotting it: the view is populated from
+//! the live tables at F_new and skips everything at or below F_new, while an
+//! older shadow at F_s < F_new keeps absorbing (F_s, F_new] on its own; from
+//! F_new on both absorb the same transactions.
+//!
+//! Failure isolation: every view's planning step and its final write step
+//! run in subtransactions. A failing view is rolled back alone, its failure
+//! is recorded in the catalog, and the slot is held back until the view
+//! either absorbs the transaction on a later poll or exceeds
+//! `nabla.max_apply_failures` and goes stale.
 
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, BgWorkerStartTime, SignalWakeFlags};
 use pgrx::datum::{DatumWithOid, JsonB};
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::pg_sys::pg_try::PgTryBuilder;
 use pgrx::prelude::*;
+use pgrx::spi::quote_identifier;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
-use crate::apply::{self, Outcome, ViewTarget};
+use crate::apply::{self, Op, Planned, ViewTarget};
 use crate::definition::ViewSpec;
 use crate::guc;
 use crate::lsn;
-use crate::pgoutput::{Change, Decoder, Relation, SourceTransaction};
+use crate::pgoutput::{Change, ColumnValue, Decoder, Relation, SourceTransaction, Tuple};
 
 const SLOT: &str = "nabla";
 const PUBLICATION: &str = "nabla";
@@ -135,6 +144,8 @@ fn select_two<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
     .map_err(spi_err)
 }
 
+// --- per-transaction state -----------------------------------------------------
+
 struct LiveView {
     id: i32,
     name: String,
@@ -146,14 +157,36 @@ struct LiveView {
     apply_failures: i32,
     definition: String,
     touched: bool,
+    /// Planned operations for the current source transaction.
+    ops: Vec<Op>,
+    /// Set when a planning step failed: the view must retry the transaction.
+    failed: Option<String>,
     stale: Option<String>,
 }
 
 impl LiveView {
-    fn mentions(&self, column: &str) -> bool {
-        // Conservative text check; false positives only make a view stale earlier.
-        self.definition.to_lowercase().contains(&column.to_lowercase())
+    /// Position of `relid` in the view's relation list, if the view uses it.
+    fn relation_index(&self, relid: u32) -> Option<usize> {
+        if self.spec.is_join() {
+            self.spec.relations.iter().position(|r| r.oid == relid)
+        } else if self.base_oid == relid {
+            Some(0)
+        } else {
+            None
+        }
     }
+
+    fn active_for(&self, relid: u32, end_lsn: u64) -> bool {
+        self.failed.is_none() && self.stale.is_none() && end_lsn > self.frontier && self.relation_index(relid).is_some()
+    }
+}
+
+struct Shadow {
+    relid: u32,
+    table: String,
+    frontier: u64,
+    /// Maintenance failed (schema drift): dependents are stale, refresh rebuilds it.
+    failed: bool,
 }
 
 fn load_live_views() -> Result<Vec<LiveView>, String> {
@@ -185,10 +218,36 @@ fn load_live_views() -> Result<Vec<LiveView>, String> {
                 definition: r.get::<String>(7)?.expect("definition"),
                 apply_failures: r.get::<i32>(8)?.unwrap_or(0),
                 touched: false,
+                ops: Vec::new(),
+                failed: None,
                 stale: None,
             });
         }
         Ok(views)
+    })
+    .map_err(spi_err)
+}
+
+fn load_shadows() -> Result<HashMap<u32, Shadow>, String> {
+    Spi::connect(|client| {
+        let mut shadows = HashMap::new();
+        for r in client.select(
+            "SELECT relid::int8, table_name, frontier_lsn::text, stale_reason IS NOT NULL FROM nabla.shadows",
+            None,
+            &[],
+        )? {
+            let relid = r.get::<i64>(1)?.expect("relid") as u32;
+            shadows.insert(
+                relid,
+                Shadow {
+                    relid,
+                    table: r.get::<String>(2)?.expect("table"),
+                    frontier: lsn::parse(&r.get::<String>(3)?.expect("frontier")).unwrap_or(0),
+                    failed: r.get::<bool>(4)?.unwrap_or(false),
+                },
+            );
+        }
+        Ok(shadows)
     })
     .map_err(spi_err)
 }
@@ -205,6 +264,105 @@ fn resolve_types(rel: &mut Relation) -> Result<(), String> {
     }
     Ok(())
 }
+
+fn change_relids(change: &Change) -> Vec<u32> {
+    match change {
+        Change::Insert { relid, .. } | Change::Update { relid, .. } | Change::Delete { relid, .. } => vec![*relid],
+        Change::Truncate { relids } => relids.clone(),
+    }
+}
+
+// --- shadows -------------------------------------------------------------------
+
+/// Primary key values of a change, taken from the old key tuple when pgoutput
+/// sent one, otherwise from the new tuple (the key did not change).
+fn key_values(pk_columns: &[String], rel: &Relation, old: Option<&Tuple>, new: Option<&Tuple>) -> Result<Vec<(usize, String)>, String> {
+    let mut out = Vec::new();
+    for pk in pk_columns {
+        let idx = rel.columns.iter().position(|c| &c.name == pk).ok_or_else(|| format!("primary key column {pk} is missing from the decoded row"))?;
+        let value = old
+            .and_then(|t| t.get(idx))
+            .and_then(|v| if let ColumnValue::Text(s) = v { Some(s.clone()) } else { None })
+            .or_else(|| new.and_then(|t| t.get(idx)).and_then(|v| if let ColumnValue::Text(s) = v { Some(s.clone()) } else { None }))
+            .ok_or_else(|| format!("primary key column {pk} has no value in the decoded row"))?;
+        out.push((idx, value));
+    }
+    Ok(out)
+}
+
+fn key_predicate(rel: &Relation, keys: &[(usize, String)], first_param: usize) -> Result<(String, Vec<Option<String>>), String> {
+    let mut conds = Vec::new();
+    let mut values = Vec::new();
+    for (n, (idx, value)) in keys.iter().enumerate() {
+        let col = &rel.columns[*idx];
+        let ty = col.type_name.as_deref().ok_or("type not resolved")?;
+        conds.push(format!("{} = ${}::{}", quote_identifier(&col.name), first_param + n, ty));
+        values.push(Some(value.clone()));
+    }
+    Ok((conds.join(" AND "), values))
+}
+
+/// The full old row of a change, read from the shadow by primary key, in the
+/// decoded relation's column order.
+fn shadow_old_row(shadow: &Shadow, pk_columns: &[String], rel: &Relation, old: Option<&Tuple>, new: Option<&Tuple>) -> Result<Tuple, String> {
+    let keys = key_values(pk_columns, rel, old, new)?;
+    let (conds, values) = key_predicate(rel, &keys, 1)?;
+    let cols: Vec<String> = rel.columns.iter().map(|c| format!("{}::text", quote_identifier(&c.name))).collect();
+    let sql = format!("SELECT {} FROM {} WHERE {conds}", cols.join(", "), shadow.table);
+    let args: Vec<DatumWithOid> = values.into_iter().map(|v| v.into()).collect();
+    let row = Spi::connect(|client| {
+        let table = client.select(&sql, Some(1), &args)?;
+        if table.is_empty() {
+            return Ok(None);
+        }
+        let table = table.first();
+        let mut tuple = Vec::with_capacity(rel.columns.len());
+        for i in 1..=rel.columns.len() {
+            tuple.push(match table.get::<String>(i)? {
+                Some(s) => ColumnValue::Text(s),
+                None => ColumnValue::Null,
+            });
+        }
+        Ok(Some(tuple))
+    })
+    .map_err(spi_err)?;
+    row.ok_or_else(|| format!("row not found in shadow {} (shadow out of sync with the base table)", shadow.table))
+}
+
+/// Apply a change to the shadow: insert, delete by key, or delete + insert.
+fn shadow_apply(shadow: &Shadow, pk_columns: &[String], rel: &Relation, change: &Change, old_full: Option<&Tuple>, new_full: Option<&Tuple>) -> Result<(), String> {
+    let delete = |old: Option<&Tuple>, new: Option<&Tuple>| -> Result<(), String> {
+        let keys = key_values(pk_columns, rel, old, new)?;
+        let (conds, values) = key_predicate(rel, &keys, 1)?;
+        let args: Vec<DatumWithOid> = values.into_iter().map(|v| v.into()).collect();
+        Spi::run_with_args(&format!("DELETE FROM {} WHERE {conds}", shadow.table), &args).map_err(spi_err)
+    };
+    let insert = |row: &Tuple| -> Result<(), String> {
+        let mut cols = Vec::new();
+        let mut casts = Vec::new();
+        for (i, c) in rel.columns.iter().enumerate() {
+            let ty = c.type_name.as_deref().ok_or("type not resolved")?;
+            cols.push(quote_identifier(&c.name));
+            casts.push(format!("${}::{}", i + 1, ty));
+        }
+        Spi::run_with_args(
+            &format!("INSERT INTO {} ({}) VALUES ({})", shadow.table, cols.join(", "), casts.join(", ")),
+            &apply::row_args(row),
+        )
+        .map_err(spi_err)
+    };
+    match change {
+        Change::Insert { .. } => insert(new_full.ok_or("missing new row")?),
+        Change::Delete { old, .. } => delete(Some(old), None),
+        Change::Update { old, new, .. } => {
+            delete(old_full.or(old.as_ref().map(|(_, t)| t)), Some(new))?;
+            insert(new_full.ok_or("missing new row")?)
+        }
+        Change::Truncate { .. } => Ok(()),
+    }
+}
+
+// --- catalog bookkeeping -------------------------------------------------------
 
 fn record_deltas(view: &mut LiveView, tx: &SourceTransaction, deltas: Vec<apply::Delta>) -> Result<(), String> {
     for d in deltas {
@@ -226,64 +384,6 @@ fn record_deltas(view: &mut LiveView, tx: &SourceTransaction, deltas: Vec<apply:
         view.touched = true;
     }
     Ok(())
-}
-
-/// Apply one change of a source transaction to one view.
-fn apply_change(view: &mut LiveView, rel: &Relation, change: &Change, tx: &SourceTransaction) -> Result<(), String> {
-    let target = ViewTarget { name: &view.name, spec: &view.spec };
-    let mut outcomes: Vec<Outcome> = Vec::new();
-    match change {
-        Change::Insert { new, .. } => {
-            let new = match apply::resolve_unchanged(rel, new, None, |c| view.mentions(c)) {
-                Ok(t) => t,
-                Err(s) => {
-                    view.stale = Some(s.0);
-                    return Ok(());
-                }
-            };
-            outcomes.push(apply::apply_insert(&target, rel, &new)?);
-        }
-        Change::Delete { key_kind, old, .. } => {
-            outcomes.push(apply::apply_delete(&target, rel, *key_kind, old)?);
-        }
-        Change::Update { old, new, .. } => {
-            // Without an old tuple the key is unchanged: take it from the new row.
-            let (key_kind, old_tuple) = match old {
-                Some((k, t)) => (*k, t.clone()),
-                None => (b'K', new.clone()),
-            };
-            outcomes.push(apply::apply_delete(&target, rel, key_kind, &old_tuple)?);
-            let new = match apply::resolve_unchanged(rel, new, old.as_ref(), |c| view.mentions(c)) {
-                Ok(t) => t,
-                Err(s) => {
-                    view.stale = Some(s.0);
-                    return Ok(());
-                }
-            };
-            outcomes.push(apply::apply_insert(&target, rel, &new)?);
-        }
-        Change::Truncate { .. } => {
-            view.stale = Some("base table was truncated; TRUNCATE is not maintained incrementally".to_string());
-            return Ok(());
-        }
-    }
-    for outcome in outcomes {
-        match outcome {
-            Outcome::Applied(deltas) => record_deltas(view, tx, deltas)?,
-            Outcome::Stale(s) => {
-                view.stale = Some(s.0);
-                return Ok(());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn change_relids(change: &Change) -> Vec<u32> {
-    match change {
-        Change::Insert { relid, .. } | Change::Update { relid, .. } | Change::Delete { relid, .. } => vec![*relid],
-        Change::Truncate { relids } => relids.clone(),
-    }
 }
 
 fn mark_stale(view: &LiveView, reason: &str) -> Result<(), String> {
@@ -348,17 +448,118 @@ fn record_success(view: &LiveView, tx: &SourceTransaction) -> Result<(), String>
     Ok(())
 }
 
+fn record_shadow_failure(shadow: &mut Shadow, message: &str) -> Result<(), String> {
+    shadow.failed = true;
+    let reason = format!("shadow {} could not be maintained: {message}", shadow.table);
+    pgrx::warning!("nabla worker: {reason}");
+    let args: [DatumWithOid; 2] = [(shadow.relid as i64).into(), reason.as_str().into()];
+    Spi::run_with_args("UPDATE nabla.shadows SET stale_reason = $2 WHERE relid = $1::oid", &args).map_err(spi_err)
+}
+
+// --- planning one change for one view ----------------------------------------------
+
+/// Plan the effect of one change on one view. `old_full` is the complete old
+/// row when it came from a shadow.
+fn plan_change(view: &mut LiveView, rel: &Relation, change: &Change, old_full: Option<&Tuple>) -> Result<Planned, String> {
+    let target = ViewTarget { name: &view.name, spec: &view.spec };
+    let mentions = |c: &str| view.definition.to_lowercase().contains(&c.to_lowercase());
+    let mut ops = Vec::new();
+    if view.spec.is_join() {
+        let index = view.relation_index(rel.id).ok_or("view does not use this relation")?;
+        match change {
+            Change::Insert { new, .. } => {
+                let new = match apply::resolve_unchanged(rel, new, None, mentions) {
+                    Ok(t) => t,
+                    Err(s) => return Ok(Planned::Stale(s)),
+                };
+                ops.extend(apply::plan_join(&target, index, rel, &new, 1)?);
+            }
+            Change::Delete { .. } => {
+                let Some(old) = old_full else {
+                    return Ok(Planned::Stale(apply::Stale(format!(
+                        "old row of {} unavailable (its shadow is ahead of the view)",
+                        rel.name
+                    ))));
+                };
+                ops.extend(apply::plan_join(&target, index, rel, old, -1)?);
+            }
+            Change::Update { new, .. } => {
+                let Some(old) = old_full else {
+                    return Ok(Planned::Stale(apply::Stale(format!(
+                        "old row of {} unavailable (its shadow is ahead of the view)",
+                        rel.name
+                    ))));
+                };
+                ops.extend(apply::plan_join(&target, index, rel, old, -1)?);
+                let new = match apply::resolve_unchanged(rel, new, Some(old), mentions) {
+                    Ok(t) => t,
+                    Err(s) => return Ok(Planned::Stale(s)),
+                };
+                ops.extend(apply::plan_join(&target, index, rel, &new, 1)?);
+            }
+            Change::Truncate { .. } => {
+                return Ok(Planned::Stale(apply::Stale(
+                    "base table was truncated; TRUNCATE is not maintained incrementally".to_string(),
+                )))
+            }
+        }
+    } else {
+        match change {
+            Change::Insert { new, .. } => {
+                let new = match apply::resolve_unchanged(rel, new, None, mentions) {
+                    Ok(t) => t,
+                    Err(s) => return Ok(Planned::Stale(s)),
+                };
+                ops.extend(apply::plan_single_insert(&target, rel, &new)?);
+            }
+            Change::Delete { key_kind, old, .. } => match apply::plan_single_delete(&target, rel, *key_kind, old)? {
+                Planned::Ops(o) => ops.extend(o),
+                Planned::Stale(s) => return Ok(Planned::Stale(s)),
+            },
+            Change::Update { old, new, .. } => {
+                // Without an old tuple the key is unchanged: take it from the new row.
+                let (key_kind, old_tuple) = match old {
+                    Some((k, t)) => (*k, t.clone()),
+                    None => (b'K', new.clone()),
+                };
+                match apply::plan_single_delete(&target, rel, key_kind, &old_tuple)? {
+                    Planned::Ops(o) => ops.extend(o),
+                    Planned::Stale(s) => return Ok(Planned::Stale(s)),
+                }
+                let new = match apply::resolve_unchanged(rel, new, old.as_ref().map(|(_, t)| t), mentions) {
+                    Ok(t) => t,
+                    Err(s) => return Ok(Planned::Stale(s)),
+                };
+                ops.extend(apply::plan_single_insert(&target, rel, &new)?);
+            }
+            Change::Truncate { .. } => {
+                return Ok(Planned::Stale(apply::Stale(
+                    "base table was truncated; TRUNCATE is not maintained incrementally".to_string(),
+                )))
+            }
+        }
+    }
+    Ok(Planned::Ops(ops))
+}
+
 struct ApplyStats {
     deltas: usize,
     /// A live view failed and must retry: the slot must not advance past `tx`.
     blocked: bool,
 }
 
-/// Apply one complete source transaction in one worker transaction, each view
-/// in its own subtransaction.
+/// Apply one complete source transaction in one worker transaction.
+///
+/// Phase 1 walks the changes in stream order: for each change, every
+/// affected view plans its delta rows (join views against the shadows as
+/// they stand before this change), then the changed table's shadow absorbs
+/// the change. Views before shadow would only matter for self-joins, which
+/// are rejected. Phase 2 writes each view's planned rows in its own
+/// subtransaction and advances the frontiers.
 fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<ApplyStats, String> {
     Spi::run("SET LOCAL nabla.internal_write = on").map_err(spi_err)?;
     let mut views = load_live_views()?;
+    let mut shadows = load_shadows()?;
 
     let mut relations: HashMap<u32, Relation> = HashMap::new();
     for change in &tx.changes {
@@ -373,46 +574,126 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
             relations.insert(relid, rel.clone());
         }
     }
+    // Primary keys of shadowed tables, from any join view's spec.
+    let mut pk_of: HashMap<u32, Vec<String>> = HashMap::new();
+    for v in &views {
+        for r in &v.spec.relations {
+            pk_of.entry(r.oid).or_insert_with(|| r.pk_columns.clone());
+        }
+    }
 
+    // Phase 1: plan per change, maintain shadows in stream order.
+    for change in &tx.changes {
+        for relid in change_relids(change) {
+            let rel = &relations[&relid];
+            let shadow_active = shadows.get(&relid).map_or(false, |s| !s.failed && tx.end_lsn > s.frontier);
+
+            // Old row from the shadow (before this change), full row for
+            // join deltas and for the shadow's own delete-by-key.
+            let mut old_full: Option<Tuple> = None;
+            let mut shadow_error: Option<String> = None;
+            if shadow_active && matches!(change, Change::Update { .. } | Change::Delete { .. }) {
+                let (old, new): (Option<&Tuple>, Option<&Tuple>) = match change {
+                    Change::Update { old, new, .. } => (old.as_ref().map(|(_, t)| t), Some(new)),
+                    Change::Delete { old, .. } => (Some(old), None),
+                    _ => (None, None),
+                };
+                let shadow = &shadows[&relid];
+                let pk = pk_of.get(&relid).cloned().unwrap_or_default();
+                match in_subtransaction(AssertUnwindSafe(|| shadow_old_row(shadow, &pk, rel, old, new))) {
+                    Ok(row) => old_full = Some(row),
+                    Err(e) => shadow_error = Some(e),
+                }
+            }
+
+            for view in views.iter_mut() {
+                if !view.active_for(relid, tx.end_lsn) {
+                    continue;
+                }
+                if let Some(e) = &shadow_error {
+                    if view.spec.is_join() {
+                        view.stale = Some(format!("shadow of {} could not provide the old row: {e}", rel.name));
+                        continue;
+                    }
+                }
+                let old_ref = old_full.as_ref();
+                match in_subtransaction(AssertUnwindSafe(|| plan_change(view, rel, change, old_ref))) {
+                    Ok(Planned::Ops(ops)) => view.ops.extend(ops),
+                    Ok(Planned::Stale(s)) => view.stale = Some(s.0),
+                    Err(message) => view.failed = Some(message),
+                }
+            }
+
+            if shadow_active {
+                let new_full: Option<Tuple> = match change {
+                    Change::Insert { new, .. } => Some(new.clone()),
+                    Change::Update { new, .. } => {
+                        apply::resolve_unchanged(rel, new, old_full.as_ref(), |_| true).ok()
+                    }
+                    _ => None,
+                };
+                let outcome = if let Some(e) = shadow_error.take() {
+                    Err(e)
+                } else if matches!(change, Change::Update { .. }) && new_full.is_none() {
+                    Err("unchanged TOAST value could not be recovered from the shadow".to_string())
+                } else {
+                    let shadow = &shadows[&relid];
+                    let pk = pk_of.get(&relid).cloned().unwrap_or_default();
+                    let (old_ref, new_ref) = (old_full.as_ref(), new_full.as_ref());
+                    in_subtransaction(AssertUnwindSafe(|| shadow_apply(shadow, &pk, rel, change, old_ref, new_ref)))
+                };
+                if let Err(message) = outcome {
+                    let shadow = shadows.get_mut(&relid).expect("shadow present");
+                    record_shadow_failure(shadow, &message)?;
+                    for view in views.iter_mut() {
+                        if view.spec.is_join() && view.relation_index(relid).is_some() && view.stale.is_none() {
+                            view.stale = Some(format!("shadow of {} could not be maintained: {message}", rel.name));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 2: write each view in its own subtransaction, then bookkeeping.
     let mut stats = ApplyStats { deltas: 0, blocked: false };
     for view in views.iter_mut() {
         if tx.end_lsn <= view.frontier {
             continue; // already absorbed (replay after a crash or a retry round)
         }
-        let touched = tx.changes.iter().any(|c| change_relids(c).contains(&view.base_oid));
-        let (seq_before, touched_before) = (view.last_seq, view.touched);
-        let outcome = if touched {
-            in_subtransaction(AssertUnwindSafe(|| {
-                for change in &tx.changes {
-                    for relid in change_relids(change) {
-                        if relid == view.base_oid {
-                            apply_change(view, &relations[&relid], change, tx)?;
-                        }
-                    }
-                }
-                Ok(())
-            }))
-        } else {
-            Ok(())
-        };
-        match outcome {
-            Ok(()) => {
-                if let Some(reason) = view.stale.take() {
-                    mark_stale(view, &reason)?;
-                    continue;
-                }
-                record_success(view, tx)?;
+        if let Some(reason) = view.stale.take() {
+            mark_stale(view, &reason)?;
+            continue;
+        }
+        if let Some(message) = view.failed.take() {
+            if record_failure(view, tx, &message)? {
+                stats.blocked = true;
             }
+            continue;
+        }
+        let ops = std::mem::take(&mut view.ops);
+        let (seq_before, touched_before) = (view.last_seq, view.touched);
+        let outcome = in_subtransaction(AssertUnwindSafe(|| {
+            let target = ViewTarget { name: &view.name, spec: &view.spec };
+            let deltas = apply::execute(&target, &ops)?;
+            record_deltas(view, tx, deltas)
+        }));
+        match outcome {
+            Ok(()) => record_success(view, tx)?,
             Err(message) => {
-                // The subtransaction rolled back the view's rows and deltas;
-                // undo the in-memory bookkeeping as well.
                 view.last_seq = seq_before;
                 view.touched = touched_before;
-                view.stale = None;
                 if record_failure(view, tx, &message)? {
                     stats.blocked = true;
                 }
             }
+        }
+    }
+    for shadow in shadows.values() {
+        if !shadow.failed && tx.end_lsn > shadow.frontier {
+            let args: [DatumWithOid; 2] = [lsn::format(tx.end_lsn).into(), (shadow.relid as i64).into()];
+            Spi::run_with_args("UPDATE nabla.shadows SET frontier_lsn = $1::pg_lsn WHERE relid = $2::oid", &args)
+                .map_err(spi_err)?;
         }
     }
     stats.deltas = views.iter().map(|v| (v.last_seq - v.start_seq).max(0)).sum::<i64>() as usize;
@@ -543,12 +824,18 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
     }
 
     if drained {
-        // Everything up to `target` was decoded: views reflect the base at `target`.
+        // Everything up to `target` was decoded: views and shadows reflect
+        // the base tables at `target`.
         let frontier = target.max(last_end);
         try_transaction(|| {
             let args: [DatumWithOid; 1] = [lsn::format(frontier).into()];
             Spi::run_with_args(
                 "UPDATE nabla.views SET frontier_lsn = $1::pg_lsn WHERE status = 'live' AND frontier_lsn < $1::pg_lsn",
+                &args,
+            )
+            .map_err(spi_err)?;
+            Spi::run_with_args(
+                "UPDATE nabla.shadows SET frontier_lsn = $1::pg_lsn WHERE stale_reason IS NULL AND frontier_lsn < $1::pg_lsn",
                 &args,
             )
             .map_err(spi_err)?;

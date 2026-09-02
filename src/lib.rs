@@ -13,6 +13,7 @@ mod errors;
 mod guc;
 mod lsn;
 mod pgoutput;
+mod shadow;
 mod worker;
 
 ::pgrx::pg_module_magic!();

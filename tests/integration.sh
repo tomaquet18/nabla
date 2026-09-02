@@ -190,8 +190,8 @@ assert_eq "retention keeps at most 50 deltas" "t" "$(q "SELECT count(*) <= 50 FR
 # --- 6. rejections -----------------------------------------------------------
 echo "== 6. rejections"
 q "CREATE TABLE customers (id int PRIMARY KEY, name text)" >/dev/null
-ERR=$(q_err "SELECT nabla.create_view('public.bad1', 'SELECT o.id FROM orders o JOIN customers c ON c.id = o.k')")
-assert_contains "JOIN is rejected" "nabla: unsupported view definition" "$ERR"
+ERR=$(q_err "SELECT nabla.create_view('public.bad1', 'SELECT o.id FROM orders o LEFT JOIN customers c ON c.id = o.k')")
+assert_contains "LEFT JOIN is rejected" "nabla: unsupported view definition" "$ERR"
 ERR=$(q_err "SELECT nabla.create_view('public.bad2', 'SELECT k, avg(amount) FROM orders GROUP BY k')")
 assert_contains "avg() is rejected" "nabla: unsupported view definition" "$ERR"
 ERR=$(q_err "SELECT nabla.create_view('public.bad3', 'SELECT id, k FROM orders ORDER BY id')")
@@ -324,8 +324,8 @@ reject "LIMIT" "SELECT id FROM orders LIMIT 1" "LIMIT and OFFSET are not support
 reject "HAVING" "SELECT k, count(*) FROM orders GROUP BY k HAVING count(*) > 1" "HAVING is not supported"
 reject "GROUPING SETS" "SELECT k, count(*) FROM orders GROUP BY GROUPING SETS ((k), ())" "GROUPING SETS, CUBE and ROLLUP are not supported"
 reject "FOR UPDATE" "SELECT id FROM orders FOR UPDATE" "FOR UPDATE and FOR SHARE are not supported"
-reject "join" "SELECT o.id FROM orders o JOIN orders2 x ON x.id = o.k" "joins are not supported"
-reject "comma join" "SELECT o.id FROM orders o, orders2 x" "joins are not supported"
+reject "outer join" "SELECT o.id FROM orders o LEFT JOIN orders2 x ON x.id = o.k" "LEFT JOIN is not supported; only inner joins are"
+reject "comma join to a table without a primary key" "SELECT o.id FROM orders o, nopk n" "public.nopk has no primary key; every table in a join view needs one"
 reject "LATERAL" "SELECT o.id FROM orders o, LATERAL (SELECT o.k) l" "LATERAL is not supported"
 reject "set-returning function" "SELECT g FROM generate_series(1, 3) g" "set-returning functions are not supported"
 reject "SRF in select list" "SELECT id, generate_series(1, 2) AS g FROM orders" "set-returning functions are not supported"
@@ -454,6 +454,121 @@ reject "sum(w) FILTER still rejected" "SELECT k, sum(w) FILTER (WHERE w > 1) AS 
 reject "count(expr) with a mutable expression rejected" "SELECT k, count(w + random()::int) AS c FROM s GROUP BY k" "the argument of count() in column \"c\" uses \"random\", which is not IMMUTABLE"
 reject "count(w) without GROUP BY rejected" "SELECT count(w) AS c FROM s" "aggregates require a GROUP BY clause"
 reject "reserved _nabla_ names rejected" "SELECT k AS _nabla_key, count(*) FROM s GROUP BY k" "column names starting with _nabla_ are reserved"
+
+# --- 15. projection join view --------------------------------------------------
+echo "== 15. projection join view"
+q "CREATE SCHEMA shop" >/dev/null
+q "CREATE TABLE shop.customers (id int PRIMARY KEY, name text, region text)" >/dev/null
+q "CREATE TABLE shop.products (id int PRIMARY KEY, name text, price numeric)" >/dev/null
+q "CREATE TABLE shop.orders (id bigserial PRIMARY KEY, customer_id int, product_id int, qty int, status text)" >/dev/null
+q "INSERT INTO shop.customers VALUES (1, 'Alice', 'north'), (2, 'Bob', 'south'), (3, 'Carol', 'north')" >/dev/null
+q "INSERT INTO shop.products VALUES (1, 'pen', 1.5), (2, 'book', 12), (3, 'lamp', 30)" >/dev/null
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 2, 'paid'), (2, 2, 1, 'paid'), (3, 3, 1, 'new')" >/dev/null
+LINES_DEF="SELECT o.id AS order_id, c.name AS customer, p.name AS product, o.qty * p.price AS total FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id JOIN shop.products p ON p.id = o.product_id WHERE o.status = 'paid'"
+q "SELECT nabla.create_view('public.order_lines', \$d\$$LINES_DEF\$d\$)" >/dev/null || die "create_view(order_lines) failed"
+lines_diff() { q "SELECT count(*) FROM ((SELECT order_id, customer, product, total FROM order_lines EXCEPT $LINES_DEF)
+  UNION ALL ($LINES_DEF EXCEPT SELECT order_id, customer, product, total FROM order_lines)) d"; }
+shadow_of() { q "SELECT table_name FROM nabla.shadows WHERE relid = '$1'::regclass"; }
+shadow_diff() { q "SELECT count(*) FROM ((SELECT * FROM $(shadow_of "$1") EXCEPT SELECT * FROM $1) UNION ALL (SELECT * FROM $1 EXCEPT SELECT * FROM $(shadow_of "$1"))) d"; }
+assert_eq "join view columns: visible then hidden keys" "order_id,customer,product,total,_nabla_pk1_id,_nabla_pk2_id,_nabla_pk3_id" \
+  "$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'order_lines'")"
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 2, 3, 'paid'), (3, 1, 4, 'paid'), (2, 3, 1, 'new')" >/dev/null
+wait_view public.order_lines
+assert_eq "join view after inserting orders" "0|4" "$(lines_diff)|$(q "SELECT count(*) FROM order_lines")"
+q "UPDATE shop.customers SET name = 'Robert' WHERE id = 2" >/dev/null
+wait_view public.order_lines
+assert_eq "customer rename propagates to every order" "0|1" "$(lines_diff)|$(q "SELECT count(*) FROM order_lines WHERE customer = 'Robert'")"
+q "UPDATE shop.products SET price = 15 WHERE id = 2" >/dev/null
+wait_view public.order_lines
+assert_eq "price change updates totals" "0|45" "$(lines_diff)|$(q "SELECT total FROM order_lines WHERE order_id = 4")"
+q "UPDATE shop.orders SET customer_id = 2 WHERE id = 4" >/dev/null
+wait_view public.order_lines
+assert_eq "order moves to another customer" "0|Robert" "$(lines_diff)|$(q "SELECT customer FROM order_lines WHERE order_id = 4")"
+q "DELETE FROM shop.customers WHERE id = 3" >/dev/null
+wait_view public.order_lines
+assert_eq "deleting a customer removes its orders from the view" "0|0" "$(lines_diff)|$(q "SELECT count(*) FROM order_lines WHERE customer = 'Carol'")"
+q "BEGIN; INSERT INTO shop.customers VALUES (4, 'Dave', 'east'); INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (4, 1, 10, 'paid'), (4, 3, 1, 'paid'); COMMIT" >/dev/null
+wait_view public.order_lines
+assert_eq "one transaction inserting a customer and its orders" "0|2" "$(lines_diff)|$(q "SELECT count(*) FROM order_lines WHERE customer = 'Dave'")"
+assert_eq "one shadow per base table, refcount 1" "3|3" \
+  "$(q "SELECT count(*) FROM nabla.shadows WHERE relid IN ('shop.customers'::regclass, 'shop.products'::regclass, 'shop.orders'::regclass)")|$(q "SELECT count(*) FROM nabla.shadows WHERE refcount = 1")"
+assert_eq "shadows equal their base tables" "0|0|0" "$(shadow_diff shop.customers)|$(shadow_diff shop.products)|$(shadow_diff shop.orders)"
+
+# --- 16. aggregate join view ---------------------------------------------------
+echo "== 16. aggregate join view"
+REV_DEF="SELECT c.region, count(*) AS n, sum(o.qty * p.price) AS revenue FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id JOIN shop.products p ON p.id = o.product_id WHERE o.status = 'paid' GROUP BY c.region"
+q "SELECT nabla.create_view('public.revenue_by_region', \$d\$$REV_DEF\$d\$)" >/dev/null || die "create_view(revenue_by_region) failed"
+rev_diff() { q "SELECT count(*) FROM ((SELECT region, n, revenue FROM revenue_by_region EXCEPT $REV_DEF)
+  UNION ALL ($REV_DEF EXCEPT SELECT region, n, revenue FROM revenue_by_region)) d"; }
+assert_eq "aggregate join view equals its query at creation" "0" "$(rev_diff)"
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (2, 1, 6, 'paid'), (1, 3, 2, 'paid')" >/dev/null
+wait_view public.revenue_by_region
+assert_eq "aggregate join after inserting orders" "0" "$(rev_diff)"
+q "UPDATE shop.customers SET region = 'west' WHERE id = 2" >/dev/null
+wait_view public.revenue_by_region
+assert_eq "region change moves revenue between groups" "0|0" "$(rev_diff)|$(q "SELECT count(*) FROM revenue_by_region WHERE region = 'south'")"
+q "UPDATE shop.products SET price = 2 WHERE id = 1" >/dev/null
+wait_view public.revenue_by_region
+assert_eq "price change updates revenue" "0" "$(rev_diff)"
+q "BEGIN; DELETE FROM shop.orders WHERE customer_id = 2; DELETE FROM shop.customers WHERE id = 4; COMMIT" >/dev/null
+wait_view public.revenue_by_region
+assert_eq "deletes across two tables in one transaction; empty regions disappear" "0|0" "$(rev_diff)|$(q "SELECT count(*) FROM revenue_by_region WHERE region IN ('west', 'east')")"
+wait_view public.order_lines
+assert_eq "projection join view still equals its query" "0" "$(lines_diff)"
+assert_eq "shadows shared by two views have refcount 2" "3" "$(q "SELECT count(*) FROM nabla.shadows WHERE refcount = 2")"
+q "SELECT nabla.drop_view('public.order_lines')" >/dev/null || die "drop_view(order_lines) failed"
+assert_eq "dropping one view keeps the shadows with refcount 1" "3|3" \
+  "$(q "SELECT count(*) FROM nabla.shadows WHERE refcount = 1")|$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'nabla_shadow'")"
+q "SELECT nabla.drop_view('public.revenue_by_region')" >/dev/null || die "drop_view(revenue_by_region) failed"
+assert_eq "dropping the last view drops the shadows" "0|0|0" \
+  "$(q "SELECT count(*) FROM nabla.shadows")|$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'nabla_shadow'")|$(q "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'nabla' AND schemaname = 'shop'")"
+
+# --- 17. the shadow proof ------------------------------------------------------
+echo "== 17. shadow proof"
+q "SELECT nabla.create_view('public.order_lines', \$d\$$LINES_DEF\$d\$)" >/dev/null || die "create_view(order_lines) failed"
+q "ALTER SYSTEM SET nabla.poll_interval_ms = 5000" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+sleep 0.5
+wait_view public.order_lines
+SEQ0=$(q "SELECT nabla.current_seq('public.order_lines')")
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 2, 7, 'paid')" >/dev/null
+NEW_ORDER=$(q "SELECT max(id) FROM shop.orders")
+q "UPDATE shop.customers SET name = 'Alicia' WHERE id = 1" >/dev/null
+q "ALTER SYSTEM RESET nabla.poll_interval_ms" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+wait_view public.order_lines
+assert_eq "final state shows the new customer name" "Alicia|0" "$(q "SELECT customer FROM order_lines WHERE order_id = $NEW_ORDER")|$(lines_diff)"
+assert_eq "T1's delta carries the name as of T1 (read from the shadow), then T2's D/I pair" "I:Alice,D:Alice,I:Alicia" \
+  "$(q "SELECT string_agg(op::text || ':' || (row->>'customer'), ',' ORDER BY seq) FROM nabla.changes('public.order_lines', $SEQ0) WHERE (row->>'order_id')::bigint = $NEW_ORDER")"
+assert_eq "T1 and T2 deltas carry distinct increasing LSNs" "2|true" \
+  "$(q "SELECT count(DISTINCT lsn) || '|' || (min(lsn) < max(lsn)) FROM nabla.changes('public.order_lines', $SEQ0)")"
+assert_eq "T2 rewrote every order of the customer" "3" \
+  "$(q "SELECT count(*) FROM nabla.changes('public.order_lines', $SEQ0) WHERE op = 'I' AND row->>'customer' = 'Alicia'")"
+psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 1, 'paid'); SELECT pg_sleep(3); COMMIT" >/dev/null 2>&1 &
+WRITER_PID=$!
+sleep 0.5
+START_NS=$(date +%s%N)
+if q "SET lock_timeout = '1s'; UPDATE shop.customers SET name = 'Bob' WHERE id = 2" >/dev/null 2>/tmp/nabla-j.err; then
+  ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
+  if [ "$ELAPSED_MS" -lt 1000 ]; then pass "writer on a joined table committed in ${ELAPSED_MS} ms while another transaction was open"
+  else fail "join thesis" "commit took ${ELAPSED_MS} ms"; fi
+else
+  fail "join thesis" "update failed: $(cat /tmp/nabla-j.err)"
+fi
+wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
+wait_view public.order_lines
+assert_eq "join view consistent after concurrent writers" "0" "$(lines_diff)"
+
+# --- 18. join rejections -------------------------------------------------------
+echo "== 18. join rejections"
+reject "LEFT JOIN" "SELECT o.id FROM shop.orders o LEFT JOIN shop.customers c ON c.id = o.customer_id" "LEFT JOIN is not supported; only inner joins are"
+reject "FULL JOIN" "SELECT o.id FROM shop.orders o FULL JOIN shop.customers c ON c.id = o.customer_id" "FULL JOIN is not supported; only inner joins are"
+reject "self-join" "SELECT a.id FROM shop.orders a JOIN shop.orders b ON a.id = b.id" "table shop.orders is referenced twice; self-joins are not supported"
+reject "join with a subquery in FROM" "SELECT o.id FROM shop.orders o JOIN (SELECT id FROM shop.customers) c ON c.id = o.customer_id" "subqueries in FROM are not supported"
+reject "join to a partitioned table" "SELECT o.id FROM shop.orders o JOIN parted p ON p.id = o.customer_id" "public.parted is a partitioned table"
+reject "join to a table without a primary key" "SELECT o.id FROM shop.orders o JOIN nopk n ON n.a = o.customer_id" "public.nopk has no primary key; every table in a join view needs one"
+reject "SELECT * over a join with duplicate output names" "SELECT * FROM shop.customers c JOIN shop.products p ON p.id = c.id" "output column names must be unique"
+reject "join over a nabla view" "SELECT o.id FROM shop.orders o JOIN order_lines l ON l.order_id = o.id" "is a nabla view"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

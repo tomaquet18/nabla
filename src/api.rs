@@ -3,11 +3,13 @@
 use pgrx::datum::{DatumWithOid, JsonB};
 use pgrx::prelude::*;
 use pgrx::spi::quote_identifier;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::definition::{self, Shape, ViewSpec};
 use crate::errors;
 use crate::lsn;
+use crate::shadow;
 
 const SLOT: &str = "nabla";
 const PUBLICATION: &str = "nabla";
@@ -35,6 +37,20 @@ fn read_one<T: FromDatum + IntoDatum>(sql: &str, args: &[DatumWithOid]) -> Optio
         } else {
             table.first().get_one::<T>()
         }
+    })
+    .unwrap_or_else(|e| spi_fail(e))
+}
+
+/// Read-only query returning the first column of every row as i64.
+fn read_ids(sql: &str, args: &[DatumWithOid]) -> Vec<i64> {
+    Spi::connect(|client| {
+        let mut out = Vec::new();
+        for row in client.select(sql, None, args)? {
+            if let Some(v) = row.get::<i64>(1)? {
+                out.push(v);
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
     })
     .unwrap_or_else(|e| spi_fail(e))
 }
@@ -103,6 +119,19 @@ fn ensure_publication_includes(base_oid: u32) {
     }
 }
 
+/// Remove a base table from the publication when no view uses it any more.
+fn release_publication(relid: u32) {
+    let still_used = read_one::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM nabla.view_relations WHERE relid = $1::oid) \
+         OR EXISTS (SELECT 1 FROM nabla.shadows WHERE relid = $1::oid)",
+        &[(relid as i64).into()],
+    )
+    .unwrap_or(false);
+    if !still_used {
+        run(&format!("ALTER PUBLICATION {} DROP TABLE {}", quote_identifier(PUBLICATION), regclass_text(relid)));
+    }
+}
+
 fn regclass_text(oid: u32) -> String {
     read_one::<String>("SELECT $1::oid::regclass::text", &[(oid as i64).into()])
         .unwrap_or_else(|| errors::invalid(format!("nabla: relation {oid} does not exist"), None))
@@ -128,8 +157,20 @@ fn view_index_sql(name: &str, spec: &ViewSpec) -> String {
     format!("CREATE UNIQUE INDEX ON {name} ({}){nulls}", cols.join(", "))
 }
 
+/// Populate a view table and reset its bookkeeping (create and refresh).
+fn record_refresh(view_id: i32) {
+    run_args(
+        "UPDATE nabla.views SET frontier_lsn = pg_catalog.pg_current_wal_lsn(), epoch = epoch + 1, \
+         status = 'live', last_seq = last_seq + 1, resync_seq = last_seq + 1, \
+         apply_failures = 0, last_error = NULL, last_error_at = NULL, stale_reason = NULL WHERE id = $1",
+        &[view_id.into()],
+    );
+    run_args("DELETE FROM nabla.deltas WHERE view_id = $1", &[view_id.into()]);
+}
+
 struct CatalogRow {
     id: i32,
+    name: String,
     base_oid: u32,
     spec: ViewSpec,
     epoch: i32,
@@ -147,40 +188,86 @@ fn stale_error(name: &str, reason: Option<&str>) -> ! {
     )
 }
 
-fn load_view(name: &str) -> CatalogRow {
-    let args = [name.into()];
-    let row = Spi::connect(|client| {
-        let mut out = None;
+fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
+    Spi::connect(|client| {
+        let mut out = Vec::new();
         for r in client.select(
-            "SELECT id, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq, stale_reason \
-             FROM nabla.views WHERE name = $1",
-            Some(1),
-            &args,
+            &format!(
+                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, resync_seq, stale_reason \
+                 FROM nabla.views WHERE {clause} ORDER BY id"
+            ),
+            None,
+            args,
         )? {
-            let spec: JsonB = r.get::<JsonB>(3)?.expect("spec");
+            let spec: JsonB = r.get::<JsonB>(4)?.expect("spec");
             let spec: ViewSpec = serde_json::from_value(spec.0)
                 .unwrap_or_else(|e| errors::invalid(format!("nabla: corrupt spec: {e}"), None));
-            out = Some(CatalogRow {
+            out.push(CatalogRow {
                 id: r.get::<i32>(1)?.expect("id"),
-                base_oid: r.get::<i64>(2)?.expect("base") as u32,
+                name: r.get::<String>(2)?.expect("name"),
+                base_oid: r.get::<i64>(3)?.expect("base") as u32,
                 spec,
-                epoch: r.get::<i32>(4)?.expect("epoch"),
-                status: r.get::<String>(5)?.expect("status"),
-                last_seq: r.get::<i64>(6)?.expect("last_seq"),
-                resync_seq: r.get::<i64>(7)?.expect("resync_seq"),
-                stale_reason: r.get::<String>(8)?,
+                epoch: r.get::<i32>(5)?.expect("epoch"),
+                status: r.get::<String>(6)?.expect("status"),
+                last_seq: r.get::<i64>(7)?.expect("last_seq"),
+                resync_seq: r.get::<i64>(8)?.expect("resync_seq"),
+                stale_reason: r.get::<String>(9)?,
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
     })
-    .unwrap_or_else(|e| spi_fail(e));
-    row.unwrap_or_else(|| {
+    .unwrap_or_else(|e| spi_fail(e))
+}
+
+fn load_view(name: &str) -> CatalogRow {
+    load_view_where("name = $1", &[name.into()]).into_iter().next().unwrap_or_else(|| {
         errors::raise(
             PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
             format!("nabla: view \"{name}\" does not exist"),
             None,
         )
     })
+}
+
+fn oid_array(oids: &BTreeSet<u32>) -> String {
+    let items: Vec<String> = oids.iter().map(|o| o.to_string()).collect();
+    format!("ARRAY[{}]::oid[]", items.join(", "))
+}
+
+/// The refresh set of a join view: it, every shadow it uses, and every other
+/// join view sharing any of those shadows — transitively, because a shadow
+/// re-snapshotted at a new LSN would be wrong for a view still at an older one.
+fn refresh_closure(view: &CatalogRow) -> (Vec<CatalogRow>, BTreeSet<u32>) {
+    let mut view_ids: BTreeSet<i64> = BTreeSet::from([view.id as i64]);
+    let mut relids: BTreeSet<u32> = view.spec.relations.iter().map(|r| r.oid).collect();
+    loop {
+        let more = read_ids(
+            &format!(
+                "SELECT DISTINCT vr.view_id::int8 FROM nabla.view_relations vr \
+                 JOIN nabla.views v ON v.id = vr.view_id \
+                 WHERE vr.relid = ANY({}) AND jsonb_array_length(v.spec->'relations') > 1",
+                oid_array(&relids)
+            ),
+            &[],
+        );
+        let before = (view_ids.len(), relids.len());
+        view_ids.extend(more);
+        let ids: Vec<String> = view_ids.iter().map(|i| i.to_string()).collect();
+        relids.extend(
+            read_ids(
+                &format!("SELECT relid::int8 FROM nabla.view_relations WHERE view_id IN ({})", ids.join(", ")),
+                &[],
+            )
+            .into_iter()
+            .map(|r| r as u32),
+        );
+        if before == (view_ids.len(), relids.len()) {
+            break;
+        }
+    }
+    let ids: Vec<String> = view_ids.iter().map(|i| i.to_string()).collect();
+    let views = load_view_where(&format!("id IN ({})", ids.join(", ")), &[]);
+    (views, relids)
 }
 
 /// The SQL-visible functions. `#[pg_schema]` makes pgrx emit the schema
@@ -195,7 +282,9 @@ mod nabla {
         let (spec, base) = definition::validate(definition);
         require_logical_wal();
 
-        if spec.shape == Shape::Aggregate && base.replident != "f" {
+        // Single-table aggregates take old rows from pgoutput and need the
+        // full row; join views take them from the shadows and need only a key.
+        if !spec.is_join() && spec.shape == Shape::Aggregate && base.replident != "f" {
             errors::prerequisite(
                 format!(
                     "nabla: the aggregate shape needs the full old row of every change, but {} has REPLICA IDENTITY '{}'",
@@ -213,13 +302,24 @@ mod nabla {
             errors::invalid(format!("nabla: view \"{name}\" already exists"), None);
         }
 
-        // Order matters: the slot first (no writes yet), then catalog writes.
+        // Order matters: the slot first (no writes yet), then locks, then writes.
         ensure_slot();
-        ensure_publication_includes(base.oid);
 
-        // Brief, documented write pause on the base table: SHARE waits for
-        // in-flight writers to finish so the starting snapshot is exact.
-        run(&format!("LOCK TABLE {} IN SHARE MODE", base.qualified));
+        // Brief, documented write pause on the base tables: SHARE waits for
+        // in-flight writers to finish so the starting snapshot is exact and
+        // shared by the view table and every shadow.
+        for rel in &spec.relations {
+            run(&format!("LOCK TABLE {} IN SHARE MODE", rel.qualified));
+        }
+        if spec.is_join() {
+            for rel in &spec.relations {
+                shadow::ensure(rel);
+            }
+        }
+        for rel in &spec.relations {
+            ensure_publication_includes(rel.oid);
+        }
+
         run(&format!("CREATE TABLE {name} AS {}", spec.populate_sql));
         run(&view_index_sql(&name, &spec));
         run(&format!(
@@ -232,9 +332,9 @@ mod nabla {
         ));
 
         let spec_json = serde_json::to_string(&spec).expect("spec serializes");
-        run_args(
+        let view_id = Spi::get_one_with_args::<i32>(
             "INSERT INTO nabla.views (name, base_table, definition, shape, spec, frontier_lsn) \
-             VALUES ($1, $2::oid::regclass, $3, $4, $5::jsonb, pg_catalog.pg_current_wal_lsn())",
+             VALUES ($1, $2::oid::regclass, $3, $4, $5::jsonb, pg_catalog.pg_current_wal_lsn()) RETURNING id",
             &[
                 name.as_str().into(),
                 (base.oid as i64).into(),
@@ -242,26 +342,43 @@ mod nabla {
                 spec.shape.as_str().into(),
                 spec_json.as_str().into(),
             ],
-        );
+        )
+        .unwrap_or_else(|e| spi_fail(e))
+        .expect("view id");
+        for rel in &spec.relations {
+            run_args(
+                "INSERT INTO nabla.view_relations (view_id, relid, rti) VALUES ($1, $2::oid, $3)",
+                &[view_id.into(), (rel.oid as i64).into(), (rel.rti as i32).into()],
+            );
+        }
     }
 
     #[pg_extern]
     fn drop_view(name: &str) {
         let name = require_qualified_name(name);
         let view = load_view(&name);
+        let relids: Vec<u32> = if view.spec.relations.is_empty() {
+            vec![view.base_oid]
+        } else {
+            view.spec.relations.iter().map(|r| r.oid).collect()
+        };
         run(&format!("DROP TABLE IF EXISTS {name}"));
         run_args("DELETE FROM nabla.views WHERE id = $1", &[view.id.into()]);
-        let still_used = read_one::<bool>(
-            "SELECT EXISTS (SELECT 1 FROM nabla.views WHERE base_table = $1::oid::regclass)",
-            &[(view.base_oid as i64).into()],
-        )
-        .unwrap_or(false);
-        if !still_used {
-            run(&format!(
-                "ALTER PUBLICATION {} DROP TABLE {}",
-                quote_identifier(PUBLICATION),
-                regclass_text(view.base_oid)
-            ));
+        if view.spec.is_join() {
+            for relid in &relids {
+                shadow::release(*relid);
+            }
+        }
+        for relid in &relids {
+            // Views created before view_relations existed are covered by base_table.
+            let used_by_base = read_one::<bool>(
+                "SELECT EXISTS (SELECT 1 FROM nabla.views WHERE base_table = $1::oid::regclass)",
+                &[(*relid as i64).into()],
+            )
+            .unwrap_or(false);
+            if !used_by_base {
+                release_publication(*relid);
+            }
         }
     }
 
@@ -271,17 +388,48 @@ mod nabla {
         let view = load_view(&name);
         // The slot may have been dropped for lag; recreate it before any write.
         ensure_slot();
-        ensure_publication_includes(view.base_oid);
-        run(&format!("LOCK TABLE {} IN SHARE MODE", view.spec.base_table));
+        if !view.spec.is_join() {
+            ensure_publication_includes(view.base_oid);
+            run(&format!("LOCK TABLE {} IN SHARE MODE", view.spec.base_table));
+            run("SET LOCAL nabla.internal_write = on");
+            run(&format!("DELETE FROM {name}"));
+            run(&format!("INSERT INTO {name} {}", view.spec.populate_sql));
+            record_refresh(view.id);
+            return;
+        }
+
+        // Refresh cascades to views sharing a shadow: everything in the
+        // closure is re-snapshotted under SHARE locks, in one transaction.
+        let (views, relids) = refresh_closure(&view);
+        let mut names: Vec<(u32, String)> = Vec::new();
+        for v in &views {
+            for r in &v.spec.relations {
+                if relids.contains(&r.oid) && !names.iter().any(|(o, _)| *o == r.oid) {
+                    names.push((r.oid, r.qualified.clone()));
+                }
+            }
+        }
+        names.sort_by_key(|(o, _)| *o); // stable lock order across concurrent refreshes
+        for (oid, _) in &names {
+            ensure_publication_includes(*oid);
+        }
+        for (_, qualified) in &names {
+            run(&format!("LOCK TABLE {qualified} IN SHARE MODE"));
+        }
         run("SET LOCAL nabla.internal_write = on");
-        run(&format!("DELETE FROM {name}"));
-        run(&format!("INSERT INTO {name} {}", view.spec.populate_sql));
-        run_args(
-            "UPDATE nabla.views SET frontier_lsn = pg_catalog.pg_current_wal_lsn(), epoch = epoch + 1, \
-             status = 'live', last_seq = last_seq + 1, resync_seq = last_seq + 1, apply_failures = 0, last_error = NULL, last_error_at = NULL, stale_reason = NULL WHERE id = $1",
-            &[view.id.into()],
-        );
-        run_args("DELETE FROM nabla.deltas WHERE view_id = $1", &[view.id.into()]);
+        let mut done: BTreeSet<u32> = BTreeSet::new();
+        for v in &views {
+            for r in &v.spec.relations {
+                if done.insert(r.oid) {
+                    shadow::snapshot(r);
+                }
+            }
+        }
+        for v in &views {
+            run(&format!("DELETE FROM {}", v.name));
+            run(&format!("INSERT INTO {} {}", v.name, v.spec.populate_sql));
+            record_refresh(v.id);
+        }
     }
 
     #[pg_extern(sql = r#"

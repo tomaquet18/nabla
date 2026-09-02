@@ -65,10 +65,11 @@ aliases, schema-qualified names, comments and string literals all behave
 exactly as in `psql`; the shape decision is made on the analyzed query tree
 (`src/definition.rs`).
 
-1. **Projection**: `SELECT expr [AS alias][, ...] FROM table [WHERE predicate]`.
+1. **Projection**: `SELECT expr [AS alias][, ...] FROM table [JOIN ...] [WHERE predicate]`.
    Output expressions may be plain columns or IMMUTABLE expressions over the
-   base table's columns. The base table's primary key columns must be selected
-   as plain columns (they may be aliased).
+   base tables' columns. For a single table its primary key columns must be
+   selected as plain columns (they may be aliased); join views get hidden key
+   columns instead (see "Joins and shadow tables").
 2. **Aggregate**: `SELECT key [AS alias][, ...], <aggregate> [AS a][, ...]
    FROM table [WHERE predicate] GROUP BY key[, ...]`. Accepted aggregates are
    `count(*)`, `count(<expr>)` and `sum(<expr>)`, with PostgreSQL's NULL
@@ -142,6 +143,42 @@ GUCs: `nabla.database`, `nabla.poll_interval_ms` (100),
 `nabla.retain_deltas` (100000), `nabla.max_slot_lag_bytes` (1 GiB),
 `nabla.max_apply_failures` (3).
 
+## Joins and shadow tables
+
+A view may join 2..N ordinary tables with inner joins. Under deferred
+consistency the worker applies a source transaction T after the live tables
+have possibly moved on, and for V = A JOIN B the delta of a change on A is
+dA JOIN B-as-of-T, which the live B is not. PostgreSQL cannot serve a snapshot
+of a past LSN, so nabla keeps a **shadow copy** of every base table used by a
+join view (`nabla_shadow.t<oid>`, catalog `nabla.shadows`), maintained from
+the same change stream, in the same order and the same worker transaction as
+the views. Invariant: after absorbing T, shadow(X) == X as of T. Join deltas
+are evaluated against shadows, never against live tables; the changed table
+itself enters the join as a one-row VALUES built from the decoded row.
+
+- Cost: one full copy of each such base table (all columns in v0.1), shared
+  by every join view that uses it (`refcount`).
+- Every joined table needs a primary key; because old rows come from the
+  shadow, join views do NOT need `REPLICA IDENTITY FULL`.
+- Projection join views carry hidden `_nabla_pk<rti>_<column>` columns (one
+  per primary-key column of each table, rti = the table's 1-based position
+  in the FROM list) that identify a joined row; the unique index is on them.
+- `create_view` on a table that already has a shadow reuses it without
+  re-snapshotting: each object has its own frontier and the worker skips
+  transactions at or below it, so an older shadow catches up on its own.
+- `refresh` of a join view re-snapshots the view, every shadow it uses and,
+  because a shared shadow at a new LSN would be wrong for a view still at an
+  older one, every other join view sharing any of those shadows
+  (transitively), all under SHARE locks in one transaction: refresh cascades
+  to views sharing a shadow.
+- A shadow that cannot be maintained (schema drift) is flagged in
+  `nabla.shadows.stale_reason`, its dependent views go stale, and
+  `refresh` rebuilds it. Shadows are not dumped by pg_dump; refresh rebuilds
+  them after a restore.
+
+Not yet: outer joins, self-joins, column pruning of views, shadow column
+pruning.
+
 ## Build and test
 
 Everything compiles and runs inside the `nabla-dev:17` Docker image
@@ -184,8 +221,8 @@ The worker loop (`src/worker.rs`), every `nabla.poll_interval_ms`:
 
 ## Not yet
 
-- Joins, multiple base tables, subqueries, expressions, other aggregates
-  (`avg`, `min`, `max`, ...), `HAVING`, `DISTINCT`.
+- Outer joins, self-joins, subqueries, other aggregates (`avg`, `min`,
+  `max`, ...), `HAVING`, `DISTINCT`.
 - Single-group aggregates without `GROUP BY` (`SELECT count(*) FROM t`) and
   `min`/`max`/`avg`.
 - A streaming transport for subscribers; `changes()` is pull-based.
