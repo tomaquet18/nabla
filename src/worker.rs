@@ -378,8 +378,12 @@ fn shadow_old_row(shadow: &Shadow, rel: &Relation, old: Option<&Tuple>, new: Opt
     let cols: Vec<String> = indexes.iter().map(|i| format!("{}::text", quote_identifier(&rel.columns[*i].name))).collect();
     let sql = format!("SELECT {} FROM {} WHERE {conds}", cols.join(", "), shadow.table);
     let args: Vec<DatumWithOid> = values.into_iter().map(|v| v.into()).collect();
-    let row = Spi::connect(|client| {
-        let table = client.select(&sql, Some(1), &args)?;
+    // Mutable SPI on purpose: the read-only path keeps the command id of the
+    // snapshot pushed at transaction start and would not see a row this very
+    // transaction inserted into the shadow (insert then delete of the same
+    // row inside one source transaction).
+    let row = Spi::connect_mut(|client| {
+        let table = client.update(&sql, Some(1), &args)?;
         if table.is_empty() {
             return Ok(None);
         }
@@ -826,7 +830,9 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
         let (seq_before, touched_before) = (view.last_seq, view.touched);
         let outcome = in_subtransaction(AssertUnwindSafe(|| {
             let target = ViewTarget { name: &view.name, spec: &view.spec };
-            let deltas = apply::execute(&target, &ops)?;
+            // Table writes stay per change; the log gets the transaction's
+            // net effect per identity key (see apply::net).
+            let deltas = apply::net(&view.spec, apply::execute(&target, &ops)?);
             record_deltas(view, tx, deltas)
         }));
         match outcome {

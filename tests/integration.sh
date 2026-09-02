@@ -160,8 +160,8 @@ case "$SEEN" in
   *) fail "atomicity" "observed intermediate counts: $SEEN" ;;
 esac
 assert_eq "k=999 final count" "5" "$(q "SELECT n FROM orders_by_k WHERE k = 999")"
-# 5 inserts into a fresh group produce 1 + 4*2 = 9 deltas, all from one source transaction.
-assert_eq "deltas of one source transaction share lsn and xid" "9|1|1" \
+# 5 inserts into a fresh group are one source transaction: its net effect is one I.
+assert_eq "a source transaction nets to one delta per group, with one lsn and xid" "1|1|1" \
   "$(q "SELECT count(*) || '|' || count(DISTINCT lsn) || '|' || count(DISTINCT xid) FROM $(CH public.orders_by_k $SEQ0)")"
 assert_eq "last delta of the transaction is the final group row" "I|5" \
   "$(q "SELECT op || '|' || (row->>'n') FROM $(CH public.orders_by_k $SEQ0) ORDER BY seq DESC LIMIT 1")"
@@ -994,6 +994,115 @@ assert_eq "10. worker alive and quiet, no WARNING" "1|$W3" \
 wait_view public.paid_orders
 assert_eq "10. views over other tables keep working" "0" \
   "$(q "SELECT count(*) FROM ((SELECT id, k, amount FROM paid_orders EXCEPT SELECT id, k, amount FROM orders WHERE status = 'paid') UNION ALL (SELECT id, k, amount FROM orders WHERE status = 'paid' EXCEPT SELECT id, k, amount FROM paid_orders)) d")"
+
+# --- 23. netted deltas per source transaction ------------------------------------
+echo "== 23. netted deltas per source transaction"
+q "CREATE SCHEMA net" >/dev/null
+q "CREATE TABLE net.customers (id int PRIMARY KEY, name text, region text)" >/dev/null
+q "CREATE TABLE net.products (id int PRIMARY KEY, name text, price numeric)" >/dev/null
+q "CREATE TABLE net.orders (id serial PRIMARY KEY, customer_id int, product_id int, qty int, status text)" >/dev/null
+q "ALTER TABLE net.orders REPLICA IDENTITY FULL" >/dev/null
+q "INSERT INTO net.customers VALUES (1, 'Alice', 'AR'), (2, 'Bob', 'BR'), (4, 'Dora', 'AR')" >/dev/null
+q "INSERT INTO net.products VALUES (1, 'pen', 10), (2, 'book', 20)" >/dev/null
+q "INSERT INTO net.orders (customer_id, product_id, qty, status) VALUES (1, 1, 2, 'paid'), (2, 1, 3, 'paid'), (2, 2, 1, 'paid'), (1, 2, 1, 'paid'), (4, 1, 1, 'paid')" >/dev/null
+REV_DEF="SELECT c.region, count(*) AS n, sum(o.qty * p.price) AS revenue FROM net.orders o JOIN net.customers c ON c.id = o.customer_id JOIN net.products p ON p.id = o.product_id WHERE o.status = 'paid' GROUP BY c.region"
+LIN_DEF="SELECT o.id AS order_id, c.region, o.qty FROM net.orders o JOIN net.customers c ON c.id = o.customer_id WHERE o.status = 'paid'"
+AGG_DEF="SELECT customer_id, count(*) AS n, sum(qty) AS q FROM net.orders GROUP BY customer_id"
+for spec in "public.net_rev|$REV_DEF" "public.net_lines|$LIN_DEF" "public.net_agg|$AGG_DEF"; do
+  q "SELECT nabla.create_view('${spec%%|*}', \$d\$${spec#*|}\$d\$)" >/dev/null || die "create_view(${spec%%|*}) failed"
+  await_ready "${spec%%|*}"
+done
+net_check() { # label
+  wait_view public.net_rev; wait_view public.net_lines; wait_view public.net_agg
+  assert_eq "$1: views equal their queries" "0|0|0" \
+    "$(vdiff net_rev "region, n, revenue" "$REV_DEF")|$(vdiff net_lines "order_id, region, qty" "$LIN_DEF")|$(vdiff net_agg "customer_id, n, q" "$AGG_DEF")"
+}
+# netted deltas of a view since a cursor, as op:key:value in seq order
+rev_deltas() { q "SELECT coalesce(string_agg(op || ':' || (row->>'region') || ':' || (row->>'n'), ',' ORDER BY seq), '') FROM $(CH public.net_rev "$1")"; }
+lin_deltas() { q "SELECT coalesce(string_agg(op || ':' || (row->>'order_id') || ':' || (row->>'qty'), ',' ORDER BY seq), '') FROM $(CH public.net_lines "$1")"; }
+agg_deltas() { q "SELECT coalesce(string_agg(op || ':' || (row->>'customer_id') || ':' || (row->>'n'), ',' ORDER BY seq), '') FROM $(CH public.net_agg "$1")"; }
+cur() { q "SELECT current_seq FROM nabla.status('$1')"; }
+q "INSERT INTO net.customers VALUES (3, 'Cleo', 'CL')" >/dev/null
+net_check "setup"
+# the reference client follows the aggregate view through steps 1-6
+NET_OUT=/tmp/follow-net.out; : > "$NET_OUT"
+"$FOLLOW" "$CONN" public.net_rev > "$NET_OUT" 2>/tmp/follow-net.err &
+CLIENT_PID=$!
+for i in $(seq 1 100); do grep -q '^snapshot:' "$NET_OUT" && break; sleep 0.1; done
+# 1. three paid orders for a new region in one transaction
+R0=$(cur public.net_rev); L0=$(cur public.net_lines); A0=$(cur public.net_agg)
+q "INSERT INTO net.orders (customer_id, product_id, qty, status) VALUES (3, 1, 1, 'paid'), (3, 1, 2, 'paid'), (3, 2, 1, 'paid')" >/dev/null
+net_check "1. new region"
+assert_eq "1. one I with the final group row; the projection gets three I" "I:CL:3|3|I:3:3" \
+  "$(rev_deltas "$R0")|$(q "SELECT count(*) FROM $(CH public.net_lines "$L0") WHERE op = 'I'")|$(agg_deltas "$A0")"
+# 2. insert two rows and delete them again in one transaction
+R0=$(cur public.net_rev); L0=$(cur public.net_lines); A0=$(cur public.net_agg); F0=$(q "SELECT nabla.frontier('public.net_rev')")
+q "BEGIN; INSERT INTO net.orders (customer_id, product_id, qty, status) VALUES (1, 1, 99, 'paid'), (1, 2, 99, 'paid'); DELETE FROM net.orders WHERE qty = 99; COMMIT" >/dev/null
+net_check "2. insert then delete"
+assert_eq "2. zero deltas on every view, cursors unchanged, frontier advanced" "|||$R0|$L0|$A0|t" \
+  "$(rev_deltas "$R0")|$(lin_deltas "$L0")|$(agg_deltas "$A0")|$(cur public.net_rev)|$(cur public.net_lines)|$(cur public.net_agg)|$(q "SELECT nabla.frontier('public.net_rev') > '$F0'::pg_lsn")"
+# 3. qty 2 -> 5 -> 2 in one transaction
+R0=$(cur public.net_rev); L0=$(cur public.net_lines); A0=$(cur public.net_agg)
+q "BEGIN; UPDATE net.orders SET qty = 5 WHERE id = 1; UPDATE net.orders SET qty = 2 WHERE id = 1; COMMIT" >/dev/null
+net_check "3. update and revert"
+assert_eq "3. zero deltas" "||" "$(rev_deltas "$R0")|$(lin_deltas "$L0")|$(agg_deltas "$A0")"
+# 4. every order of a region deleted in one transaction
+R0=$(cur public.net_rev); L0=$(cur public.net_lines); A0=$(cur public.net_agg)
+q "DELETE FROM net.orders WHERE customer_id = 3" >/dev/null
+net_check "4. region emptied"
+assert_eq "4. one D carrying the pre-transaction group row" "D:CL:3|3|D:3:3" \
+  "$(rev_deltas "$R0")|$(q "SELECT count(*) FROM $(CH public.net_lines "$L0") WHERE op = 'D'")|$(agg_deltas "$A0")"
+# 5. two orders move from AR to BR through a customer update
+R0=$(cur public.net_rev)
+AR_BEFORE=$(q "SELECT n FROM net_rev WHERE region = 'AR'"); BR_BEFORE=$(q "SELECT n FROM net_rev WHERE region = 'BR'")
+q "UPDATE net.customers SET region = 'BR' WHERE id = 1" >/dev/null
+net_check "5. region move"
+assert_eq "5. D(AR before), I(AR after), D(BR before), I(BR after)" "D:AR:$AR_BEFORE,I:AR:$((AR_BEFORE - 2)),D:BR:$BR_BEFORE,I:BR:$((BR_BEFORE + 2))" "$(rev_deltas "$R0")"
+# 6. multi-table transaction: a new customer and its orders
+R0=$(cur public.net_rev); L0=$(cur public.net_lines); A0=$(cur public.net_agg)
+q "BEGIN; INSERT INTO net.customers VALUES (5, 'Eve', 'EV'); INSERT INTO net.orders (customer_id, product_id, qty, status) VALUES (5, 1, 1, 'paid'), (5, 2, 2, 'paid'); COMMIT" >/dev/null
+net_check "6. multi-table"
+assert_eq "6. one I per affected group, no intermediate rows" "I:EV:2|2|I:5:2" \
+  "$(rev_deltas "$R0")|$(q "SELECT count(*) FROM $(CH public.net_lines "$L0") WHERE op = 'I'")|$(agg_deltas "$A0")"
+sleep 1.5
+kill -INT "$CLIENT_PID"; wait "$CLIENT_PID" 2>/dev/null; CLIENT_PID=""
+assert_eq "9. the client saw one tx line per netted transaction with the netted counts" "deltas=1,deltas=1,deltas=4,deltas=1" \
+  "$(grep -E '^tx ' "$NET_OUT" | grep -oE 'deltas=[0-9]+' | paste -sd, -)"
+assert_eq "9. the client never printed an intermediate group row" "0" \
+  "$(grep -cE '"n":(1|2),"region":"CL"|"n":1,"region":"EV"' "$NET_OUT")"
+# 7. hidden-only change on an aggregate without count(*)
+q "CREATE TABLE net.hv (id serial PRIMARY KEY, k int, v int)" >/dev/null
+q "ALTER TABLE net.hv REPLICA IDENTITY FULL" >/dev/null
+q "INSERT INTO net.hv (k, v) VALUES (1, 5)" >/dev/null
+q "SELECT nabla.create_view('public.net_sumv', 'SELECT k, sum(v) AS sv FROM net.hv GROUP BY k')" >/dev/null || die "create_view(net_sumv) failed"
+await_ready public.net_sumv
+S0=$(cur public.net_sumv); E0=$(q "SELECT epoch FROM nabla.status('public.net_sumv')")
+q "INSERT INTO net.hv (k, v) VALUES (1, NULL)" >/dev/null
+wait_view public.net_sumv
+assert_eq "7. a change of hidden counters only is silent and the view stays correct" "$S0|0|1:5" \
+  "$(cur public.net_sumv)|$(vdiff net_sumv "k, sv" "SELECT k, sum(v) FROM net.hv GROUP BY k")|$(q "SELECT k || ':' || sv FROM net_sumv")"
+q "INSERT INTO net.hv (k, v) VALUES (1, 1)" >/dev/null
+wait_view public.net_sumv
+assert_eq "7. a later delta nets to D(before), I(after) and exposes the updated hidden counters with include_hidden" "D|2|1,I|3|2" \
+  "$(q "SELECT string_agg(op || '|' || (row->>'_nabla_n') || '|' || (row->>'_nabla_nn_0'), ',' ORDER BY seq) FROM nabla.changes('public.net_sumv', $S0, $E0, 1000, true)")"
+# 8. projection: insert then update twice; flip status back and forth
+L0=$(cur public.net_lines)
+q "BEGIN; INSERT INTO net.orders (id, customer_id, product_id, qty, status) VALUES (900, 2, 1, 1, 'paid'); UPDATE net.orders SET qty = 7 WHERE id = 900; UPDATE net.orders SET qty = 9 WHERE id = 900; COMMIT" >/dev/null
+net_check "8a. insert and update twice"
+assert_eq "8a. one I with the final row" "I:900:9" "$(lin_deltas "$L0")"
+L0=$(cur public.net_lines)
+q "BEGIN; UPDATE net.orders SET status = 'new' WHERE id = 900; UPDATE net.orders SET status = 'paid' WHERE id = 900; COMMIT" >/dev/null
+net_check "8b. flip and flip back"
+assert_eq "8b. zero deltas" "" "$(lin_deltas "$L0")"
+# replay of the hands-on session
+R0=$(cur public.net_rev)
+q "BEGIN; INSERT INTO net.customers VALUES (6, 'Dani', 'NR'); INSERT INTO net.orders (customer_id, product_id, qty, status) VALUES (6, 1, 5, 'paid'), (6, 2, 1, 'paid'); COMMIT" >/dev/null
+net_check "replay: Dani"
+assert_eq "replay: Dani plus two orders nets to one I" "I:NR:2" "$(rev_deltas "$R0")"
+R0=$(cur public.net_rev); BR_N=$(q "SELECT n FROM net_rev WHERE region = 'BR'")
+q "DELETE FROM net.orders WHERE customer_id IN (SELECT id FROM net.customers WHERE region = 'BR')" >/dev/null
+net_check "replay: BR emptied"
+assert_eq "replay: deleting every BR row nets to one D with the pre-transaction row" "D:BR:$BR_N" "$(rev_deltas "$R0")"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

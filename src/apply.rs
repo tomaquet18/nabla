@@ -21,6 +21,7 @@ use crate::pgoutput::{ColumnValue, Relation, Tuple};
 use crate::shadow;
 
 /// A delta row produced for the subscriber log.
+#[derive(Clone, Debug)]
 pub struct Delta {
     pub op: char,
     pub row_json: String,
@@ -334,4 +335,138 @@ fn aggregate_row(view: &ViewTarget, sign: i32, row_json: &str, deltas: &mut Vec<
             .map_err(|e| format!("group cleanup failed: {e}"))?;
     }
     Ok(())
+}
+
+// --- netting -------------------------------------------------------------------
+
+/// The identity of a view row: the group keys of an aggregate view, the
+/// selected primary key columns of a single-table projection, the hidden
+/// `_nabla_pk*` columns of a join projection.
+fn identity_columns(spec: &ViewSpec) -> Vec<&str> {
+    match spec.shape {
+        Shape::Aggregate => spec.columns.iter().map(|c| c.alias.as_str()).collect(),
+        Shape::Projection => spec.pk_view_columns.iter().map(|s| s.as_str()).collect(),
+    }
+}
+
+fn visible(spec: &ViewSpec, row: &serde_json::Value) -> serde_json::Value {
+    let mut row = row.clone();
+    if let serde_json::Value::Object(map) = &mut row {
+        for h in &spec.hidden_columns {
+            map.remove(h);
+        }
+    }
+    row
+}
+
+/// Net the deltas of one source transaction for one view: per identity key,
+/// `D(before)` (the row carried by the key's first `D`, absent if its first
+/// event is an `I`) then `I(after)` (the row of its last `I`, absent if its
+/// last event is a `D`), nothing when the two are equal on visible columns.
+/// Keys keep the order of their first appearance. Subscribers therefore only
+/// ever see committed states, never the intermediate rows the per-change
+/// maintenance passed through. The buffer is bounded by the transaction's
+/// own delta count, which is already fully decoded in memory.
+pub fn net(spec: &ViewSpec, deltas: Vec<Delta>) -> Vec<Delta> {
+    struct State {
+        before: Option<serde_json::Value>,
+        after: Option<serde_json::Value>,
+    }
+    let identity = identity_columns(spec);
+    let mut order: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut states: Vec<State> = Vec::new();
+    for d in deltas {
+        let row: serde_json::Value = match serde_json::from_str(&d.row_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let key: Vec<serde_json::Value> = identity
+            .iter()
+            .map(|c| row.get(*c).cloned().unwrap_or(serde_json::Value::Null))
+            .collect();
+        let index = match order.iter().position(|k| *k == key) {
+            Some(i) => i,
+            None => {
+                order.push(key);
+                states.push(State {
+                    before: if d.op == 'D' { Some(row.clone()) } else { None },
+                    after: None,
+                });
+                states.len() - 1
+            }
+        };
+        let state = &mut states[index];
+        state.after = if d.op == 'I' { Some(row) } else { None };
+    }
+    let mut out = Vec::new();
+    for state in states {
+        let before_visible = state.before.as_ref().map(|r| visible(spec, r));
+        let after_visible = state.after.as_ref().map(|r| visible(spec, r));
+        if before_visible == after_visible {
+            continue;
+        }
+        if let Some(before) = state.before {
+            out.push(Delta { op: 'D', row_json: before.to_string() });
+        }
+        if let Some(after) = state.after {
+            out.push(Delta { op: 'I', row_json: after.to_string() });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+    use crate::definition::{OutputColumn, ViewSpec};
+
+    fn spec() -> ViewSpec {
+        ViewSpec {
+            shape: Shape::Aggregate,
+            base_table: String::new(),
+            base_relname: String::new(),
+            predicate: None,
+            columns: vec![OutputColumn { expr: "k".into(), alias: "k".into() }],
+            pk_columns: vec![],
+            pk_view_columns: vec![],
+            count_alias: Some("n".into()),
+            hidden_count: false,
+            counts: vec![],
+            sums: vec![],
+            populate_sql: String::new(),
+            relations: vec![],
+            select_list: String::new(),
+            group_by: None,
+            visible_columns: vec!["k".into(), "n".into()],
+            hidden_columns: vec!["_nabla_nn_0".into()],
+        }
+    }
+
+    fn d(op: char, json: &str) -> Delta {
+        Delta { op, row_json: json.to_string() }
+    }
+
+    #[test]
+    fn nets_to_final_state() {
+        let out = net(&spec(), vec![d('I', r#"{"k":1,"n":1}"#), d('D', r#"{"k":1,"n":1}"#), d('I', r#"{"k":1,"n":2}"#)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].op, 'I');
+        assert!(out[0].row_json.contains(r#""n":2"#));
+    }
+
+    #[test]
+    fn insert_then_delete_is_silent_and_delete_keeps_before() {
+        assert!(net(&spec(), vec![d('I', r#"{"k":1,"n":1}"#), d('D', r#"{"k":1,"n":1}"#)]).is_empty());
+        let out = net(&spec(), vec![d('D', r#"{"k":2,"n":3}"#), d('I', r#"{"k":2,"n":1}"#), d('D', r#"{"k":2,"n":1}"#)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].op, out[0].row_json.contains(r#""n":3"#)), ('D', true));
+    }
+
+    #[test]
+    fn hidden_only_changes_are_silent_and_keys_keep_order() {
+        assert!(net(&spec(), vec![d('D', r#"{"k":1,"n":1,"_nabla_nn_0":0}"#), d('I', r#"{"k":1,"n":1,"_nabla_nn_0":1}"#)]).is_empty());
+        let out = net(&spec(), vec![d('D', r#"{"k":9,"n":1}"#), d('I', r#"{"k":9,"n":2}"#), d('D', r#"{"k":3,"n":5}"#)]);
+        let ops: Vec<(char, i64)> = out.iter().map(|x| (x.op, serde_json::from_str::<serde_json::Value>(&x.row_json).unwrap()["k"].as_i64().unwrap())).collect();
+        assert_eq!(ops, vec![('D', 9), ('I', 9), ('D', 3)]);
+    }
 }

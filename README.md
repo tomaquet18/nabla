@@ -293,6 +293,18 @@ the `follow` example); clients in other languages follow the same steps.
    text form) and call `nabla.wait_for('<view>', lsn, timeout_ms)`; when it
    returns true the view and the delta log include your transaction.
 
+What a delta is: the rows of one source transaction are its net effect per
+identity key (the group keys of an aggregate view, the primary key of a
+projection). Per key the batch holds at most a `D` carrying the row as it
+was before the transaction, then an `I` carrying the row after it; a key
+whose visible columns did not change, or that was created and removed
+within the transaction, is silent. Intermediate states the maintenance
+passed through (a group counted 1 then 2 then 3) never appear. Changes that
+only touch hidden `_nabla_*` maintenance columns produce no delta, so the
+hidden values seen with `include_hidden = true` are best-effort. A
+transaction with an empty net effect appends nothing and sends no
+notification for that view, but still advances the view's frontier.
+
 Events a client should surface: `Snapshot { epoch, frontier, cursor, rows }`,
 `Transaction { xid, lsn, epoch, deltas[] }` and `Resync { reason }` where the
 reason is one of lagged, epoch changed, stale (with the reason) or
