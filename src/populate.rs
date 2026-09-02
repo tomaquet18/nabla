@@ -15,6 +15,12 @@
 //! very process, and only after this step). The view's frontier is set to the
 //! consistent point, so the existing skip rule (`end_lsn <= frontier`) makes
 //! the two halves meet exactly.
+//!
+//! A rebuild (refresh) re-validates the stored definition text first, so a
+//! definition that no longer resolves (dropped column, renamed table) fails
+//! with PostgreSQL's own error, and the regenerated spec picks up type
+//! changes. View tables and shadow tables are recorded in `pg_depend` as
+//! depending on their base tables, like SQL views.
 
 use pgrx::datum::{DatumWithOid, JsonB};
 use pgrx::pg_sys::panic::CaughtError;
@@ -26,7 +32,7 @@ use std::ffi::{c_int, c_void, CString};
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
-use crate::definition::{Shape, ViewSpec};
+use crate::definition::{self, Shape, ViewSpec};
 use crate::guc;
 use crate::lsn;
 use crate::shadow;
@@ -59,11 +65,30 @@ fn spi_err(e: pgrx::spi::Error) -> String {
     e.to_string()
 }
 
+/// Run `body` in a subtransaction; a PostgreSQL error rolls it back and is
+/// returned as a message.
+fn in_subtransaction<R>(body: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
+    unsafe {
+        let memory_context = pg_sys::CurrentMemoryContext;
+        let resource_owner = pg_sys::CurrentResourceOwner;
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        let result = PgTryBuilder::new(AssertUnwindSafe(body)).catch_others(|e| Err(describe(&e))).execute();
+        match &result {
+            Ok(_) => pg_sys::ReleaseCurrentSubTransaction(),
+            Err(_) => pg_sys::RollbackAndReleaseCurrentSubTransaction(),
+        }
+        pg_sys::MemoryContextSwitchTo(memory_context);
+        pg_sys::CurrentResourceOwner = resource_owner;
+        result
+    }
+}
+
 /// A view waiting to be built or rebuilt.
 pub struct Pending {
     pub id: i32,
     pub name: String,
     pub status: String,
+    pub definition: String,
     pub spec: ViewSpec,
     /// A build has committed before (shadow references exist, epoch bumps).
     pub populated: bool,
@@ -94,7 +119,7 @@ pub fn load_pending() -> Result<Vec<Pending>, String> {
     Spi::connect(|client| {
         let mut out = Vec::new();
         for r in client.select(
-            "SELECT id, name, status, spec, populated_at IS NOT NULL FROM nabla.views \
+            "SELECT id, name, status, spec, populated_at IS NOT NULL, definition FROM nabla.views \
              WHERE status IN ('initializing', 'refreshing') ORDER BY id",
             None,
             &[],
@@ -110,6 +135,7 @@ pub fn load_pending() -> Result<Vec<Pending>, String> {
                 status: r.get::<String>(3)?.expect("status"),
                 spec,
                 populated: r.get::<bool>(5)?.unwrap_or(false),
+                definition: r.get::<String>(6)?.unwrap_or_default(),
             });
         }
         Ok(out)
@@ -161,21 +187,81 @@ fn read_text(sql: &str, args: &[DatumWithOid]) -> Result<Option<String>, String>
     .map_err(spi_err)
 }
 
+/// Columns a shadow of `relid` must hold: the union of `used_columns` over
+/// every view that references the table (any status), plus this view's own.
+fn needed_columns(relid: u32, own: &ViewSpec) -> Result<BTreeSet<String>, String> {
+    let mut needed: BTreeSet<String> = BTreeSet::new();
+    let specs: Vec<JsonB> = Spi::connect(|client| {
+        let mut out = Vec::new();
+        for r in client.select(
+            "SELECT v.spec FROM nabla.views v JOIN nabla.view_relations vr ON vr.view_id = v.id \
+             WHERE vr.relid = $1::oid",
+            None,
+            &[(relid as i64).into()],
+        )? {
+            if let Some(s) = r.get::<JsonB>(1)? {
+                out.push(s);
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(out)
+    })
+    .map_err(spi_err)?;
+    for s in specs {
+        if let Ok(spec) = serde_json::from_value::<ViewSpec>(s.0) {
+            for rel in spec.relations.iter().filter(|r| r.oid == relid) {
+                needed.extend(rel.used_columns.iter().cloned());
+            }
+        }
+    }
+    for rel in own.relations.iter().filter(|r| r.oid == relid) {
+        needed.extend(rel.used_columns.iter().cloned());
+    }
+    Ok(needed)
+}
+
 /// Build (or rebuild) one view of a group inside the population transaction.
 fn build(view: &Pending, consistent_point: u64, shadows_done: &mut BTreeSet<u32>) -> Result<(), String> {
     run("SET LOCAL nabla.internal_write = on")?;
     let rebuild = view.status == "refreshing" && view.populated;
-    if view.spec.is_join() {
-        for rel in &view.spec.relations {
+
+    // A rebuild re-validates the definition against the current schema and
+    // stores the regenerated spec (types, used columns). A definition that
+    // no longer resolves fails this view alone (NB006 via await_ready); the
+    // other members of the group are still rebuilt.
+    let spec = if rebuild {
+        let definition = view.definition.clone();
+        match in_subtransaction(move || Ok(definition::validate(&definition).0)) {
+            Ok(spec) => {
+                let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
+                run_args("UPDATE nabla.views SET spec = $2::jsonb WHERE id = $1", &[view.id.into(), json.as_str().into()])?;
+                spec
+            }
+            Err(message) => {
+                pgrx::warning!("nabla worker: rebuild of {} failed: {message}", view.name);
+                let args: [DatumWithOid; 2] = [view.id.into(), message.as_str().into()];
+                run_args(
+                    "UPDATE nabla.views SET status = 'failed', last_error = $2, last_error_at = now() WHERE id = $1",
+                    &args,
+                )?;
+                return Ok(());
+            }
+        }
+    } else {
+        view.spec.clone()
+    };
+
+    if spec.is_join() {
+        for rel in &spec.relations {
             if !shadows_done.insert(rel.oid) {
                 continue;
             }
+            let needed = needed_columns(rel.oid, &spec)?;
             if rebuild {
-                // Every shadow of the group is re-snapshotted from this point.
-                shadow::snapshot(rel, consistent_point);
+                // Every shadow of the group is rebuilt from this point.
+                shadow::rebuild(rel, consistent_point, &needed);
             } else {
-                // First build: existing healthy shadows are left alone (skip rule).
-                shadow::ensure(rel, consistent_point);
+                // First build: existing healthy shadows are extended, never re-snapshotted.
+                shadow::ensure(rel, consistent_point, &needed);
             }
         }
     }
@@ -184,11 +270,17 @@ fn build(view: &Pending, consistent_point: u64, shadows_done: &mut BTreeSet<u32>
         // DELETE, not TRUNCATE: readers keep seeing the old rows under MVCC
         // until this transaction commits, never an empty table.
         run(&format!("DELETE FROM {}", view.name))?;
-        run(&format!("INSERT INTO {} {}", view.name, view.spec.populate_sql))?;
+        run(&format!("INSERT INTO {} {}", view.name, spec.populate_sql))?;
     } else {
-        run(&format!("CREATE TABLE {} AS {}", view.name, view.spec.populate_sql))?;
-        for ddl in view_ddl(&view.name, &view.spec) {
+        run(&format!("CREATE TABLE {} AS {}", view.name, spec.populate_sql))?;
+        for ddl in view_ddl(&view.name, &spec) {
             run(&ddl)?;
+        }
+        // The view table depends on its base tables, like a SQL view does.
+        if let Some(view_oid) = shadow::relation_oid(&view.name) {
+            for rel in &spec.relations {
+                shadow::record_dependency(view_oid, rel.oid);
+            }
         }
     }
     let bump: i32 = if rebuild { 1 } else { 0 };

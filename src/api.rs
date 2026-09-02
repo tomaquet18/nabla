@@ -14,7 +14,6 @@ use crate::definition::{self, Shape, ViewSpec};
 use crate::errors;
 use crate::idle;
 use crate::lsn;
-use crate::shadow;
 
 const SLOT: &str = "nabla";
 const PUBLICATION: &str = "nabla";
@@ -116,30 +115,20 @@ fn ensure_publication_includes(base_oid: u32) {
     )
     .unwrap_or(false);
     if !included {
-        run(&format!(
-            "ALTER PUBLICATION {} ADD TABLE {}",
-            quote_identifier(PUBLICATION),
-            regclass_text(base_oid)
-        ));
+        let table = regclass_text(base_oid)
+            .unwrap_or_else(|| errors::failed("?", Some(&format!("base table with oid {base_oid} no longer exists"))));
+        run(&format!("ALTER PUBLICATION {} ADD TABLE {table}", quote_identifier(PUBLICATION)));
     }
 }
 
-/// Remove a base table from the publication when no view uses it any more.
-fn release_publication(relid: u32) {
-    let still_used = read_one::<bool>(
-        "SELECT EXISTS (SELECT 1 FROM nabla.view_relations WHERE relid = $1::oid) \
-         OR EXISTS (SELECT 1 FROM nabla.shadows WHERE relid = $1::oid)",
-        &[(relid as i64).into()],
+/// Quoted name of a relation, or None when it no longer exists (a dropped
+/// regclass renders as a bare number, which must never reach SQL).
+fn regclass_text(oid: u32) -> Option<String> {
+    read_one::<String>(
+        "SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) \
+         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1::oid",
+        &[(oid as i64).into()],
     )
-    .unwrap_or(false);
-    if !still_used {
-        run(&format!("ALTER PUBLICATION {} DROP TABLE {}", quote_identifier(PUBLICATION), regclass_text(relid)));
-    }
-}
-
-fn regclass_text(oid: u32) -> String {
-    read_one::<String>("SELECT $1::oid::regclass::text", &[(oid as i64).into()])
-        .unwrap_or_else(|| errors::invalid(format!("nabla: relation {oid} does not exist"), None))
 }
 
 fn require_logical_wal() {
@@ -155,7 +144,6 @@ fn require_logical_wal() {
 struct CatalogRow {
     id: i32,
     name: String,
-    base_oid: u32,
     spec: ViewSpec,
     frontier: u64,
     epoch: i32,
@@ -163,8 +151,6 @@ struct CatalogRow {
     last_seq: i64,
     stale_reason: Option<String>,
     last_error: Option<String>,
-    /// A build has committed before (shadow references exist).
-    populated: bool,
 }
 
 fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
@@ -172,28 +158,26 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
         let mut out = Vec::new();
         for r in client.select(
             &format!(
-                "SELECT id, name, base_table::oid::int8, spec, epoch, status, last_seq, stale_reason, \
-                        frontier_lsn::text, last_error, populated_at IS NOT NULL \
+                "SELECT id, name, spec, epoch, status, last_seq, stale_reason, \
+                        frontier_lsn::text, last_error \
                  FROM nabla.views WHERE {clause} ORDER BY id"
             ),
             None,
             args,
         )? {
-            let spec: JsonB = r.get::<JsonB>(4)?.expect("spec");
+            let spec: JsonB = r.get::<JsonB>(3)?.expect("spec");
             let spec: ViewSpec = serde_json::from_value(spec.0)
                 .unwrap_or_else(|e| errors::invalid(format!("nabla: corrupt spec: {e}"), None));
             out.push(CatalogRow {
                 id: r.get::<i32>(1)?.expect("id"),
                 name: r.get::<String>(2)?.expect("name"),
-                base_oid: r.get::<i64>(3)?.expect("base") as u32,
                 spec,
-                epoch: r.get::<i32>(5)?.expect("epoch"),
-                status: r.get::<String>(6)?.expect("status"),
-                last_seq: r.get::<i64>(7)?.expect("last_seq"),
-                stale_reason: r.get::<String>(8)?,
-                frontier: lsn::parse(&r.get::<String>(9)?.unwrap_or_default()).unwrap_or(0),
-                last_error: r.get::<String>(10)?,
-                populated: r.get::<bool>(11)?.unwrap_or(false),
+                epoch: r.get::<i32>(4)?.expect("epoch"),
+                status: r.get::<String>(5)?.expect("status"),
+                last_seq: r.get::<i64>(6)?.expect("last_seq"),
+                stale_reason: r.get::<String>(7)?,
+                frontier: lsn::parse(&r.get::<String>(8)?.unwrap_or_default()).unwrap_or(0),
+                last_error: r.get::<String>(9)?,
             });
         }
         Ok::<_, pgrx::spi::Error>(out)
@@ -346,11 +330,10 @@ mod nabla {
         }
         let spec_json = serde_json::to_string(&spec).expect("spec serializes");
         let view_id = Spi::get_one_with_args::<i32>(
-            "INSERT INTO nabla.views (name, base_table, definition, shape, spec, frontier_lsn, status) \
-             VALUES ($1, $2::oid::regclass, $3, $4, $5::jsonb, '0/0', 'initializing') RETURNING id",
+            "INSERT INTO nabla.views (name, definition, shape, spec, frontier_lsn, status) \
+             VALUES ($1, $2, $3, $4::jsonb, '0/0', 'initializing') RETURNING id",
             &[
                 name.as_str().into(),
-                (base.oid as i64).into(),
                 definition.into(),
                 spec.shape.as_str().into(),
                 spec_json.as_str().into(),
@@ -367,33 +350,17 @@ mod nabla {
         name
     }
 
+    /// Drops the view table (its sql_drop event trigger cleans the catalog,
+    /// releases shadows and prunes the publication) and forgets the view
+    /// even when no table exists (failed or initializing) or a base table is
+    /// already gone.
     #[pg_extern]
     fn drop_view(name: &str) {
         let name = require_qualified_name(name);
         let view = load_view(&name);
-        let relids: Vec<u32> = if view.spec.relations.is_empty() {
-            vec![view.base_oid]
-        } else {
-            view.spec.relations.iter().map(|r| r.oid).collect()
-        };
         run(&format!("DROP TABLE IF EXISTS {name}"));
-        run_args("DELETE FROM nabla.views WHERE id = $1", &[view.id.into()]);
-        // Shadow references are taken when the first build commits.
-        if view.spec.is_join() && view.populated {
-            for relid in &relids {
-                shadow::release(*relid);
-            }
-        }
-        for relid in &relids {
-            let used_by_base = read_one::<bool>(
-                "SELECT EXISTS (SELECT 1 FROM nabla.views WHERE base_table = $1::oid::regclass)",
-                &[(*relid as i64).into()],
-            )
-            .unwrap_or(false);
-            if !used_by_base {
-                release_publication(*relid);
-            }
-        }
+        run_args("SELECT nabla.forget_view($1)", &[view.id.into()]);
+        run("SELECT nabla.prune_publication()");
     }
 
     /// Marks the view — and, for join views, every view sharing a shadow
@@ -405,6 +372,11 @@ mod nabla {
     fn refresh(name: &str) {
         let name = require_qualified_name(name);
         let view = load_view(&name);
+        for rel in &view.spec.relations {
+            if regclass_text(rel.oid).is_none() {
+                errors::failed(&name, Some(&format!("base table {} (oid {}) no longer exists", rel.qualified, rel.oid)));
+            }
+        }
         // The slot may have been dropped for lag; recreate it before any write.
         ensure_slot();
         let ids: Vec<String> = if view.spec.is_join() {

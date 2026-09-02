@@ -20,10 +20,10 @@ CLIENT_PID=""
 
 pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; printf '      %s\n' "$2"; FAILED=1; }
-die()  { printf 'FATAL %s\n' "$1"; exit 1; }
+die()  { printf 'FATAL %s\n' "$1"; [ -s /tmp/nabla-last.err ] && printf '      last error: %s\n' "$(tr '\n' ' ' < /tmp/nabla-last.err)"; exit 1; }
 
 # psql wrapper: unaligned, tuples only, stop on error.
-q() { psql -X -q -A -t -v ON_ERROR_STOP=1 -p "$PORT" -d "$DB" -c "$1"; }
+q() { psql -X -q -A -t -v ON_ERROR_STOP=1 -p "$PORT" -d "$DB" -c "$1" 2> >(tee /tmp/nabla-last.err >&2); }
 # Run a statement expected to fail; print its stderr.
 q_err() { psql -X -q -A -t -p "$PORT" -d "$DB" -c "$1" 2>&1 >/dev/null; }
 
@@ -276,9 +276,9 @@ DIFF=$(q "SELECT count(*) FROM ((SELECT \"Id\", \"Amount\" FROM paid_mixed EXCEP
   UNION ALL (SELECT \"Id\", \"Amount\" FROM \"Orders\" WHERE \"Status\" = 'paid' EXCEPT SELECT \"Id\", \"Amount\" FROM paid_mixed)) d")
 assert_eq "quoted mixed-case identifiers" "0|2" "$DIFF|$(q 'SELECT count(*) FROM paid_mixed')"
 assert_eq "catalog records the fully qualified base table" "t" \
-  "$(q "SELECT base_table = '\"Orders\"'::regclass AND spec->>'base_table' = 'public.\"Orders\"' FROM nabla.views WHERE name = 'public.paid_mixed'")"
+  "$(q "SELECT (SELECT vr.relid FROM nabla.view_relations vr WHERE vr.view_id = nabla.views.id) = '\"Orders\"'::regclass AND spec->>'base_table' = 'public.\"Orders\"' FROM nabla.views WHERE name = 'public.paid_mixed'")"
 assert_eq "unqualified name resolved through search_path is stored qualified" "t" \
-  "$(q "SELECT base_table = 'public.orders'::regclass AND spec->>'base_table' = 'public.orders' FROM nabla.views WHERE name = 'public.paid_orders'")"
+  "$(q "SELECT (SELECT vr.relid FROM nabla.view_relations vr WHERE vr.view_id = nabla.views.id) = 'public.orders'::regclass AND spec->>'base_table' = 'public.orders' FROM nabla.views WHERE name = 'public.paid_orders'")"
 
 q "SELECT nabla.create_view('public.paid_aliased', 'SELECT o.id AS order_id, /* keep the amount */ o.amount
    FROM public.orders AS o
@@ -509,7 +509,11 @@ await_ready public.order_lines
 lines_diff() { q "SELECT count(*) FROM ((SELECT order_id, customer, product, total FROM order_lines EXCEPT $LINES_DEF)
   UNION ALL ($LINES_DEF EXCEPT SELECT order_id, customer, product, total FROM order_lines)) d"; }
 shadow_of() { q "SELECT table_name FROM nabla.shadows WHERE relid = '$1'::regclass"; }
-shadow_diff() { q "SELECT count(*) FROM ((SELECT * FROM $(shadow_of "$1") EXCEPT SELECT * FROM $1) UNION ALL (SELECT * FROM $1 EXCEPT SELECT * FROM $(shadow_of "$1"))) d"; }
+shadow_cols_of() { q "SELECT array_to_string(columns, ', ') FROM nabla.shadows WHERE relid = '$1'::regclass"; }
+shadow_diff() { # shadows hold only the columns their views need: compare those
+  local cols; cols=$(shadow_cols_of "$1")
+  q "SELECT count(*) FROM ((SELECT $cols FROM $(shadow_of "$1") EXCEPT SELECT $cols FROM $1) UNION ALL (SELECT $cols FROM $1 EXCEPT SELECT $cols FROM $(shadow_of "$1"))) d"
+}
 assert_eq "join view columns: visible then hidden keys" "order_id,customer,product,total,_nabla_pk1_id,_nabla_pk2_id,_nabla_pk3_id" \
   "$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'order_lines'")"
 q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 2, 3, 'paid'), (3, 1, 4, 'paid'), (2, 3, 1, 'new')" >/dev/null
@@ -833,6 +837,163 @@ assert_eq "the view is failed and no table was left behind" "failed|t|0" \
   "$(q "SELECT status FROM nabla.status('public.bad_init')")|$(q "SELECT to_regclass('public.bad_init') IS NULL")|$(q "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'nabla_init_%'")"
 q "SELECT nabla.drop_view('public.bad_init')" >/dev/null || die "drop_view(bad_init) failed"
 assert_eq "drop_view cleans a failed view" "0" "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.bad_init'")"
+
+# --- 22. schema changes on base tables ------------------------------------------
+echo "== 22. schema changes on base tables"
+vdiff() { # view visible-columns definition
+  q "SELECT count(*) FROM ((SELECT $2 FROM $1 EXCEPT $3) UNION ALL ($3 EXCEPT SELECT $2 FROM $1)) d"
+}
+shadow_cols() { q "SELECT array_to_string(columns, ',') FROM nabla.shadows WHERE relid = '$1'::regclass"; }
+vstatus() { q "SELECT status FROM nabla.status('$1')"; }
+warnings() { grep -c WARNING "$LOG"; }
+wait_status() { # view status timeout_s
+  local i
+  for i in $(seq 1 $(( $3 * 10 ))); do [ "$(vstatus "$1")" = "$2" ] && return 0; sleep 0.1; done
+  return 1
+}
+# Start from a clean shop: no join views over the shop tables.
+q "SELECT nabla.drop_view('public.order_lines')" >/dev/null
+q "SELECT nabla.drop_view('public.revenue_by_region')" >/dev/null
+q "SELECT nabla.drop_view('public.events_view')" >/dev/null
+q "ALTER TABLE shop.orders REPLICA IDENTITY FULL" >/dev/null
+J1_DEF="SELECT o.id AS order_id, c.name AS customer, p.name AS product, o.qty * p.price AS total FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id JOIN shop.products p ON p.id = o.product_id WHERE o.status = 'paid'"
+J2_DEF="SELECT o.id AS order_id, c.region FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id"
+J3_DEF="SELECT o.id AS order_id, c.tier FROM shop.orders o JOIN shop.customers c ON c.id = o.customer_id"
+A1_DEF="SELECT customer_id, count(*) AS n, sum(qty) AS q FROM shop.orders GROUP BY customer_id"
+J1_COLS="order_id, customer, product, total"; J2_COLS="order_id, region"; J3_COLS="order_id, tier"; A1_COLS="customer_id, n, q"
+q "SELECT nabla.create_view('public.j1', \$d\$$J1_DEF\$d\$)" >/dev/null || die "create_view(j1) failed"
+await_ready public.j1
+q "SELECT nabla.create_view('public.j2', \$d\$$J2_DEF\$d\$)" >/dev/null || die "create_view(j2) failed"
+await_ready public.j2
+q "SELECT nabla.create_view('public.a1', \$d\$$A1_DEF\$d\$)" >/dev/null || die "create_view(a1) failed"
+await_ready public.a1
+assert_eq "shadows hold only the primary key and the used columns" "id,name,region|id,customer_id,product_id,qty,status|id,name,price" \
+  "$(shadow_cols shop.customers)|$(shadow_cols shop.orders)|$(shadow_cols shop.products)"
+check_views() { # label
+  wait_view public.j1; wait_view public.j2; wait_view public.a1
+  assert_eq "$1: every live view equals its query" "0|0|0" "$(vdiff j1 "$J1_COLS" "$J1_DEF")|$(vdiff j2 "$J2_COLS" "$J2_DEF")|$(vdiff a1 "$A1_COLS" "$A1_DEF")"
+}
+W0=$(warnings)
+# 1. an unused column is added
+q "ALTER TABLE shop.customers ADD COLUMN email text" >/dev/null
+q "UPDATE shop.customers SET email = 'a@example.com' WHERE id = 1" >/dev/null
+q "INSERT INTO shop.customers (id, name, region, email) VALUES (5, 'Eve', 'west', 'e@example.com')" >/dev/null
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (5, 1, 2, 'paid')" >/dev/null
+check_views "1. ADD COLUMN of an unused column"
+assert_eq "1. views stay live, the shadow ignores the new column, no WARNING" "live|live|id,name,region|$W0" \
+  "$(vstatus public.j1)|$(vstatus public.j2)|$(shadow_cols shop.customers)|$(warnings)"
+# 2. the unused column is dropped; another is added and renamed
+q "ALTER TABLE shop.customers DROP COLUMN email" >/dev/null
+q "ALTER TABLE shop.customers ADD COLUMN nick text" >/dev/null
+q "ALTER TABLE shop.customers RENAME COLUMN nick TO nick2" >/dev/null
+q "UPDATE shop.customers SET nick2 = 'al', name = 'Alice' WHERE id = 1" >/dev/null
+check_views "2. DROP/RENAME of unused columns"
+assert_eq "2. views stay live, no WARNING" "live|live|$W0" "$(vstatus public.j1)|$(vstatus public.j2)|$(warnings)"
+# 3. a column with a default is added and a new view starts using it
+q "ALTER TABLE shop.customers ADD COLUMN tier text DEFAULT 'std'" >/dev/null
+E1=$(q "SELECT epoch FROM nabla.status('public.j1')"); E2=$(q "SELECT epoch FROM nabla.status('public.j2')")
+q "SELECT nabla.create_view('public.j3', \$d\$$J3_DEF\$d\$)" >/dev/null || die "create_view(j3) failed"
+await_ready public.j3
+assert_eq "3. the shared shadow gained the new column, backfilled from the base" "id,name,region,tier|0|std" \
+  "$(shadow_cols shop.customers)|$(q "SELECT count(*) FROM j3 WHERE tier IS NULL")|$(q "SELECT DISTINCT tier FROM j3")"
+assert_eq "3. the old views were never rebuilt" "live|live|$E1|$E2" \
+  "$(vstatus public.j1)|$(vstatus public.j2)|$(q "SELECT epoch FROM nabla.status('public.j1')")|$(q "SELECT epoch FROM nabla.status('public.j2')")"
+S1=$(q "SELECT current_seq FROM nabla.status('public.j1')"); S2=$(q "SELECT current_seq FROM nabla.status('public.j2')")
+q "UPDATE shop.customers SET tier = 'vip' WHERE id = 1" >/dev/null
+wait_view public.j3
+assert_eq "3. a change of the new column reaches only the view that uses it" "0|vip|$S1|$S2" \
+  "$(vdiff j3 "$J3_COLS" "$J3_DEF")|$(q "SELECT DISTINCT tier FROM j3 WHERE order_id IN (SELECT id FROM shop.orders WHERE customer_id = 1)")|$(q "SELECT current_seq FROM nabla.status('public.j1')")|$(q "SELECT current_seq FROM nabla.status('public.j2')")"
+# 4. an update that touches only an unused column
+S1=$(q "SELECT current_seq FROM nabla.status('public.j1')"); S2=$(q "SELECT current_seq FROM nabla.status('public.j2')")
+S3=$(q "SELECT current_seq FROM nabla.status('public.j3')"); SA=$(q "SELECT current_seq FROM nabla.status('public.a1')")
+q "UPDATE shop.customers SET nick2 = 'bobby' WHERE id = 2" >/dev/null
+wait_view public.j1
+assert_eq "4. an update of an unused column produces no delta and no WARNING" "$S1|$S2|$S3|$SA|$W0" \
+  "$(q "SELECT current_seq FROM nabla.status('public.j1')")|$(q "SELECT current_seq FROM nabla.status('public.j2')")|$(q "SELECT current_seq FROM nabla.status('public.j3')")|$(q "SELECT current_seq FROM nabla.status('public.a1')")|$(warnings)"
+# 5. a column used by one of two views sharing the shadow is dropped
+q "ALTER TABLE shop.customers DROP COLUMN region" >/dev/null
+q "UPDATE shop.customers SET name = 'Bobby' WHERE id = 2" >/dev/null
+wait_status public.j2 stale 15 || die "j2 did not go stale: $(vstatus public.j2)"
+assert_contains "5. the view using the dropped column is stale with a precise reason" \
+  'column "region" of shop.customers was dropped, renamed or changed type' "$(q "SELECT stale_reason FROM nabla.status('public.j2')")"
+wait_view public.j1; wait_view public.j3
+assert_eq "5. the other views sharing the shadow stay live and receive deltas" "live|live|0|0|id,name,tier" \
+  "$(vstatus public.j1)|$(vstatus public.j3)|$(vdiff j1 "$J1_COLS" "$J1_DEF")|$(vdiff j3 "$J3_COLS" "$J3_DEF")|$(shadow_cols shop.customers)"
+q "SELECT nabla.refresh('public.j2')" >/dev/null || die "refresh(j2) failed to start"
+ERR=$(q_err "SELECT nabla.await_ready('public.j2', 60000)")
+assert_contains "5. refresh of the stale view fails with PostgreSQL's error" "does not exist" "$ERR"
+assert_eq "5. the failed refresh carries NB006" "NB006" "$(sqlstate_of "SELECT nabla.await_ready('public.j2', 60000)")"
+q "SELECT nabla.drop_view('public.j2')" >/dev/null || die "drop_view(j2) failed"
+assert_eq "5. drop_view cleans the failed view" "0" "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.j2'")"
+# 6. a used column changes type
+q "ALTER TABLE shop.products ALTER COLUMN price TYPE double precision" >/dev/null
+q "UPDATE shop.products SET price = price + 0.5 WHERE id = 1" >/dev/null
+wait_status public.j1 stale 15 || die "j1 did not go stale after the type change: $(vstatus public.j1)"
+assert_contains "6. a type change of a used column marks the views using it stale" \
+  'column "price" of shop.products was dropped, renamed or changed type' "$(q "SELECT stale_reason FROM nabla.status('public.j1')")"
+wait_view public.j3; wait_view public.a1
+assert_eq "6. views not using the column are unaffected" "live|live" "$(vstatus public.j3)|$(vstatus public.a1)"
+q "SELECT nabla.refresh('public.j1')" >/dev/null || die "refresh(j1) failed to start"
+await_ready public.j1
+wait_view public.j1
+assert_eq "6. refresh recovers the view with the new type" "live|0|id,name,price" \
+  "$(vstatus public.j1)|$(vdiff j1 "$J1_COLS" "$J1_DEF")|$(shadow_cols shop.products)"
+# 7. dropping a base table without CASCADE is refused
+ERR=$(q_err "DROP TABLE shop.customers")
+assert_contains "7. DROP TABLE of a base table is refused because nabla tables depend on it" "other objects depend on it" "$ERR"
+assert_contains "7. the error names the dependent view" "j1" "$ERR"
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 2, 3, 'paid')" >/dev/null
+wait_view public.j1; wait_view public.j3; wait_view public.a1
+assert_eq "7. views are still live and maintained" "0|0|0" "$(vdiff j1 "$J1_COLS" "$J1_DEF")|$(vdiff j3 "$J3_COLS" "$J3_DEF")|$(vdiff a1 "$A1_COLS" "$A1_DEF")"
+# 8. dropping a base table with CASCADE cleans everything that depended on it
+W1=$(warnings)
+q "DROP TABLE shop.customers CASCADE" >/dev/null || die "DROP TABLE CASCADE failed"
+assert_eq "8. views over the dropped table and their shadows are gone" "0|0|0|0|0" \
+  "$(q "SELECT count(*) FROM nabla.views WHERE name IN ('public.j1', 'public.j3')")|$(q "SELECT count(*) FROM nabla.view_relations vr WHERE NOT EXISTS (SELECT 1 FROM nabla.views v WHERE v.id = vr.view_id)")|$(q "SELECT count(*) FROM nabla.shadows")|$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'nabla_shadow'")|$(q "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'nabla' AND tablename = 'customers'")"
+assert_eq "8. the view tables are gone from disk" "t|t" "$(q "SELECT to_regclass('public.j1') IS NULL")|$(q "SELECT to_regclass('public.j3') IS NULL")"
+q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (2, 2, 4, 'paid')" >/dev/null
+wait_view public.a1
+assert_eq "8. the single-table view is unaffected, no WARNING, worker alive" "live|0|$W1|1" \
+  "$(vstatus public.a1)|$(vdiff a1 "$A1_COLS" "$A1_DEF")|$(warnings)|$(q "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'nabla worker'")"
+# 9. dropping a view table directly
+q "SELECT nabla.create_view('public.j4', 'SELECT o.id AS order_id, p.name AS product FROM shop.orders o JOIN shop.products p ON p.id = o.product_id')" >/dev/null || die "create_view(j4) failed"
+await_ready public.j4
+assert_eq "9. the new join view created its shadows" "2" "$(q "SELECT count(*) FROM nabla.shadows WHERE refcount = 1")"
+q "DROP TABLE public.j4" >/dev/null || die "DROP TABLE j4 failed"
+assert_eq "9. dropping the view table cleans the catalog and the orphan shadows" "0|0|0" \
+  "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.j4'")|$(q "SELECT count(*) FROM nabla.shadows")|$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'nabla_shadow'")"
+# Replay of the hands-on session that found these bugs.
+q "CREATE TABLE public.play_customers (id int PRIMARY KEY, name text, region text)" >/dev/null
+q "CREATE TABLE public.play_orders (id serial PRIMARY KEY, customer_id int, amount numeric)" >/dev/null
+q "INSERT INTO public.play_customers VALUES (1, 'Alice', 'north'), (2, 'Bob', 'south')" >/dev/null
+q "INSERT INTO public.play_orders (customer_id, amount) VALUES (1, 10), (2, 20)" >/dev/null
+SBR_DEF="SELECT c.region, count(*) AS n, sum(o.amount) AS total FROM public.play_orders o JOIN public.play_customers c ON c.id = o.customer_id GROUP BY c.region"
+q "SELECT nabla.create_view('public.sales_by_region', \$d\$$SBR_DEF\$d\$)" >/dev/null || die "create_view(sales_by_region) failed"
+await_ready public.sales_by_region
+W2=$(warnings)
+q "ALTER TABLE public.play_customers ADD COLUMN email text" >/dev/null
+q "UPDATE public.play_customers SET name = 'Alicia' WHERE id = 1" >/dev/null
+wait_view public.sales_by_region
+assert_eq "replay: ADD COLUMN plus a write keeps the view live and equal, no WARNING" "live|0|$W2" \
+  "$(vstatus public.sales_by_region)|$(vdiff sales_by_region "region, n, total" "$SBR_DEF")|$(warnings)"
+ERR=$(q_err "DROP TABLE public.play_customers")
+assert_contains "replay: DROP TABLE is refused" "other objects depend on it" "$ERR"
+q "DROP TABLE public.play_customers CASCADE" >/dev/null || die "DROP TABLE play_customers CASCADE failed"
+assert_eq "replay: CASCADE leaves no dangling catalog rows or shadows" "0|0|0" \
+  "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.sales_by_region'")|$(q "SELECT count(*) FROM nabla.shadows")|$(q "SELECT count(*) FROM nabla.view_relations vr WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = vr.relid)")"
+assert_contains "replay: drop_view of the vanished view reports it cleanly" 'view "public.sales_by_region" does not exist' "$(q_err "SELECT nabla.drop_view('public.sales_by_region')")"
+q "DROP TABLE public.play_orders" >/dev/null
+# 10. dropping the whole schema
+W3=$(warnings)
+q "DROP SCHEMA shop CASCADE" >/dev/null || die "DROP SCHEMA shop CASCADE failed"
+assert_eq "10. DROP SCHEMA CASCADE leaves no view over shop tables, no shadows, no shop tables in the publication" "0|0|0|0" \
+  "$(q "SELECT count(*) FROM nabla.views WHERE name IN ('public.a1')")|$(q "SELECT count(*) FROM nabla.view_relations vr WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = vr.relid)")|$(q "SELECT count(*) FROM nabla.shadows")|$(q "SELECT count(*) FROM pg_publication_tables WHERE pubname = 'nabla' AND schemaname = 'shop'")"
+sleep 1
+assert_eq "10. worker alive and quiet, no WARNING" "1|$W3" \
+  "$(q "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'nabla worker'")|$(warnings)"
+wait_view public.paid_orders
+assert_eq "10. views over other tables keep working" "0" \
+  "$(q "SELECT count(*) FROM ((SELECT id, k, amount FROM paid_orders EXCEPT SELECT id, k, amount FROM orders WHERE status = 'paid') UNION ALL (SELECT id, k, amount FROM orders WHERE status = 'paid' EXCEPT SELECT id, k, amount FROM paid_orders)) d")"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

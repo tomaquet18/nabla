@@ -85,6 +85,17 @@ pub struct BaseRelation {
     pub pk_columns: Vec<String>,
     /// All column names in attribute order.
     pub columns: Vec<String>,
+    /// Types of `columns` (`format_type` text), parallel to it.
+    #[serde(default)]
+    pub column_types: Vec<String>,
+    /// Columns this view reads from the relation (select list, group keys,
+    /// quals and, for join views, the primary key), in attribute order.
+    #[serde(default)]
+    pub used_columns: Vec<String>,
+    /// Types of `used_columns`, parallel to it; a mismatch with the decoded
+    /// relation marks the view stale.
+    #[serde(default)]
+    pub used_column_types: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -261,6 +272,35 @@ unsafe extern "C-unwind" fn find_foreign_var(node: *mut pg_sys::Node, ctx: *mut 
     pg_sys::expression_tree_walker_impl(node, Some(find_foreign_var), ctx)
 }
 
+struct VarCollect {
+    vars: Vec<(i32, i16)>,
+}
+
+unsafe extern "C-unwind" fn collect_vars(node: *mut pg_sys::Node, ctx: *mut c_void) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    let collect = &mut *(ctx as *mut VarCollect);
+    if (*node).type_ == NodeTag::T_Var {
+        let var = &*(node as *mut pg_sys::Var);
+        if var.varlevelsup == 0 {
+            collect.vars.push((var.varno, var.varattno));
+        }
+        return false;
+    }
+    pg_sys::expression_tree_walker_impl(node, Some(collect_vars), ctx)
+}
+
+/// Every (varno, attno) referenced by `node`.
+unsafe fn referenced_vars(node: *mut pg_sys::Node, out: &mut Vec<(i32, i16)>) {
+    if node.is_null() {
+        return;
+    }
+    let mut collect = VarCollect { vars: Vec::new() };
+    collect_vars(node, &mut collect as *mut VarCollect as *mut c_void);
+    out.extend(collect.vars);
+}
+
 unsafe fn require_base_vars(node: *mut pg_sys::Node, allowed: &[i32]) {
     if node.is_null() {
         return;
@@ -407,7 +447,7 @@ unsafe fn qualified_name(relid: pg_sys::Oid) -> (String, String) {
 
 /// Catalog facts about a base table, read with read-only SPI so the calling
 /// transaction stays free of an xid (create_view creates the slot afterwards).
-fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>, Vec<String>) {
+fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>, Vec<(String, String)>) {
     let qualified = quote_qualified_identifier(nspname, relname);
     let args = [(relid as i64).into()];
     Spi::connect(|client| {
@@ -434,12 +474,12 @@ fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>
         }
         let mut columns = Vec::new();
         for row in client.select(
-            "SELECT attname::text FROM pg_catalog.pg_attribute \
+            "SELECT attname::text, pg_catalog.format_type(atttypid, atttypmod) FROM pg_catalog.pg_attribute \
              WHERE attrelid = $1::oid AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
             None,
             &args,
         )? {
-            columns.push(row.get::<String>(1)?.unwrap_or_default());
+            columns.push((row.get::<String>(1)?.unwrap_or_default(), row.get::<String>(2)?.unwrap_or_default()));
         }
         let mut pk_columns = Vec::new();
         let mut pk_attnums = Vec::new();
@@ -633,7 +673,9 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             if !seen_oids.insert(relid.to_u32()) {
                 reject(format!("table {qualified} is referenced twice; self-joins are not supported"));
             }
-            let (base, pk_attnums, columns) = lookup_base(relid.to_u32(), &nspname, &relname);
+            let (base, pk_attnums, columns_typed) = lookup_base(relid.to_u32(), &nspname, &relname);
+            let columns: Vec<String> = columns_typed.iter().map(|(n, _)| n.clone()).collect();
+            let column_types: Vec<String> = columns_typed.iter().map(|(_, t)| t.clone()).collect();
             if is_join && pk_attnums.is_empty() {
                 reject(format!("{qualified} has no primary key; every table in a join view needs one"));
             }
@@ -646,6 +688,9 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                 qualified,
                 pk_columns: base.pk_columns.clone(),
                 columns,
+                column_types,
+                used_columns: Vec::new(),
+                used_column_types: Vec::new(),
             });
             if i == 0 {
                 first_pk_attnums = pk_attnums;
@@ -684,6 +729,10 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
             Deparser::single(pg_sys::Oid::from(base.oid), &base_relname)
         };
 
+        let mut var_refs: Vec<(i32, i16)> = Vec::new();
+        for q in &quals {
+            referenced_vars(*q, &mut var_refs);
+        }
         let mut predicate_parts = Vec::new();
         let qual_place = if is_join { "the WHERE or ON clause" } else { "the WHERE clause" };
         for q in &quals {
@@ -717,6 +766,32 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                 reject(format!("output column names must be unique; add AS aliases (duplicate: \"{}\")", t.alias));
             }
             require_base_vars(t.node, &allowed);
+        }
+
+        for t in &visible {
+            referenced_vars(t.node, &mut var_refs);
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            let rel = &mut relations[i];
+            let mut used: HashSet<String> = HashSet::new();
+            for (varno, attno) in &var_refs {
+                if *varno != entry.rt_index {
+                    continue;
+                }
+                if *attno <= 0 {
+                    reject("whole-row references are not supported");
+                }
+                used.insert(text(pg_sys::get_attname((*entry.rte).relid, *attno, false)));
+            }
+            if is_join {
+                used.extend(rel.pk_columns.iter().cloned());
+            }
+            for (name, ty) in rel.columns.iter().zip(rel.column_types.iter()) {
+                if used.contains(name) {
+                    rel.used_columns.push(name.clone());
+                    rel.used_column_types.push(ty.clone());
+                }
+            }
         }
 
         let has_aggs = (*query).hasAggs;

@@ -9,10 +9,17 @@
 //!
 //! Skip rule: an object (view or shadow) with `frontier >= T.end_lsn` has
 //! already absorbed T and is skipped. This is also what lets a new view share
-//! an existing shadow without re-snapshotting it: the view is populated from
-//! the live tables at F_new and skips everything at or below F_new, while an
+//! an existing shadow without re-snapshotting it: the view is populated at a
+//! consistent point F_new and skips everything at or below F_new, while an
 //! older shadow at F_s < F_new keeps absorbing (F_s, F_new] on its own; from
 //! F_new on both absorb the same transactions.
+//!
+//! Schema changes: every column is addressed by name from the pgoutput
+//! Relation message. Columns a view or shadow does not use are ignored, so
+//! adding, dropping or renaming unrelated columns changes nothing. A needed
+//! column that disappears or changes type marks exactly the views that use
+//! it stale, with a reason naming the column; a shadow drops that column from
+//! its active set and keeps serving the other views.
 //!
 //! Failure isolation: every view's planning step and its final write step
 //! run in subtransactions. A failing view is rolled back alone, its failure
@@ -44,6 +51,8 @@ const PUBLICATION: &str = "nabla";
 /// across the limit (it is checked between WAL records), so a large transaction
 /// simply returns more rows than the limit.
 const PEEK_LIMIT: i64 = 1000;
+/// pgoutput tag of a complete old tuple (REPLICA IDENTITY FULL).
+const FULL_OLD_TUPLE: u8 = 79; // b'O'
 
 pub fn register() {
     if !unsafe { pg_sys::process_shared_preload_libraries_in_progress } {
@@ -63,9 +72,13 @@ pub fn register() {
 }
 
 fn describe(e: &CaughtError) -> String {
-    match e {
-        CaughtError::PostgresError(r) | CaughtError::ErrorReport(r) => r.message().to_string(),
-        CaughtError::RustPanic { ereport, .. } => ereport.message().to_string(),
+    let report = match e {
+        CaughtError::PostgresError(r) | CaughtError::ErrorReport(r) => r,
+        CaughtError::RustPanic { ereport, .. } => ereport,
+    };
+    match report.detail() {
+        Some(detail) => format!("{} ({})", report.message(), detail.replace('\n', " ")),
+        None => report.message().to_string(),
     }
 }
 
@@ -151,7 +164,6 @@ fn select_two<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
 struct LiveView {
     id: i32,
     name: String,
-    base_oid: u32,
     spec: ViewSpec,
     frontier: u64,
     last_seq: i64,
@@ -169,17 +181,48 @@ struct LiveView {
 impl LiveView {
     /// Position of `relid` in the view's relation list, if the view uses it.
     fn relation_index(&self, relid: u32) -> Option<usize> {
-        if self.spec.is_join() {
-            self.spec.relations.iter().position(|r| r.oid == relid)
-        } else if self.base_oid == relid {
-            Some(0)
-        } else {
-            None
+        self.spec.relations.iter().position(|r| r.oid == relid)
+    }
+
+    /// True when `old` and `new` differ in at least one column of `relid`
+    /// this view uses. An unchanged-TOAST marker counts as equal. Without a
+    /// full old row the answer is conservatively true.
+    fn touches_used_columns(&self, relid: u32, rel: &Relation, old: Option<&Tuple>, new: &Tuple) -> bool {
+        let Some(index) = self.relation_index(relid) else {
+            return true;
+        };
+        let Some(old) = old else {
+            return true;
+        };
+        for name in &self.spec.relations[index].used_columns {
+            let Some(i) = rel.columns.iter().position(|c| &c.name == name) else {
+                return true;
+            };
+            match (old.get(i), new.get(i)) {
+                (_, Some(ColumnValue::Unchanged)) => {}
+                (Some(o), Some(n)) if o == n => {}
+                _ => return true,
+            }
         }
+        false
     }
 
     fn active_for(&self, relid: u32, end_lsn: u64) -> bool {
         self.failed.is_none() && self.stale.is_none() && end_lsn > self.frontier && self.relation_index(relid).is_some()
+    }
+
+    /// The first column of `relid` the view uses that the decoded relation
+    /// no longer provides with the expected type.
+    fn drift(&self, relid: u32, rel: &Relation) -> Option<String> {
+        let index = self.relation_index(relid)?;
+        let base = &self.spec.relations[index];
+        for (name, ty) in base.used_columns.iter().zip(base.used_column_types.iter()) {
+            let ok = rel.columns.iter().any(|c| &c.name == name && c.type_name.as_deref() == Some(ty.as_str()));
+            if !ok {
+                return Some(format!("column \"{name}\" of {} was dropped, renamed or changed type", base.qualified));
+            }
+        }
+        None
     }
 }
 
@@ -187,20 +230,24 @@ struct Shadow {
     relid: u32,
     table: String,
     frontier: u64,
-    /// Maintenance failed (schema drift): dependents are stale, refresh rebuilds it.
+    /// Maintenance failed; dependents are stale, refresh rebuilds it.
     failed: bool,
+    /// Active column set (primary key plus columns some view uses) and types.
+    columns: Vec<String>,
+    column_types: Vec<String>,
+    pk_columns: Vec<String>,
 }
 
 fn load_live_views() -> Result<Vec<LiveView>, String> {
     Spi::connect(|client| {
         let mut views = Vec::new();
         for r in client.select(
-            "SELECT id, name, base_table::oid::int8, spec, frontier_lsn::text, last_seq, definition, apply_failures \
+            "SELECT id, name, spec, frontier_lsn::text, last_seq, definition, apply_failures \
              FROM nabla.views WHERE status = 'live' ORDER BY id",
             None,
             &[],
         )? {
-            let spec: JsonB = r.get::<JsonB>(4)?.expect("spec");
+            let spec: JsonB = r.get::<JsonB>(3)?.expect("spec");
             let spec: ViewSpec = match serde_json::from_value(spec.0) {
                 Ok(s) => s,
                 Err(e) => {
@@ -208,17 +255,16 @@ fn load_live_views() -> Result<Vec<LiveView>, String> {
                     continue;
                 }
             };
-            let last_seq = r.get::<i64>(6)?.expect("last_seq");
+            let last_seq = r.get::<i64>(5)?.expect("last_seq");
             views.push(LiveView {
                 id: r.get::<i32>(1)?.expect("id"),
                 name: r.get::<String>(2)?.expect("name"),
-                base_oid: r.get::<i64>(3)?.expect("base") as u32,
                 spec,
-                frontier: lsn::parse(&r.get::<String>(5)?.expect("frontier")).unwrap_or(0),
+                frontier: lsn::parse(&r.get::<String>(4)?.expect("frontier")).unwrap_or(0),
                 last_seq,
                 start_seq: last_seq,
-                definition: r.get::<String>(7)?.expect("definition"),
-                apply_failures: r.get::<i32>(8)?.unwrap_or(0),
+                definition: r.get::<String>(6)?.expect("definition"),
+                apply_failures: r.get::<i32>(7)?.unwrap_or(0),
                 touched: false,
                 ops: Vec::new(),
                 failed: None,
@@ -234,7 +280,8 @@ fn load_shadows() -> Result<HashMap<u32, Shadow>, String> {
     Spi::connect(|client| {
         let mut shadows = HashMap::new();
         for r in client.select(
-            "SELECT relid::int8, table_name, frontier_lsn::text, stale_reason IS NOT NULL FROM nabla.shadows",
+            "SELECT relid::int8, table_name, frontier_lsn::text, failed, columns, column_types, pk_columns \
+             FROM nabla.shadows",
             None,
             &[],
         )? {
@@ -246,6 +293,9 @@ fn load_shadows() -> Result<HashMap<u32, Shadow>, String> {
                     table: r.get::<String>(2)?.expect("table"),
                     frontier: lsn::parse(&r.get::<String>(3)?.expect("frontier")).unwrap_or(0),
                     failed: r.get::<bool>(4)?.unwrap_or(false),
+                    columns: r.get::<Vec<String>>(5)?.unwrap_or_default(),
+                    column_types: r.get::<Vec<String>>(6)?.unwrap_or_default(),
+                    pk_columns: r.get::<Vec<String>>(7)?.unwrap_or_default(),
                 },
             );
         }
@@ -279,6 +329,9 @@ fn change_relids(change: &Change) -> Vec<u32> {
 /// Primary key values of a change, taken from the old key tuple when pgoutput
 /// sent one, otherwise from the new tuple (the key did not change).
 fn key_values(pk_columns: &[String], rel: &Relation, old: Option<&Tuple>, new: Option<&Tuple>) -> Result<Vec<(usize, String)>, String> {
+    if pk_columns.is_empty() {
+        return Err("no primary key columns recorded for the shadow".to_string());
+    }
     let mut out = Vec::new();
     for pk in pk_columns {
         let idx = rel.columns.iter().position(|c| &c.name == pk).ok_or_else(|| format!("primary key column {pk} is missing from the decoded row"))?;
@@ -301,15 +354,28 @@ fn key_predicate(rel: &Relation, keys: &[(usize, String)], first_param: usize) -
         conds.push(format!("{} = ${}::{}", quote_identifier(&col.name), first_param + n, ty));
         values.push(Some(value.clone()));
     }
+    if conds.is_empty() {
+        return Err("empty key predicate".to_string());
+    }
     Ok((conds.join(" AND "), values))
 }
 
+/// Indexes (in the decoded relation) of the shadow's active columns.
+fn shadow_column_indexes(shadow: &Shadow, rel: &Relation) -> Vec<usize> {
+    shadow
+        .columns
+        .iter()
+        .filter_map(|name| rel.columns.iter().position(|c| &c.name == name))
+        .collect()
+}
+
 /// The full old row of a change, read from the shadow by primary key, in the
-/// decoded relation's column order.
-fn shadow_old_row(shadow: &Shadow, pk_columns: &[String], rel: &Relation, old: Option<&Tuple>, new: Option<&Tuple>) -> Result<Tuple, String> {
-    let keys = key_values(pk_columns, rel, old, new)?;
+/// decoded relation's column order (NULL for columns the shadow does not hold).
+fn shadow_old_row(shadow: &Shadow, rel: &Relation, old: Option<&Tuple>, new: Option<&Tuple>) -> Result<Tuple, String> {
+    let keys = key_values(&shadow.pk_columns, rel, old, new)?;
     let (conds, values) = key_predicate(rel, &keys, 1)?;
-    let cols: Vec<String> = rel.columns.iter().map(|c| format!("{}::text", quote_identifier(&c.name))).collect();
+    let indexes = shadow_column_indexes(shadow, rel);
+    let cols: Vec<String> = indexes.iter().map(|i| format!("{}::text", quote_identifier(&rel.columns[*i].name))).collect();
     let sql = format!("SELECT {} FROM {} WHERE {conds}", cols.join(", "), shadow.table);
     let args: Vec<DatumWithOid> = values.into_iter().map(|v| v.into()).collect();
     let row = Spi::connect(|client| {
@@ -318,12 +384,12 @@ fn shadow_old_row(shadow: &Shadow, pk_columns: &[String], rel: &Relation, old: O
             return Ok(None);
         }
         let table = table.first();
-        let mut tuple = Vec::with_capacity(rel.columns.len());
-        for i in 1..=rel.columns.len() {
-            tuple.push(match table.get::<String>(i)? {
+        let mut tuple = vec![ColumnValue::Null; rel.columns.len()];
+        for (n, idx) in indexes.iter().enumerate() {
+            tuple[*idx] = match table.get::<String>(n + 1)? {
                 Some(s) => ColumnValue::Text(s),
                 None => ColumnValue::Null,
-            });
+            };
         }
         Ok(Some(tuple))
     })
@@ -331,25 +397,36 @@ fn shadow_old_row(shadow: &Shadow, pk_columns: &[String], rel: &Relation, old: O
     row.ok_or_else(|| format!("row not found in shadow {} (shadow out of sync with the base table)", shadow.table))
 }
 
-/// Apply a change to the shadow: insert, delete by key, or delete + insert.
-fn shadow_apply(shadow: &Shadow, pk_columns: &[String], rel: &Relation, change: &Change, old_full: Option<&Tuple>, new_full: Option<&Tuple>) -> Result<(), String> {
+/// Apply a change to the shadow: insert, delete by key, or delete + insert,
+/// touching only the shadow's active columns (by name).
+fn shadow_apply(shadow: &Shadow, rel: &Relation, change: &Change, old_full: Option<&Tuple>, new_full: Option<&Tuple>) -> Result<(), String> {
     let delete = |old: Option<&Tuple>, new: Option<&Tuple>| -> Result<(), String> {
-        let keys = key_values(pk_columns, rel, old, new)?;
+        let keys = key_values(&shadow.pk_columns, rel, old, new)?;
         let (conds, values) = key_predicate(rel, &keys, 1)?;
         let args: Vec<DatumWithOid> = values.into_iter().map(|v| v.into()).collect();
         Spi::run_with_args(&format!("DELETE FROM {} WHERE {conds}", shadow.table), &args).map_err(spi_err)
     };
     let insert = |row: &Tuple| -> Result<(), String> {
+        let indexes = shadow_column_indexes(shadow, rel);
+        if indexes.is_empty() {
+            return Err("the shadow has no active column present in the decoded row".to_string());
+        }
         let mut cols = Vec::new();
         let mut casts = Vec::new();
-        for (i, c) in rel.columns.iter().enumerate() {
+        let mut args: Vec<DatumWithOid> = Vec::new();
+        for (n, idx) in indexes.iter().enumerate() {
+            let c = &rel.columns[*idx];
             let ty = c.type_name.as_deref().ok_or("type not resolved")?;
             cols.push(quote_identifier(&c.name));
-            casts.push(format!("${}::{}", i + 1, ty));
+            casts.push(format!("${}::{}", n + 1, ty));
+            args.push(match &row[*idx] {
+                ColumnValue::Text(s) => Some(s.clone()).into(),
+                _ => Option::<String>::None.into(),
+            });
         }
         Spi::run_with_args(
             &format!("INSERT INTO {} ({}) VALUES ({})", shadow.table, cols.join(", "), casts.join(", ")),
-            &apply::row_args(row),
+            &args,
         )
         .map_err(spi_err)
     };
@@ -362,6 +439,50 @@ fn shadow_apply(shadow: &Shadow, pk_columns: &[String], rel: &Relation, change: 
         }
         Change::Truncate { .. } => Ok(()),
     }
+}
+
+/// Compare the decoded relation with the shadow's active columns. Returns the
+/// columns that disappeared or changed type. Those are removed from the
+/// active set unless a primary key column is among them, which makes the
+/// shadow unmaintainable.
+fn shadow_drift(shadow: &mut Shadow, rel: &Relation, qualified: &str) -> Result<Vec<String>, String> {
+    let mut drifted = Vec::new();
+    for (name, ty) in shadow.columns.iter().zip(shadow.column_types.iter()) {
+        let ok = rel.columns.iter().any(|c| &c.name == name && c.type_name.as_deref() == Some(ty.as_str()));
+        if !ok {
+            drifted.push(name.clone());
+        }
+    }
+    if drifted.is_empty() {
+        return Ok(drifted);
+    }
+    let reason = drifted
+        .iter()
+        .map(|c| format!("column \"{c}\" of {qualified} was dropped, renamed or changed type"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if drifted.iter().any(|c| shadow.pk_columns.contains(c)) {
+        record_shadow_failure(shadow, &reason)?;
+        return Ok(drifted);
+    }
+    let keep: Vec<(String, String)> = shadow
+        .columns
+        .iter()
+        .zip(shadow.column_types.iter())
+        .filter(|(c, _)| !drifted.contains(c))
+        .map(|(c, t)| (c.clone(), t.clone()))
+        .collect();
+    let (names, types): (Vec<String>, Vec<String>) = keep.into_iter().unzip();
+    shadow.columns = names.clone();
+    shadow.column_types = types.clone();
+    let args: [DatumWithOid; 4] = [(shadow.relid as i64).into(), names.into(), types.into(), reason.as_str().into()];
+    Spi::run_with_args(
+        "UPDATE nabla.shadows SET columns = $2, column_types = $3, stale_reason = $4 WHERE relid = $1::oid",
+        &args,
+    )
+    .map_err(spi_err)?;
+    pgrx::warning!("nabla worker: shadow {} no longer carries: {reason}", shadow.table);
+    Ok(drifted)
 }
 
 // --- catalog bookkeeping -------------------------------------------------------
@@ -455,7 +576,8 @@ fn record_shadow_failure(shadow: &mut Shadow, message: &str) -> Result<(), Strin
     let reason = format!("shadow {} could not be maintained: {message}", shadow.table);
     pgrx::warning!("nabla worker: {reason}");
     let args: [DatumWithOid; 2] = [(shadow.relid as i64).into(), reason.as_str().into()];
-    Spi::run_with_args("UPDATE nabla.shadows SET stale_reason = $2 WHERE relid = $1::oid", &args).map_err(spi_err)
+    Spi::run_with_args("UPDATE nabla.shadows SET stale_reason = $2, failed = true WHERE relid = $1::oid", &args)
+        .map_err(spi_err)
 }
 
 // --- planning one change for one view ----------------------------------------------
@@ -492,6 +614,9 @@ fn plan_change(view: &mut LiveView, rel: &Relation, change: &Change, old_full: O
                         rel.name
                     ))));
                 };
+                if !view.touches_used_columns(rel.id, rel, Some(old), new) {
+                    return Ok(Planned::Ops(ops)); // only unused columns changed
+                }
                 ops.extend(apply::plan_join(&target, index, rel, old, -1)?);
                 let new = match apply::resolve_unchanged(rel, new, Some(old), mentions) {
                     Ok(t) => t,
@@ -519,6 +644,11 @@ fn plan_change(view: &mut LiveView, rel: &Relation, change: &Change, old_full: O
                 Planned::Stale(s) => return Ok(Planned::Stale(s)),
             },
             Change::Update { old, new, .. } => {
+                if let Some((kind, full)) = old {
+                    if *kind == FULL_OLD_TUPLE && !view.touches_used_columns(rel.id, rel, Some(full), new) {
+                        return Ok(Planned::Ops(ops)); // only unused columns changed
+                    }
+                }
                 // Without an old tuple the key is unchanged: take it from the new row.
                 let (key_kind, old_tuple) = match old {
                     Some((k, t)) => (*k, t.clone()),
@@ -561,6 +691,13 @@ struct ApplyStats {
 fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<ApplyStats, String> {
     Spi::run("SET LOCAL nabla.internal_write = on").map_err(spi_err)?;
     let mut views = load_live_views()?;
+    // Lock order view table -> shadows -> catalog, the same order a DROP of
+    // a view table takes (ACCESS EXCLUSIVE on the table, then its sql_drop
+    // trigger touches shadows and catalog rows). Taking the view locks first
+    // keeps the worker and concurrent DDL from deadlocking.
+    for view in &views {
+        Spi::run(&format!("LOCK TABLE {} IN ROW EXCLUSIVE MODE", view.name)).map_err(spi_err)?;
+    }
     let mut shadows = load_shadows()?;
 
     let mut relations: HashMap<u32, Relation> = HashMap::new();
@@ -576,11 +713,25 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
             relations.insert(relid, rel.clone());
         }
     }
-    // Primary keys of shadowed tables, from any join view's spec.
-    let mut pk_of: HashMap<u32, Vec<String>> = HashMap::new();
-    for v in &views {
-        for r in &v.spec.relations {
-            pk_of.entry(r.oid).or_insert_with(|| r.pk_columns.clone());
+
+    // Schema drift, once per relation: views lose exactly the columns they
+    // use; shadows drop the columns from their active set (or fail on a key).
+    for (relid, rel) in &relations {
+        let qualified = views
+            .iter()
+            .find_map(|v| v.spec.relations.iter().find(|r| r.oid == *relid).map(|r| r.qualified.clone()))
+            .unwrap_or_else(|| format!("{}.{}", rel.namespace, rel.name));
+        if let Some(shadow) = shadows.get_mut(relid) {
+            if !shadow.failed && tx.end_lsn > shadow.frontier {
+                shadow_drift(shadow, rel, &qualified)?;
+            }
+        }
+        for view in views.iter_mut() {
+            if view.stale.is_none() && tx.end_lsn > view.frontier {
+                if let Some(reason) = view.drift(*relid, rel) {
+                    view.stale = Some(reason);
+                }
+            }
         }
     }
 
@@ -601,8 +752,7 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
                     _ => (None, None),
                 };
                 let shadow = &shadows[&relid];
-                let pk = pk_of.get(&relid).cloned().unwrap_or_default();
-                match in_subtransaction(AssertUnwindSafe(|| shadow_old_row(shadow, &pk, rel, old, new))) {
+                match in_subtransaction(AssertUnwindSafe(|| shadow_old_row(shadow, rel, old, new))) {
                     Ok(row) => old_full = Some(row),
                     Err(e) => shadow_error = Some(e),
                 }
@@ -640,9 +790,8 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
                     Err("unchanged TOAST value could not be recovered from the shadow".to_string())
                 } else {
                     let shadow = &shadows[&relid];
-                    let pk = pk_of.get(&relid).cloned().unwrap_or_default();
                     let (old_ref, new_ref) = (old_full.as_ref(), new_full.as_ref());
-                    in_subtransaction(AssertUnwindSafe(|| shadow_apply(shadow, &pk, rel, change, old_ref, new_ref)))
+                    in_subtransaction(AssertUnwindSafe(|| shadow_apply(shadow, rel, change, old_ref, new_ref)))
                 };
                 if let Err(message) = outcome {
                     let shadow = shadows.get_mut(&relid).expect("shadow present");
@@ -849,7 +998,7 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
             )
             .map_err(spi_err)?;
             Spi::run_with_args(
-                "UPDATE nabla.shadows SET frontier_lsn = $1::pg_lsn WHERE stale_reason IS NULL AND frontier_lsn < $1::pg_lsn",
+                "UPDATE nabla.shadows SET frontier_lsn = $1::pg_lsn WHERE NOT failed AND frontier_lsn < $1::pg_lsn",
                 &args,
             )
             .map_err(spi_err)?;

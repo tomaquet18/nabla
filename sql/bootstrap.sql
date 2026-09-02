@@ -8,7 +8,6 @@ CREATE SCHEMA IF NOT EXISTS nabla_shadow;
 CREATE TABLE nabla.views (
   id            serial PRIMARY KEY,
   name          text NOT NULL UNIQUE,           -- schema-qualified name of the view table
-  base_table    regclass NOT NULL,
   definition    text NOT NULL,
   shape         text NOT NULL CHECK (shape IN ('projection', 'aggregate')),
   spec          jsonb NOT NULL,                  -- parsed structure, see src/definition.rs
@@ -44,6 +43,10 @@ CREATE TABLE nabla.shadows (
   table_name    text NOT NULL,                  -- nabla_shadow.t<oid>
   frontier_lsn  pg_lsn NOT NULL,
   refcount      int NOT NULL,                   -- join views using it
+  columns       text[] NOT NULL DEFAULT '{}',   -- active column set: primary key + columns some view uses
+  pk_columns    text[] NOT NULL DEFAULT '{}',
+  column_types  text[] NOT NULL DEFAULT '{}',   -- format_type() text, parallel to columns
+  failed        bool NOT NULL DEFAULT false,    -- maintenance stopped; refresh rebuilds
   stale_reason  text,                           -- set when maintenance failed; rebuilt by refresh
   created_at    timestamptz NOT NULL DEFAULT now()
 );
@@ -79,3 +82,97 @@ BEGIN
   RETURN NEW;
 END
 $$;
+
+-- Forget a view: release its shadow references (taken when its first build
+-- committed), drop shadows nobody uses any more, and remove the catalog row.
+-- Idempotent; safe when the tables are already gone.
+CREATE FUNCTION nabla.forget_view(view_id int) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  v record;
+  r record;
+  s record;
+BEGIN
+  SELECT id, name, populated_at, jsonb_array_length(spec->'relations') > 1 AS is_join
+    INTO v FROM nabla.views WHERE id = view_id;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+  IF v.is_join AND v.populated_at IS NOT NULL THEN
+    FOR r IN SELECT relid FROM nabla.view_relations WHERE view_relations.view_id = v.id LOOP
+      UPDATE nabla.shadows SET refcount = refcount - 1 WHERE relid = r.relid;
+      FOR s IN SELECT table_name FROM nabla.shadows WHERE relid = r.relid AND refcount <= 0 LOOP
+        EXECUTE 'DROP TABLE IF EXISTS ' || s.table_name;
+        DELETE FROM nabla.shadows WHERE table_name = s.table_name;
+      END LOOP;
+    END LOOP;
+  END IF;
+  DELETE FROM nabla.views WHERE id = v.id;
+END
+$$;
+
+-- Remove from the publication every table no view and no shadow needs.
+CREATE FUNCTION nabla.prune_publication() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  t record;
+BEGIN
+  -- Runs inside the sql_drop trigger too: ALTER PUBLICATION ... DROP TABLE
+  -- itself drops a publication-relation object, so re-check membership on
+  -- every iteration and ignore a table another invocation already removed.
+  FOR t IN
+    SELECT pt.schemaname, pt.tablename
+    FROM pg_catalog.pg_publication_tables pt
+    WHERE pt.pubname = 'nabla'
+      AND NOT EXISTS (
+        SELECT 1 FROM nabla.view_relations vr
+        JOIN pg_catalog.pg_class c ON c.oid = vr.relid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = pt.schemaname AND c.relname = pt.tablename)
+      AND NOT EXISTS (
+        SELECT 1 FROM nabla.shadows s
+        JOIN pg_catalog.pg_class c ON c.oid = s.relid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = pt.schemaname AND c.relname = pt.tablename)
+  LOOP
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_publication_tables pt
+               WHERE pt.pubname = 'nabla' AND pt.schemaname = t.schemaname AND pt.tablename = t.tablename) THEN
+      BEGIN
+        EXECUTE format('ALTER PUBLICATION nabla DROP TABLE %I.%I', t.schemaname, t.tablename);
+      EXCEPTION WHEN undefined_object THEN
+        NULL;
+      END;
+    END IF;
+  END LOOP;
+END
+$$;
+
+-- Keep the catalog consistent with whatever DROP removed: a view table
+-- (dropped directly or by CASCADE), a shadow table, or a base table. View and
+-- shadow tables depend on their base tables in pg_depend, so DROP TABLE base
+-- requires CASCADE and takes them along; this trigger then forgets them.
+-- Only the names carried by pg_event_trigger_dropped_objects() are used.
+CREATE FUNCTION nabla.on_sql_drop() RETURNS event_trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  obj record;
+  v record;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects() WHERE object_type = 'table') THEN
+    RETURN;
+  END IF;
+  FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects() WHERE object_type = 'table' LOOP
+    FOR v IN SELECT id FROM nabla.views WHERE name = obj.schema_name || '.' || obj.object_name LOOP
+      PERFORM nabla.forget_view(v.id);
+    END LOOP;
+    DELETE FROM nabla.shadows WHERE table_name = obj.schema_name || '.' || obj.object_name;
+    FOR v IN SELECT DISTINCT view_id AS id FROM nabla.view_relations WHERE relid = obj.objid LOOP
+      PERFORM nabla.forget_view(v.id);
+    END LOOP;
+    DELETE FROM nabla.shadows WHERE relid = obj.objid;
+  END LOOP;
+  PERFORM nabla.prune_publication();
+END
+$$;
+
+CREATE EVENT TRIGGER nabla_sql_drop ON sql_drop EXECUTE FUNCTION nabla.on_sql_drop();

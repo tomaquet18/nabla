@@ -229,6 +229,37 @@ itself enters the join as a one-row VALUES built from the decoded row.
 Not yet: outer joins, self-joins, column pruning of views, shadow column
 pruning.
 
+## Schema changes on base tables
+
+Every column is addressed by name from the logical decoding stream, so DDL
+that does not touch a column a view uses is tolerated silently: adding,
+dropping or renaming unused columns, and updates that change only unused
+columns (no delta is produced). Shadows hold only the primary key plus the
+columns the views sharing them use (`nabla.shadows.columns`); a new view
+that needs more columns extends the shadow in place, backfilled from the
+base table under the population snapshot (columns are never removed when a
+view is dropped).
+
+Dropping, renaming or changing the type of a column a view uses marks
+exactly the views that use it `stale` with the reason
+`column "x" of <table> was dropped, renamed or changed type`; a shadow
+drops that column from its active set and keeps serving the other views.
+`refresh` re-validates the stored definition against the current schema:
+if it still resolves (a type change), the view and its shadows are rebuilt
+with the new types and recover; if not (a dropped or renamed column),
+`await_ready` raises `NB006` with PostgreSQL's error and the view stays
+`failed` until it is dropped or the schema is restored.
+
+View tables and shadow tables depend on their base tables in `pg_depend`,
+like SQL views: `DROP TABLE base` fails listing the dependent nabla tables
+unless `CASCADE`, which drops them. An event trigger on `sql_drop` keeps the
+catalog consistent whenever a view table, a shadow table or a base table is
+dropped (directly, by CASCADE, or with `DROP SCHEMA ... CASCADE`): catalog
+rows go, shadow references are released, orphaned shadows are dropped and
+tables nobody needs leave the publication. Renaming a base table or moving
+it to another schema keeps maintenance running (oids do not change);
+`refresh` fails with `NB006` if the stored definition no longer resolves.
+
 ## Subscribing from a client
 
 The reference implementation is `clients/rust/nabla-client` (library plus
