@@ -3,11 +3,19 @@
 //! `create_view` and `refresh` only record intent and return immediately; the
 //! worker builds the tables under a consistent snapshot (see populate.rs).
 //! Status vocabulary: `initializing`, `refreshing`, `live`, `stale`, `failed`.
+//!
+//! Names are resolved the way PostgreSQL resolves relation names: an
+//! unqualified name is created in the search_path's creation namespace and
+//! looked up through the search_path; identifiers keep PostgreSQL's
+//! case-folding (unquoted lowercased, quoted verbatim). The canonical stored
+//! name is the schema-qualified form quoted only where needed, and the user
+//! object is a plain VIEW over the storage table `nabla_store.v<id>`.
 
 use pgrx::datum::{DatumWithOid, JsonB};
 use pgrx::prelude::*;
-use pgrx::spi::quote_identifier;
+use pgrx::spi::{quote_identifier, quote_qualified_identifier};
 use std::collections::BTreeSet;
+use std::ffi::{c_char, CStr, CString};
 use std::time::{Duration, Instant};
 
 use crate::definition::{self, Shape, ViewSpec};
@@ -17,6 +25,12 @@ use crate::lsn;
 
 const SLOT: &str = "nabla";
 const PUBLICATION: &str = "nabla";
+/// RVR_MISSING_OK from catalog/namespace.h (not re-exported at the pg_sys root).
+const RVR_MISSING_OK: u32 = 1;
+
+pub fn storage_name(view_id: i32) -> String {
+    format!("nabla_store.v{view_id}")
+}
 
 fn spi_fail(e: pgrx::spi::Error) -> ! {
     errors::raise(PgSqlErrorCode::ERRCODE_INTERNAL_ERROR, format!("nabla: {e}"), None)
@@ -59,21 +73,94 @@ fn read_ids(sql: &str, args: &[DatumWithOid]) -> Vec<i64> {
     .unwrap_or_else(|e| spi_fail(e))
 }
 
-fn require_qualified_name(name: &str) -> String {
-    let name = name.trim().to_lowercase();
-    let ok = name.split('.').count() == 2
-        && name.split('.').all(|part| {
-            !part.is_empty()
-                && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !part.starts_with(|c: char| c.is_ascii_digit())
-        });
-    if !ok {
-        errors::invalid(
-            format!("nabla: view name \"{name}\" must be schema-qualified (schema.name)"),
-            Some("Example: nabla.create_view('public.paid_orders', ...)"),
-        );
+unsafe fn text(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
     }
-    name
+}
+
+// --- name resolution -------------------------------------------------------------
+
+/// A parsed view name: PostgreSQL's own parser (case folding, quoting) plus
+/// the RangeVar it produced, for namespace resolution.
+struct ParsedName {
+    schema: Option<String>,
+    rel: String,
+    range_var: *mut pg_sys::RangeVar,
+}
+
+fn parse_name(name: &str) -> ParsedName {
+    let c = CString::new(name).unwrap_or_else(|_| errors::invalid("nabla: view name contains a NUL byte", None));
+    // SAFETY: parser entry points on a NUL-terminated string; errors raise.
+    unsafe {
+        let list = pg_sys::stringToQualifiedNameList(c.as_ptr(), std::ptr::null_mut());
+        let rv = pg_sys::makeRangeVarFromNameList(list);
+        if !(*rv).catalogname.is_null() {
+            errors::invalid(
+                format!("nabla: view name \"{name}\" must have at most two parts (schema.name)"),
+                None,
+            );
+        }
+        let schema = if (*rv).schemaname.is_null() { None } else { Some(text((*rv).schemaname)) };
+        ParsedName { schema, rel: text((*rv).relname), range_var: rv }
+    }
+}
+
+/// The canonical name `create_view` gives a view under the current
+/// search_path: the explicit schema, or the creation namespace (like CREATE
+/// TABLE), quoted only where needed.
+fn creation_name(parsed: &ParsedName) -> String {
+    let schema = match &parsed.schema {
+        Some(s) => s.clone(),
+        None => unsafe {
+            let nsp = pg_sys::RangeVarGetCreationNamespace(parsed.range_var);
+            text(pg_sys::get_namespace_name(nsp))
+        },
+    };
+    quote_qualified_identifier(&schema, &parsed.rel)
+}
+
+/// The oid the name resolves to through the search_path, if any relation is
+/// visible under it.
+fn visible_relid(parsed: &ParsedName) -> Option<u32> {
+    let oid = unsafe {
+        pg_sys::RangeVarGetRelidExtended(
+            parsed.range_var,
+            pg_sys::NoLock as pg_sys::LOCKMODE,
+            RVR_MISSING_OK,
+            None,
+            std::ptr::null_mut(),
+        )
+    };
+    if oid == pg_sys::InvalidOid {
+        None
+    } else {
+        Some(oid.to_u32())
+    }
+}
+
+fn not_found(name: &str) -> ! {
+    errors::raise(
+        PgSqlErrorCode::ERRCODE_UNDEFINED_TABLE,
+        format!("nabla: view \"{name}\" does not exist"),
+        None,
+    )
+}
+
+/// Find an existing view: through the search_path by the VIEW's oid, or,
+/// when no relation is visible yet (still initializing), by the canonical
+/// name the same search_path would create it under.
+fn find_view(name: &str) -> CatalogRow {
+    let parsed = parse_name(name);
+    if let Some(relid) = visible_relid(&parsed) {
+        if let Some(view) = load_view_where("relid = $1::oid", &[(relid as i64).into()]).into_iter().next() {
+            return view;
+        }
+    }
+    let canonical = creation_name(&parsed);
+    load_view_where("name = $1", &[canonical.as_str().into()]).into_iter().next().unwrap_or_else(|| not_found(name))
 }
 
 fn slot_exists() -> bool {
@@ -131,6 +218,10 @@ fn regclass_text(oid: u32) -> Option<String> {
     )
 }
 
+fn relation_exists(name: &str) -> bool {
+    read_one::<bool>("SELECT pg_catalog.to_regclass($1) IS NOT NULL", &[name.into()]).unwrap_or(false)
+}
+
 fn require_logical_wal() {
     let level = read_one::<String>("SELECT current_setting('wal_level')", &[]).unwrap_or_default();
     if level != "logical" {
@@ -185,16 +276,6 @@ fn load_view_where(clause: &str, args: &[DatumWithOid]) -> Vec<CatalogRow> {
     .unwrap_or_else(|e| spi_fail(e))
 }
 
-fn load_view(name: &str) -> CatalogRow {
-    load_view_where("name = $1", &[name.into()]).into_iter().next().unwrap_or_else(|| {
-        errors::raise(
-            PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
-            format!("nabla: view \"{name}\" does not exist"),
-            None,
-        )
-    })
-}
-
 fn oid_array(oids: &BTreeSet<u32>) -> String {
     let items: Vec<String> = oids.iter().map(|o| o.to_string()).collect();
     format!("ARRAY[{}]::oid[]", items.join(", "))
@@ -235,8 +316,9 @@ fn refresh_closure(view: &CatalogRow) -> Vec<CatalogRow> {
     load_view_where(&format!("id IN ({})", ids.join(", ")), &[])
 }
 
-/// (frontier, status, stale_reason, last_error) read with a fresh snapshot.
-fn current_state(name: &str) -> (u64, String, Option<String>, Option<String>) {
+/// (frontier, status, stale_reason, last_error) of the canonical view name,
+/// read with a fresh snapshot.
+fn current_state(canonical: &str) -> (u64, String, Option<String>, Option<String>) {
     // Read-only SPI runs under the active snapshot, so push the latest one
     // to observe the worker's commits while polling.
     unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot()) };
@@ -244,7 +326,7 @@ fn current_state(name: &str) -> (u64, String, Option<String>, Option<String>) {
         let table = client.select(
             "SELECT frontier_lsn::text, status, stale_reason, last_error FROM nabla.views WHERE name = $1",
             Some(1),
-            &[name.into()],
+            &[canonical.into()],
         )?;
         if table.is_empty() {
             Ok(None)
@@ -256,24 +338,18 @@ fn current_state(name: &str) -> (u64, String, Option<String>, Option<String>) {
     unsafe { pg_sys::PopActiveSnapshot() };
     let (lsn_text, status, stale_reason, last_error) =
         found.unwrap_or_else(|e| spi_fail(e)).unwrap_or((None, None, None, None));
-    let lsn_text = lsn_text.unwrap_or_else(|| {
-        errors::raise(
-            PgSqlErrorCode::ERRCODE_UNDEFINED_OBJECT,
-            format!("nabla: view \"{name}\" does not exist"),
-            None,
-        )
-    });
+    let lsn_text = lsn_text.unwrap_or_else(|| not_found(canonical));
     (lsn::parse(&lsn_text).unwrap_or(0), status.unwrap_or_default(), stale_reason, last_error)
 }
 
 /// Poll the frontier every 10 ms until it reaches `target` or the timeout.
-fn wait_for_frontier(name: &str, target: u64, timeout_ms: i32) -> bool {
+fn wait_for_frontier(canonical: &str, target: u64, timeout_ms: i32) -> bool {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
-        let (frontier, status, stale_reason, last_error) = current_state(name);
+        let (frontier, status, stale_reason, last_error) = current_state(canonical);
         match status.as_str() {
-            "stale" => errors::stale(name, stale_reason.as_deref()),
-            "failed" => errors::failed(name, last_error.as_deref()),
+            "stale" => errors::stale(canonical, stale_reason.as_deref()),
+            "failed" => errors::failed(canonical, last_error.as_deref()),
             _ => {}
         }
         if idle::effective_frontier(frontier) >= target {
@@ -294,11 +370,14 @@ mod nabla {
     use super::*;
 
     /// Records the view and returns its canonical name immediately; the
-    /// worker builds the table under a consistent snapshot (populate.rs).
-    /// LISTEN on `'nabla:' || name`; nabla.await_ready() waits for the build.
+    /// worker builds the storage table and the VIEW under a consistent
+    /// snapshot (populate.rs). An unqualified name goes to the search_path's
+    /// creation namespace, like CREATE TABLE. LISTEN on `'nabla:' || name`;
+    /// nabla.await_ready() waits for the build.
     #[pg_extern]
     fn create_view(name: &str, definition: &str) -> String {
-        let name = require_qualified_name(name);
+        let parsed = parse_name(name);
+        let canonical = creation_name(&parsed);
         let (spec, base) = definition::validate(definition);
         require_logical_wal();
 
@@ -313,13 +392,13 @@ mod nabla {
                 Some(&format!("Run: ALTER TABLE {} REPLICA IDENTITY FULL;", base.qualified)),
             );
         }
-        if read_one::<bool>("SELECT pg_catalog.to_regclass($1) IS NOT NULL", &[name.as_str().into()]).unwrap_or(false) {
-            errors::invalid(format!("nabla: relation \"{name}\" already exists"), None);
+        if relation_exists(&canonical) {
+            errors::invalid(format!("nabla: relation {canonical} already exists"), None);
         }
-        if read_one::<bool>("SELECT EXISTS (SELECT 1 FROM nabla.views WHERE name = $1)", &[name.as_str().into()])
+        if read_one::<bool>("SELECT EXISTS (SELECT 1 FROM nabla.views WHERE name = $1)", &[canonical.as_str().into()])
             .unwrap_or(false)
         {
-            errors::invalid(format!("nabla: view \"{name}\" already exists"), None);
+            errors::invalid(format!("nabla: view {canonical} already exists"), None);
         }
 
         // Order matters: the slot first (no writes yet), then catalog writes.
@@ -333,7 +412,7 @@ mod nabla {
             "INSERT INTO nabla.views (name, definition, shape, spec, frontier_lsn, status) \
              VALUES ($1, $2, $3, $4::jsonb, '0/0', 'initializing') RETURNING id",
             &[
-                name.as_str().into(),
+                canonical.as_str().into(),
                 definition.into(),
                 spec.shape.as_str().into(),
                 spec_json.as_str().into(),
@@ -347,18 +426,23 @@ mod nabla {
                 &[view_id.into(), (rel.oid as i64).into(), (rel.rti as i32).into()],
             );
         }
-        name
+        canonical
     }
 
-    /// Drops the view table (its sql_drop event trigger cleans the catalog,
-    /// releases shadows and prunes the publication) and forgets the view
-    /// even when no table exists (failed or initializing) or a base table is
-    /// already gone.
+    /// Drops the VIEW (its sql_drop event trigger drops the storage table,
+    /// cleans the catalog, releases shadows and prunes the publication) and
+    /// forgets the view even when no objects exist yet (failed or
+    /// initializing) or a base table is already gone.
     #[pg_extern]
     fn drop_view(name: &str) {
-        let name = require_qualified_name(name);
-        let view = load_view(&name);
-        run(&format!("DROP TABLE IF EXISTS {name}"));
+        let view = find_view(name);
+        if relation_exists(&view.name) {
+            run(&format!("DROP VIEW {}", view.name));
+        }
+        let storage = storage_name(view.id);
+        if relation_exists(&storage) {
+            run(&format!("DROP TABLE {storage}"));
+        }
         run_args("SELECT nabla.forget_view($1)", &[view.id.into()]);
         run("SELECT nabla.prune_publication()");
     }
@@ -370,11 +454,10 @@ mod nabla {
     /// nabla.await_ready() waits for it.
     #[pg_extern]
     fn refresh(name: &str) {
-        let name = require_qualified_name(name);
-        let view = load_view(&name);
+        let view = find_view(name);
         for rel in &view.spec.relations {
             if regclass_text(rel.oid).is_none() {
-                errors::failed(&name, Some(&format!("base table {} (oid {}) no longer exists", rel.qualified, rel.oid)));
+                errors::failed(&view.name, Some(&format!("base table {} (oid {}) no longer exists", rel.qualified, rel.oid)));
             }
         }
         // The slot may have been dropped for lag; recreate it before any write.
@@ -398,14 +481,14 @@ mod nabla {
     /// or the timeout elapses (false).
     #[pg_extern]
     fn await_ready(name: &str, timeout_ms: default!(i32, 60000)) -> bool {
-        let name = require_qualified_name(name);
+        let canonical = find_view(name).name;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
         loop {
-            let (_, status, stale_reason, last_error) = current_state(&name);
+            let (_, status, stale_reason, last_error) = current_state(&canonical);
             match status.as_str() {
                 "live" => return true,
-                "failed" => errors::failed(&name, last_error.as_deref()),
-                "stale" => errors::stale(&name, stale_reason.as_deref()),
+                "failed" => errors::failed(&canonical, last_error.as_deref()),
+                "stale" => errors::stale(&canonical, stale_reason.as_deref()),
                 _ => {}
             }
             if Instant::now() >= deadline {
@@ -421,9 +504,8 @@ mod nabla {
     STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     "#)]
     fn frontier(name: &str) -> i64 {
-        let name = require_qualified_name(name);
-        load_view(&name);
-        current_state(&name).0 as i64
+        let canonical = find_view(name).name;
+        current_state(&canonical).0 as i64
     }
 
     #[pg_extern(sql = r#"
@@ -431,8 +513,8 @@ mod nabla {
     STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     "#)]
     fn wait_for(name: &str, lsn: i64, timeout_ms: i32) -> bool {
-        let name = require_qualified_name(name);
-        wait_for_frontier(&name, lsn as u64, timeout_ms)
+        let canonical = find_view(name).name;
+        wait_for_frontier(&canonical, lsn as u64, timeout_ms)
     }
 
     /// Text overload: accepts the `X/Y` form returned by changes() and status().
@@ -441,15 +523,15 @@ mod nabla {
     STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     "#)]
     fn wait_for_text(name: &str, lsn: &str, timeout_ms: i32) -> bool {
-        let name = require_qualified_name(name);
+        let canonical = find_view(name).name;
         let target = lsn::parse(lsn)
             .unwrap_or_else(|| errors::invalid(format!("nabla: \"{lsn}\" is not a valid LSN (expected X/Y)"), None));
-        wait_for_frontier(&name, target, timeout_ms)
+        wait_for_frontier(&canonical, target, timeout_ms)
     }
 
     /// Everything a subscriber needs to bootstrap, in one row read from the
     /// caller's snapshot (so it composes with a REPEATABLE READ transaction
-    /// that also reads the view table). `name` is the canonical view name:
+    /// that also reads the view). `name` is the canonical view name:
     /// LISTEN on `'nabla:' || name`. `status` is one of initializing,
     /// refreshing, live, stale, failed.
     #[pg_extern(sql = r#"
@@ -471,8 +553,7 @@ mod nabla {
             name!(stale_reason, Option<String>),
         ),
     > {
-        let name = require_qualified_name(name);
-        let view = load_view(&name);
+        let view = find_view(name);
         let reason = match view.status.as_str() {
             "failed" => view.last_error.clone(),
             _ => view.stale_reason.clone(),
@@ -488,18 +569,27 @@ mod nabla {
         ))
     }
 
-    /// The definition's output columns, in order, without the hidden
-    /// `_nabla_*` maintenance columns of the view table.
+    /// The definition's output columns, in order: the columns of the VIEW.
     #[pg_extern]
     fn visible_columns(name: &str) -> Vec<String> {
-        let name = require_qualified_name(name);
-        load_view(&name).spec.visible_columns
+        find_view(name).spec.visible_columns
+    }
+
+    /// The storage table behind the VIEW (`nabla_store.v<id>`), which also
+    /// carries the hidden `_nabla_*` maintenance columns; NULL until built.
+    #[pg_extern(sql = r#"
+    CREATE FUNCTION nabla.storage_table(name text) RETURNS regclass
+    STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+    "#)]
+    fn storage_table(name: &str) -> Option<pg_sys::Oid> {
+        let view = find_view(name);
+        read_one::<i64>("SELECT pg_catalog.to_regclass($1)::oid::int8", &[storage_name(view.id).as_str().into()])
+            .map(|o| pg_sys::Oid::from(o as u32))
     }
 
     #[pg_extern]
     fn current_seq(name: &str) -> i64 {
-        let name = require_qualified_name(name);
-        load_view(&name).last_seq
+        find_view(name).last_seq
     }
 
     /// Deltas after `after_seq`, whole source transactions only: a result with
@@ -519,19 +609,19 @@ mod nabla {
         max_rows: i32,
         include_hidden: bool,
     ) -> TableIterator<'static, (name!(seq, i64), name!(lsn, String), name!(xid, Option<i64>), name!(op, String), name!(row, JsonB))> {
-        let name = require_qualified_name(name);
-        let view = load_view(&name);
+        let view = find_view(name);
+        let canonical = view.name.clone();
         match view.status.as_str() {
-            "stale" => errors::stale(&name, view.stale_reason.as_deref()),
-            "failed" => errors::failed(&name, view.last_error.as_deref()),
+            "stale" => errors::stale(&canonical, view.stale_reason.as_deref()),
+            "failed" => errors::failed(&canonical, view.last_error.as_deref()),
             _ => {}
         }
         if epoch != view.epoch {
-            errors::epoch_changed(&name, epoch, view.epoch);
+            errors::epoch_changed(&canonical, epoch, view.epoch);
         }
         match read_one::<i64>("SELECT min(seq) FROM nabla.deltas WHERE view_id = $1", &[view.id.into()]) {
-            Some(oldest) if after_seq < oldest - 1 => errors::lagged(&name, oldest),
-            None if after_seq < view.last_seq => errors::lagged(&name, view.last_seq + 1),
+            Some(oldest) if after_seq < oldest - 1 => errors::lagged(&canonical, oldest),
+            None if after_seq < view.last_seq => errors::lagged(&canonical, view.last_seq + 1),
             _ => {}
         }
 

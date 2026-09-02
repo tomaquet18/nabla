@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use crate::api::storage_name;
 use crate::apply::{self, Op, Planned, ViewTarget};
 use crate::definition::ViewSpec;
 use crate::guc;
@@ -164,6 +165,8 @@ fn select_two<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
 struct LiveView {
     id: i32,
     name: String,
+    /// The storage table behind the VIEW: where the worker writes.
+    storage: String,
     spec: ViewSpec,
     frontier: u64,
     last_seq: i64,
@@ -256,9 +259,11 @@ fn load_live_views() -> Result<Vec<LiveView>, String> {
                 }
             };
             let last_seq = r.get::<i64>(5)?.expect("last_seq");
+            let id = r.get::<i32>(1)?.expect("id");
             views.push(LiveView {
-                id: r.get::<i32>(1)?.expect("id"),
+                id,
                 name: r.get::<String>(2)?.expect("name"),
+                storage: storage_name(id),
                 spec,
                 frontier: lsn::parse(&r.get::<String>(4)?.expect("frontier")).unwrap_or(0),
                 last_seq,
@@ -589,7 +594,7 @@ fn record_shadow_failure(shadow: &mut Shadow, message: &str) -> Result<(), Strin
 /// Plan the effect of one change on one view. `old_full` is the complete old
 /// row when it came from a shadow.
 fn plan_change(view: &mut LiveView, rel: &Relation, change: &Change, old_full: Option<&Tuple>) -> Result<Planned, String> {
-    let target = ViewTarget { name: &view.name, spec: &view.spec };
+    let target = ViewTarget { name: &view.storage, spec: &view.spec };
     let mentions = |c: &str| view.definition.to_lowercase().contains(&c.to_lowercase());
     let mut ops = Vec::new();
     if view.spec.is_join() {
@@ -700,7 +705,7 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
     // trigger touches shadows and catalog rows). Taking the view locks first
     // keeps the worker and concurrent DDL from deadlocking.
     for view in &views {
-        Spi::run(&format!("LOCK TABLE {} IN ROW EXCLUSIVE MODE", view.name)).map_err(spi_err)?;
+        Spi::run(&format!("LOCK TABLE {} IN ROW EXCLUSIVE MODE", view.storage)).map_err(spi_err)?;
     }
     let mut shadows = load_shadows()?;
 
@@ -829,7 +834,7 @@ fn apply_transaction(decoder: &mut Decoder, tx: &SourceTransaction) -> Result<Ap
         let ops = std::mem::take(&mut view.ops);
         let (seq_before, touched_before) = (view.last_seq, view.touched);
         let outcome = in_subtransaction(AssertUnwindSafe(|| {
-            let target = ViewTarget { name: &view.name, spec: &view.spec };
+            let target = ViewTarget { name: &view.storage, spec: &view.spec };
             // Table writes stay per change; the log gets the transaction's
             // net effect per identity key (see apply::net).
             let deltas = apply::net(&view.spec, apply::execute(&target, &ops)?);

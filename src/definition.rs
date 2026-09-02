@@ -504,6 +504,21 @@ fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>
 }
 
 unsafe fn check_relation_kind(rte: *mut pg_sys::RangeTblEntry, qualified: &str, nspname: &str) {
+    if nspname == "nabla_store" {
+        reject(format!("{qualified} is a nabla storage table and cannot be a base table"));
+    }
+    let relid = (*rte).relid.to_u32() as i64;
+    let is_nabla_view = Spi::connect(|client| {
+        client
+            .select("SELECT EXISTS (SELECT 1 FROM nabla.views WHERE relid = $1::oid)", Some(1), &[relid.into()])?
+            .first()
+            .get_one::<bool>()
+    })
+    .unwrap_or(None)
+    .unwrap_or(false);
+    if is_nabla_view {
+        reject(format!("{qualified} is a nabla view; views cannot be built on other nabla views"));
+    }
     match (*rte).relkind as u8 {
         b'r' => {}
         b'p' => reject(format!("{qualified} is a partitioned table; partitioned tables are not supported")),

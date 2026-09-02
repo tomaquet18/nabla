@@ -32,6 +32,7 @@ use std::ffi::{c_int, c_void, CString};
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use crate::api::storage_name;
 use crate::definition::{self, Shape, ViewSpec};
 use crate::guc;
 use crate::lsn;
@@ -265,23 +266,34 @@ fn build(view: &Pending, consistent_point: u64, shadows_done: &mut BTreeSet<u32>
             }
         }
     }
-    let exists = read_text("SELECT pg_catalog.to_regclass($1)::text", &[view.name.as_str().into()])?.is_some();
+    // Storage table nabla_store.v<id> (user columns + hidden maintenance
+    // columns) behind a plain VIEW <schema>.<name> exposing the visible
+    // columns. The VIEW is created once and survives every rebuild.
+    let storage = storage_name(view.id);
+    let exists = read_text("SELECT pg_catalog.to_regclass($1)::text", &[storage.as_str().into()])?.is_some();
     if exists {
         // DELETE, not TRUNCATE: readers keep seeing the old rows under MVCC
         // until this transaction commits, never an empty table.
-        run(&format!("DELETE FROM {}", view.name))?;
-        run(&format!("INSERT INTO {} {}", view.name, spec.populate_sql))?;
+        run(&format!("DELETE FROM {storage}"))?;
+        run(&format!("INSERT INTO {storage} {}", spec.populate_sql))?;
     } else {
-        run(&format!("CREATE TABLE {} AS {}", view.name, spec.populate_sql))?;
-        for ddl in view_ddl(&view.name, &spec) {
+        run(&format!("CREATE TABLE {storage} AS {}", spec.populate_sql))?;
+        for ddl in view_ddl(&storage, &spec) {
             run(&ddl)?;
         }
-        // The view table depends on its base tables, like a SQL view does.
-        if let Some(view_oid) = shadow::relation_oid(&view.name) {
+        // The storage table depends on its base tables, like a SQL view
+        // does; PostgreSQL records the VIEW's dependency on the storage.
+        if let Some(storage_oid) = shadow::relation_oid(&storage) {
             for rel in &spec.relations {
-                shadow::record_dependency(view_oid, rel.oid);
+                shadow::record_dependency(storage_oid, rel.oid);
             }
         }
+        let columns: Vec<String> = spec.visible_columns.iter().map(quote_identifier).collect();
+        run(&format!("CREATE VIEW {} AS SELECT {} FROM {storage}", view.name, columns.join(", ")))?;
+        run_args(
+            "UPDATE nabla.views SET relid = pg_catalog.to_regclass($2)::oid WHERE id = $1",
+            &[view.id.into(), view.name.as_str().into()],
+        )?;
     }
     let bump: i32 = if rebuild { 1 } else { 0 };
     let args: [DatumWithOid; 3] = [lsn::format(consistent_point).into(), bump.into(), view.id.into()];
@@ -409,9 +421,6 @@ pub fn record_failure(group: &[Pending], message: &str) -> Result<(), String> {
             "UPDATE nabla.views SET status = 'failed', last_error = $2, last_error_at = now() WHERE id = $1",
             &args,
         )?;
-        if !view.populated {
-            run(&format!("DROP TABLE IF EXISTS {}", view.name))?;
-        }
     }
     Ok(())
 }

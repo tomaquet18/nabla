@@ -313,12 +313,13 @@ assert_eq "projection with immutable expressions equals its query" "0" "$DIFF"
 q "SELECT nabla.create_view('public.paid_parity', 'SELECT k % 2 AS parity, sum(amount * 2) AS total FROM orders WHERE status = ''paid'' GROUP BY k % 2')" >/dev/null \
   || die "create_view(paid_parity) failed"
 await_ready public.paid_parity
-assert_eq "hidden group count column is present" "t" "$(q "SELECT bool_and(_nabla_n > 0) AND count(*) = 2 FROM paid_parity")"
+assert_eq "hidden group count column is present (in the storage table)" "t" "$(q "SELECT bool_and(_nabla_n > 0) AND count(*) = 2 FROM $(q "SELECT nabla.storage_table('public.paid_parity')")")"
 q "INSERT INTO orders (k, amount, status) VALUES (31, 10, 'paid'), (32, 20, 'paid')" >/dev/null
 q "UPDATE orders SET status = 'new' WHERE k = 31" >/dev/null
 wait_view public.paid_parity
-DIFF=$(q "SELECT count(*) FROM ((SELECT parity, total, _nabla_n FROM paid_parity EXCEPT SELECT k % 2, sum(amount * 2), count(*) FROM orders WHERE status = 'paid' GROUP BY k % 2)
-  UNION ALL (SELECT k % 2, sum(amount * 2), count(*) FROM orders WHERE status = 'paid' GROUP BY k % 2 EXCEPT SELECT parity, total, _nabla_n FROM paid_parity)) d")
+PP_STORE=$(q "SELECT nabla.storage_table('public.paid_parity')")
+DIFF=$(q "SELECT count(*) FROM ((SELECT parity, total, _nabla_n FROM $PP_STORE EXCEPT SELECT k % 2, sum(amount * 2), count(*) FROM orders WHERE status = 'paid' GROUP BY k % 2)
+  UNION ALL (SELECT k % 2, sum(amount * 2), count(*) FROM orders WHERE status = 'paid' GROUP BY k % 2 EXCEPT SELECT parity, total, _nabla_n FROM $PP_STORE)) d")
 assert_eq "aggregate with expression keys and hidden count equals its query" "0" "$DIFF"
 q "DELETE FROM orders WHERE status = 'paid' AND k % 2 = 1" >/dev/null
 wait_view public.paid_parity
@@ -455,8 +456,8 @@ await_ready public.agg_s
 s_diff() { q "SELECT count(*) FROM ((SELECT k, n, sv, cw, sw FROM agg_s EXCEPT SELECT k, count(*), sum(v), count(w), sum(w) FROM s GROUP BY k)
   UNION ALL (SELECT k, count(*), sum(v), count(w), sum(w) FROM s GROUP BY k EXCEPT SELECT k, n, sv, cw, sw FROM agg_s)) d"; }
 s_row() { q "SELECT n || '|' || coalesce(sv::text, 'NULL') || '|' || cw || '|' || coalesce(sw::text, 'NULL') FROM agg_s WHERE k = $1"; }
-assert_eq "hidden sum counters exist after the user's columns" "k,n,sv,cw,sw,_nabla_nn_1,_nabla_nn_3" \
-  "$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'agg_s'")"
+assert_eq "hidden sum counters exist after the user's columns (storage table); the VIEW shows only the user's" "k,n,sv,cw,sw,_nabla_nn_1,_nabla_nn_3|k,n,sv,cw,sw" \
+  "$(q "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid = nabla.storage_table('public.agg_s') AND attnum > 0 AND NOT attisdropped")|$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'agg_s'")"
 q "INSERT INTO s (k, v, w) VALUES (1, NULL, NULL), (1, NULL, NULL)" >/dev/null
 wait_view public.agg_s
 assert_eq "group of only NULLs: n=2, sums NULL, count(w)=0" "2|NULL|0|NULL|0" "$(s_row 1)|$(s_diff)"
@@ -483,11 +484,12 @@ wait_view public.agg_s
 assert_eq "empty group disappears" "0|0" "$(q "SELECT count(*) FROM agg_s WHERE k = 2")|$(s_diff)"
 q "INSERT INTO s (k, v, w) VALUES (3, 1.5, NULL), (3, NULL, 2), (1, 2.5, 9)" >/dev/null
 wait_view public.agg_s
-q "CREATE TABLE agg_s_snapshot AS SELECT * FROM agg_s" >/dev/null
+AGG_STORE=$(q "SELECT nabla.storage_table('public.agg_s')")
+q "CREATE TABLE agg_s_snapshot AS SELECT * FROM $AGG_STORE" >/dev/null
 q "SELECT nabla.refresh('public.agg_s')" >/dev/null || die "refresh(agg_s) failed"
 await_ready public.agg_s
 assert_eq "refresh reproduces the maintained table exactly, hidden counters included" "0" \
-  "$(q "SELECT count(*) FROM ((SELECT * FROM agg_s_snapshot EXCEPT SELECT * FROM agg_s) UNION ALL (SELECT * FROM agg_s EXCEPT SELECT * FROM agg_s_snapshot)) d")"
+  "$(q "SELECT count(*) FROM ((SELECT * FROM agg_s_snapshot EXCEPT SELECT * FROM $AGG_STORE) UNION ALL (SELECT * FROM $AGG_STORE EXCEPT SELECT * FROM agg_s_snapshot)) d")"
 reject "count(DISTINCT w) still rejected" "SELECT k, count(DISTINCT w) AS c FROM s GROUP BY k" "DISTINCT inside aggregates is not supported"
 reject "sum(w) FILTER still rejected" "SELECT k, sum(w) FILTER (WHERE w > 1) AS f FROM s GROUP BY k" "FILTER on aggregates is not supported"
 reject "count(expr) with a mutable expression rejected" "SELECT k, count(w + random()::int) AS c FROM s GROUP BY k" "the argument of count() in column \"c\" uses \"random\", which is not IMMUTABLE"
@@ -514,8 +516,8 @@ shadow_diff() { # shadows hold only the columns their views need: compare those
   local cols; cols=$(shadow_cols_of "$1")
   q "SELECT count(*) FROM ((SELECT $cols FROM $(shadow_of "$1") EXCEPT SELECT $cols FROM $1) UNION ALL (SELECT $cols FROM $1 EXCEPT SELECT $cols FROM $(shadow_of "$1"))) d"
 }
-assert_eq "join view columns: visible then hidden keys" "order_id,customer,product,total,_nabla_pk1_id,_nabla_pk2_id,_nabla_pk3_id" \
-  "$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'order_lines'")"
+assert_eq "join view storage columns: visible then hidden keys; the VIEW shows only the visible" "order_id,customer,product,total,_nabla_pk1_id,_nabla_pk2_id,_nabla_pk3_id|order_id,customer,product,total" \
+  "$(q "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid = nabla.storage_table('public.order_lines') AND attnum > 0 AND NOT attisdropped")|$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = 'order_lines'")"
 q "INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 2, 3, 'paid'), (3, 1, 4, 'paid'), (2, 3, 1, 'new')" >/dev/null
 wait_view public.order_lines
 assert_eq "join view after inserting orders" "0|4" "$(lines_diff)|$(q "SELECT count(*) FROM order_lines")"
@@ -959,8 +961,8 @@ assert_eq "8. the single-table view is unaffected, no WARNING, worker alive" "li
 q "SELECT nabla.create_view('public.j4', 'SELECT o.id AS order_id, p.name AS product FROM shop.orders o JOIN shop.products p ON p.id = o.product_id')" >/dev/null || die "create_view(j4) failed"
 await_ready public.j4
 assert_eq "9. the new join view created its shadows" "2" "$(q "SELECT count(*) FROM nabla.shadows WHERE refcount = 1")"
-q "DROP TABLE public.j4" >/dev/null || die "DROP TABLE j4 failed"
-assert_eq "9. dropping the view table cleans the catalog and the orphan shadows" "0|0|0" \
+q "DROP VIEW public.j4" >/dev/null || die "DROP VIEW j4 failed"
+assert_eq "9. dropping the VIEW cleans the catalog and the orphan shadows" "0|0|0" \
   "$(q "SELECT count(*) FROM nabla.views WHERE name = 'public.j4'")|$(q "SELECT count(*) FROM nabla.shadows")|$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'nabla_shadow'")"
 # Replay of the hands-on session that found these bugs.
 q "CREATE TABLE public.play_customers (id int PRIMARY KEY, name text, region text)" >/dev/null
@@ -1103,6 +1105,96 @@ R0=$(cur public.net_rev); BR_N=$(q "SELECT n FROM net_rev WHERE region = 'BR'")
 q "DELETE FROM net.orders WHERE customer_id IN (SELECT id FROM net.customers WHERE region = 'BR')" >/dev/null
 net_check "replay: BR emptied"
 assert_eq "replay: deleting every BR row nets to one D with the pre-transaction row" "D:BR:$BR_N" "$(rev_deltas "$R0")"
+
+# --- 24. name resolution and the VIEW facade -------------------------------------
+echo "== 24. name resolution and the VIEW facade"
+store() { q "SELECT nabla.storage_table('$1')"; }
+q "CREATE SCHEMA app" >/dev/null
+q 'CREATE SCHEMA "App"' >/dev/null
+q "CREATE TABLE app.t24 (id serial PRIMARY KEY, k int, amount numeric)" >/dev/null
+q "ALTER TABLE app.t24 REPLICA IDENTITY FULL" >/dev/null
+q "INSERT INTO app.t24 (k, amount) VALUES (1, 10), (1, 5), (2, 7)" >/dev/null
+S24_DEF="SELECT k AS region, count(*) AS orders, sum(amount) AS revenue FROM app.t24 GROUP BY k"
+# unqualified names follow the search_path, like CREATE TABLE
+assert_eq "an unqualified name is created in the search_path's creation namespace" "app.sales" \
+  "$(q "SET search_path = app, public; SELECT nabla.create_view('sales', \$d\$$S24_DEF\$d\$)")"
+await_ready app.sales
+assert_eq "lookups resolve through the search_path, qualified names always work" "app.sales|app.sales|app.sales" \
+  "$(q "SET search_path = app, public; SELECT name FROM nabla.status('sales')")|$(q "SET search_path = app, public; SELECT name FROM nabla.status('app.sales')")|$(q "SET search_path = public; SELECT name FROM nabla.status('app.sales')")"
+assert_contains "an unqualified name not visible under the search_path is not found" 'nabla: view "sales" does not exist' \
+  "$(q_err "SET search_path = public; SELECT name FROM nabla.status('sales')")"
+assert_eq "the not-found error uses SQLSTATE 42P01 (undefined_table)" "42P01" "$(sqlstate_of "SET search_path = public; SELECT name FROM nabla.status('sales')")"
+assert_contains "a three-part name is rejected" "at most two parts" "$(q_err "SELECT nabla.create_view('db.app.x', 'SELECT id FROM app.t24')")"
+# quoted, mixed-case names keep their case; the canonical name quotes only where needed
+QUOTED='"App"."Sales By Region"'
+assert_eq "quoted identifiers are kept verbatim in the canonical name" "$QUOTED" \
+  "$(q "SELECT nabla.create_view('$QUOTED', \$d\$$S24_DEF\$d\$)")"
+await_ready "$QUOTED"
+assert_eq "status().name is the canonical quoted name and the VIEW is queryable" "$QUOTED|2" \
+  "$(q "SELECT name FROM nabla.status('$QUOTED')")|$(q "SELECT count(*) FROM $QUOTED")"
+assert_eq "unquoted mixed case folds to lowercase" "public.canon24" "$(q "SELECT nabla.create_view('Public.Canon24', 'SELECT id, k FROM app.t24')")"
+await_ready public.canon24
+# the LISTEN channel is 'nabla:' || the canonical name
+# LISTEN must commit before the write: separate statements, not one -c transaction.
+printf 'LISTEN "nabla:""App"".""Sales By Region""";\nSELECT pg_sleep(2);\n' | psql -X -q -p "$PORT" -d "$DB" > /tmp/nabla-listen.out 2>&1 &
+LISTEN_PID=$!
+sleep 0.5
+q "INSERT INTO app.t24 (k, amount) VALUES (3, 1)" >/dev/null
+wait "$LISTEN_PID"
+assert_contains "the notification arrives on the canonical channel" 'Asynchronous notification "nabla:"App"."Sales By Region""' "$(cat /tmp/nabla-listen.out)"
+# the user object is a VIEW with only the visible columns; storage keeps the hidden ones
+assert_eq "the user object is a VIEW exposing exactly the visible columns" "v|region,orders,revenue|{region,orders,revenue}" \
+  "$(q "SELECT relkind FROM pg_class WHERE oid = 'app.sales'::regclass")|$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'app' AND table_name = 'sales'")|$(q "SELECT nabla.visible_columns('app.sales')")"
+assert_eq "the storage table carries the hidden columns" "region,orders,revenue,_nabla_nn_1" \
+  "$(q "SELECT string_agg(attname, ',' ORDER BY attnum) FROM pg_attribute WHERE attrelid = nabla.storage_table('app.sales') AND attnum > 0 AND NOT attisdropped")"
+assert_eq "writes through the VIEW hit the guard (NB005)" "NB005|NB005|NB005" \
+  "$(sqlstate_of "INSERT INTO app.sales VALUES (9, 1, 1)")|$(sqlstate_of "UPDATE app.sales SET orders = 0")|$(sqlstate_of "DELETE FROM app.sales")"
+assert_eq "the planner flattens the VIEW and uses the storage index" "t" \
+  "$(q "SET enable_seqscan = off; SELECT count(*) > 0 FROM (SELECT * FROM pg_catalog.pg_get_viewdef('app.sales'::regclass) v) x" >/dev/null; q "SET enable_seqscan = off; EXPLAIN SELECT * FROM app.sales WHERE region = 1" | grep -qE 'Index (Only )?Scan' && echo t || echo f)"
+# refresh keeps the VIEW's oid and readers keep the old rows meanwhile
+OID_BEFORE=$(q "SELECT 'app.sales'::regclass::oid")
+q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = 2000" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+sleep 0.3
+ROWS_BEFORE=$(q "SELECT count(*) FROM app.sales")
+q "SELECT nabla.refresh('app.sales')" >/dev/null || die "refresh(app.sales) failed to start"
+sleep 0.8
+assert_eq "readers see the old rows while the refresh runs" "refreshing|$ROWS_BEFORE" \
+  "$(q "SELECT status FROM nabla.status('app.sales')")|$(q "SELECT count(*) FROM app.sales")"
+await_ready app.sales
+assert_eq "refresh keeps the VIEW's oid" "$OID_BEFORE" "$(q "SELECT 'app.sales'::regclass::oid")"
+q "ALTER SYSTEM RESET nabla.debug_populate_delay_ms" >/dev/null
+q "SELECT pg_reload_conf()" >/dev/null
+# DROP VIEW cleans everything, including shadow references of a join view
+q "CREATE TABLE app.c24 (id int PRIMARY KEY, name text)" >/dev/null
+q "INSERT INTO app.c24 VALUES (1, 'a'), (2, 'b'), (3, 'c')" >/dev/null
+q "SELECT nabla.create_view('app.jv', 'SELECT t.id, c.name FROM app.t24 t JOIN app.c24 c ON c.id = t.k')" >/dev/null || die "create_view(app.jv) failed"
+await_ready app.jv
+JV_ID=$(q "SELECT id FROM nabla.views WHERE name = 'app.jv'")
+assert_eq "the join view created its shadows" "2" "$(q "SELECT count(*) FROM nabla.shadows WHERE refcount = 1 AND relid IN ('app.t24'::regclass, 'app.c24'::regclass)")"
+OUT=$(psql -X -q -p "$PORT" -d "$DB" -c "DROP VIEW app.jv" 2>&1)
+assert_eq "DROP VIEW removes the catalog row, storage, deltas and its shadows" "0|t|0|0|t" \
+  "$(q "SELECT count(*) FROM nabla.views WHERE name = 'app.jv'")|$(q "SELECT to_regclass('nabla_store.v$JV_ID') IS NULL")|$(q "SELECT count(*) FROM nabla.deltas WHERE view_id = $JV_ID")|$(q "SELECT count(*) FROM nabla.shadows WHERE relid IN ('app.t24'::regclass, 'app.c24'::regclass)")|$(q "SELECT (SELECT count(*) FROM pg_tables WHERE schemaname = 'nabla_shadow') = (SELECT count(*) FROM nabla.shadows)")"
+assert_eq "no skip NOTICE from nabla during DROP VIEW" "0" "$(printf '%s' "$OUT" | grep -c 'does not exist, skipping')"
+# DROP TABLE base CASCADE drops storage and VIEW, without nabla NOTICEs
+S_ID=$(q "SELECT id FROM nabla.views WHERE name = 'app.sales'")
+OUT=$(psql -X -q -p "$PORT" -d "$DB" -c "DROP TABLE app.t24 CASCADE" 2>&1) || die "DROP TABLE app.t24 CASCADE failed: $OUT"
+assert_eq "DROP TABLE base CASCADE drops the VIEW, its storage and the catalog rows" "t|t|0|0" \
+  "$(q "SELECT to_regclass('app.sales') IS NULL")|$(q "SELECT to_regclass('nabla_store.v$S_ID') IS NULL")|$(q "SELECT count(*) FROM nabla.views WHERE name IN ('app.sales', '$QUOTED', 'public.canon24')")|$(printf '%s' "$OUT" | grep -c 'does not exist, skipping')"
+OUT=$(psql -X -q -p "$PORT" -d "$DB" -c "DROP SCHEMA app CASCADE; DROP SCHEMA \"App\" CASCADE" 2>&1)
+assert_eq "DROP SCHEMA CASCADE leaves nothing behind" "0|0" \
+  "$(q "SELECT count(*) FROM nabla.view_relations vr WHERE NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.oid = vr.relid)")|$(printf '%s' "$OUT" | grep -c 'does not exist, skipping')"
+# replay of the hands-on script with unqualified names under the default search_path
+q "CREATE TABLE rc (id int PRIMARY KEY, region text)" >/dev/null
+q "CREATE TABLE ro (id serial PRIMARY KEY, customer_id int, amount numeric)" >/dev/null
+q "INSERT INTO rc VALUES (1, 'north'), (2, 'south')" >/dev/null
+q "INSERT INTO ro (customer_id, amount) VALUES (1, 10), (2, 20)" >/dev/null
+assert_eq "replay: an unqualified name lands in public" "public.sales_by_region" \
+  "$(q "SELECT nabla.create_view('sales_by_region', 'SELECT c.region, count(*) AS orders, sum(o.amount) AS revenue FROM ro o JOIN rc c ON c.id = o.customer_id GROUP BY c.region')")"
+await_ready sales_by_region
+assert_eq "replay: SELECT * shows only region, orders, revenue" "region,orders,revenue|2" \
+  "$(q "SELECT string_agg(column_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sales_by_region'")|$(q "SELECT count(*) FROM sales_by_region")"
+q "SELECT nabla.drop_view('sales_by_region')" >/dev/null || die "drop_view(sales_by_region) failed"
 
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"

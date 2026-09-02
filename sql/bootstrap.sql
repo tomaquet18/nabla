@@ -4,10 +4,13 @@
 CREATE SCHEMA IF NOT EXISTS nabla;
 -- Shadow copies of base tables used by join views (see README "Joins and shadow tables").
 CREATE SCHEMA IF NOT EXISTS nabla_shadow;
+-- Storage tables behind the user-facing VIEWs (nabla_store.v<view id>).
+CREATE SCHEMA IF NOT EXISTS nabla_store;
 
 CREATE TABLE nabla.views (
   id            serial PRIMARY KEY,
-  name          text NOT NULL UNIQUE,           -- schema-qualified name of the view table
+  name          text NOT NULL UNIQUE,           -- canonical schema-qualified name of the VIEW (quoted where needed)
+  relid         oid,                            -- oid of the VIEW; NULL until built
   definition    text NOT NULL,
   shape         text NOT NULL CHECK (shape IN ('projection', 'aggregate')),
   spec          jsonb NOT NULL,                  -- parsed structure, see src/definition.rs
@@ -59,6 +62,8 @@ CREATE TABLE nabla.view_relations (
   PRIMARY KEY (view_id, relid)
 );
 
+CREATE INDEX ON nabla.views (relid);
+
 SELECT pg_catalog.pg_extension_config_dump('nabla.views', '');
 SELECT pg_catalog.pg_extension_config_dump('nabla.shadows', '');
 SELECT pg_catalog.pg_extension_config_dump('nabla.view_relations', '');
@@ -93,21 +98,34 @@ DECLARE
   r record;
   s record;
 BEGIN
-  SELECT id, name, populated_at, jsonb_array_length(spec->'relations') > 1 AS is_join
+  SELECT id, name, populated_at, jsonb_array_length(spec->'relations') > 1 AS is_join,
+         ARRAY(SELECT relid FROM nabla.view_relations vr WHERE vr.view_id = views.id) AS relids
     INTO v FROM nabla.views WHERE id = view_id;
   IF NOT FOUND THEN
     RETURN;
   END IF;
+  -- Remove the catalog row first: the DROPs below re-enter this function
+  -- through the sql_drop trigger, and a second pass must find nothing.
+  DELETE FROM nabla.views WHERE id = v.id;
   IF v.is_join AND v.populated_at IS NOT NULL THEN
-    FOR r IN SELECT relid FROM nabla.view_relations WHERE view_relations.view_id = v.id LOOP
+    FOR r IN SELECT relid FROM unnest(v.relids) AS relid LOOP
       UPDATE nabla.shadows SET refcount = refcount - 1 WHERE relid = r.relid;
       FOR s IN SELECT table_name FROM nabla.shadows WHERE relid = r.relid AND refcount <= 0 LOOP
-        EXECUTE 'DROP TABLE IF EXISTS ' || s.table_name;
+        IF to_regclass(s.table_name) IS NOT NULL THEN
+          EXECUTE 'DROP TABLE ' || s.table_name;
+        END IF;
         DELETE FROM nabla.shadows WHERE table_name = s.table_name;
       END LOOP;
     END LOOP;
   END IF;
-  DELETE FROM nabla.views WHERE id = v.id;
+  -- The VIEW and its storage, whichever still exists (DDL from within the
+  -- sql_drop trigger is allowed; existence is checked to avoid NOTICEs).
+  IF to_regclass(v.name) IS NOT NULL THEN
+    EXECUTE 'DROP VIEW ' || v.name;
+  END IF;
+  IF to_regclass('nabla_store.v' || v.id) IS NOT NULL THEN
+    EXECUTE 'DROP TABLE nabla_store.v' || v.id;
+  END IF;
 END
 $$;
 
@@ -158,13 +176,18 @@ DECLARE
   obj record;
   v record;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects() WHERE object_type = 'table') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_event_trigger_dropped_objects() WHERE object_type IN ('table', 'view')) THEN
     RETURN;
   END IF;
-  FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects() WHERE object_type = 'table' LOOP
-    FOR v IN SELECT id FROM nabla.views WHERE name = obj.schema_name || '.' || obj.object_name LOOP
+  FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects() WHERE object_type IN ('table', 'view') LOOP
+    -- The user-facing VIEW of a nabla view.
+    FOR v IN SELECT id FROM nabla.views WHERE relid = obj.objid LOOP
       PERFORM nabla.forget_view(v.id);
     END LOOP;
+    -- A storage table (nabla_store.v<id>).
+    IF obj.schema_name = 'nabla_store' AND obj.object_name ~ '^v[0-9]+$' THEN
+      PERFORM nabla.forget_view(substr(obj.object_name, 2)::int);
+    END IF;
     DELETE FROM nabla.shadows WHERE table_name = obj.schema_name || '.' || obj.object_name;
     FOR v IN SELECT DISTINCT view_id AS id FROM nabla.view_relations WHERE relid = obj.objid LOOP
       PERFORM nabla.forget_view(v.id);

@@ -114,21 +114,22 @@ CREATE EXTENSION nabla;
 CREATE TABLE orders (id bigserial PRIMARY KEY, k int, amount numeric, status text);
 ALTER TABLE orders REPLICA IDENTITY FULL;
 
-SELECT nabla.create_view('public.paid_orders',
+SELECT nabla.create_view('paid_orders',
   'SELECT id, k, amount FROM orders WHERE status = ''paid''');
-SELECT nabla.create_view('public.orders_by_k',
+SELECT nabla.create_view('orders_by_k',
   'SELECT k, count(*) AS n, sum(amount) AS total FROM orders WHERE status = ''paid'' GROUP BY k');
 
 INSERT INTO orders (k, amount, status) VALUES (1, 10, 'paid');
 
 -- Block until the view reflects everything committed so far (default 5 s).
-SELECT nabla.wait_for('public.orders_by_k', pg_current_wal_lsn());
+SELECT nabla.await_ready('orders_by_k');
+SELECT nabla.wait_for('orders_by_k', pg_current_wal_lsn());
 SELECT * FROM orders_by_k;
 
 -- Subscribe: read the table, take the cursor, then follow deltas.
-SELECT nabla.current_seq('public.orders_by_k');           -- e.g. 42
+SELECT nabla.current_seq('orders_by_k');                  -- e.g. 42
 LISTEN "nabla:public.orders_by_k";
-SELECT * FROM nabla.changes('public.orders_by_k', 42);    -- rows with seq > 42
+SELECT * FROM nabla.changes('orders_by_k', 42, 1);        -- rows with seq > 42, epoch 1
 ```
 
 SQL API (schema `nabla`):
@@ -160,8 +161,9 @@ SQL API (schema `nabla`):
   straddles `max_rows` is returned in full, so a result may exceed
   `max_rows`. `epoch` must be the epoch from the subscriber's bootstrap.
   `_nabla_*` columns are removed from `row` unless `include_hidden`.
-- `visible_columns(name) -> text[]`: the definition's output columns, for
-  clients that read the view table and want to drop the `_nabla_*` columns.
+- `visible_columns(name) -> text[]`: the definition's output columns (the
+  columns of the VIEW); `storage_table(name) -> regclass`: the storage table
+  behind it, with the hidden `_nabla_*` columns.
 - `frontier(name) -> pg_lsn`; `wait_for(name, lsn pg_lsn | text, timeout_ms
   default 5000) -> bool` (the text overload takes the form `changes()` and
   `status()` return); `current_seq(name) -> bigint`.
@@ -186,8 +188,18 @@ Changelog: the v0.1 `changes()` signature changed (added `epoch` and
 `frontier`; `wait_for` gained a text overload; `nabla.views.resync_seq` was
 removed.
 
-View names must be schema-qualified. View tables reject direct DML
-(`nabla: cannot modify a nabla view directly`).
+View names are resolved like relation names: unqualified names are created
+in the search_path's creation namespace and looked up through the
+search_path; quoted identifiers keep their case, unquoted ones fold to
+lowercase; the canonical name (`status().name`, the LISTEN channel) is the
+schema-qualified form quoted only where needed. The user object is a plain
+VIEW exposing the definition's columns over a storage table
+`nabla_store.v<id>` (`nabla.storage_table(name)`), which also carries the
+hidden `_nabla_*` maintenance columns, the unique index and the write
+guard; DML through the VIEW is rewritten onto the storage table and
+rejected (`nabla: cannot modify a nabla view directly`, NB005). Renaming or
+moving the VIEW with ALTER VIEW is not supported (maintenance continues, the
+channel name does not follow).
 
 GUCs: `nabla.database`, `nabla.poll_interval_ms` (100),
 `nabla.retain_deltas` (100000), `nabla.max_slot_lag_bytes` (1 GiB),
