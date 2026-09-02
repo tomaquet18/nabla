@@ -1,7 +1,7 @@
 # nabla Individual Contributor License Agreement
 
 Thank you for your interest in contributing to nabla (the "Project"), whose
-copyright is held by tomaquet18 (the "Licensor").
+copyright is held by Alex Fernández Sabaté (the "Licensor").
 
 This Contributor License Agreement ("Agreement") clarifies the intellectual
 property license granted with Contributions from any person or entity. It
