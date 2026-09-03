@@ -809,7 +809,7 @@ assert_eq "wait_for() accepts the text LSN form" "t|t" \
 assert_eq "SQLSTATE NB004 for unsupported definitions" "NB004" "$(sqlstate_of "SELECT nabla.create_view('public.x', 'SELECT DISTINCT id FROM orders')")"
 assert_eq "SQLSTATE NB005 for direct writes" "NB005" "$(sqlstate_of "DELETE FROM canon_test")"
 assert_eq "the client branches on SQLSTATEs, never on message text" "0" \
-  "$(grep -cE 'lagged behind|is stale' /work/clients/rust/nabla-client/src/lib.rs)"
+  "$(grep -cE 'lagged behind|is stale' "$CLIENT_DIR/src/lib.rs")"
 q "SELECT nabla.drop_view('public.canon_test')" >/dev/null
 
 # --- 21. non-blocking create and refresh ------------------------------------
