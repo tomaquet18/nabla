@@ -689,7 +689,9 @@ reject "join over a nabla view" "SELECT o.id FROM shop.orders o JOIN order_lines
 
 # --- 19. reference client ------------------------------------------------------
 echo "== 19. reference client (clients/rust/nabla-client)"
-CLIENT_DIR=/work/clients/rust/nabla-client
+# Relative to this script, so the suite runs the same inside the dev container
+# (/work) and on a CI runner (wherever the checkout lives).
+CLIENT_DIR=$(cd "$(dirname "$0")/.." && pwd)/clients/rust/nabla-client
 (cd "$CLIENT_DIR" && cargo build --release --example follow >/tmp/nabla-client-build.log 2>&1) \
   || die "client build failed: $(tail -n 30 /tmp/nabla-client-build.log)"
 FOLLOW="$CLIENT_DIR/target/release/examples/follow"
