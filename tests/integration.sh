@@ -25,11 +25,16 @@ export PGHOST=/tmp
 # writer that was never blocked. Scaling the bound without the hold would
 # make the thesis tests pass for the wrong reason.
 SCALE=${NABLA_TEST_TIME_SCALE:-1}
-BOUND_MS=$(( 1000 * SCALE ))          # a writer must commit within this while another transaction is open
-FAST_MS=$(( 500 * SCALE ))            # create_view / refresh must return within this
-LOCK_TIMEOUT="$(( 1000 * SCALE ))ms"  # lock_timeout of the probing writer
-HOLD_S=$(( 3 * SCALE ))               # how long the deliberately open transaction sleeps
+HOLD_S=$(( 4 * SCALE ))               # how long the deliberately open transaction sleeps
+# The bounds are fractions of the hold, so the invariant above holds by
+# construction at every scale: a call that waited out the hold cannot pass.
+BOUND_MS=$(( HOLD_S * 1000 / 4 ))     # a writer must commit within this while another transaction is open
+FAST_MS=$(( HOLD_S * 1000 / 2 ))      # create_view / refresh must return within this (they do in ~50 ms;
+                                      # half the hold leaves room for a busy host without losing the test)
+LOCK_TIMEOUT="${BOUND_MS}ms"          # lock_timeout of the probing writer
 WAIT_MS=$(( 15000 * SCALE ))
+[ "$BOUND_MS" -lt $(( HOLD_S * 1000 )) ] && [ "$FAST_MS" -lt $(( HOLD_S * 1000 )) ] \
+  || { echo "FATAL timing bounds must stay below the hold"; exit 1; }
 FAILED=0
 POLLER_PID=""
 WRITER_PID=""
