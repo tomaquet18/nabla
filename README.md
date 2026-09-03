@@ -52,58 +52,62 @@ derived view at all, maintained by [pg_ivm](https://github.com/sraoss/pg_ivm)
 (the established incremental-view extension, which does the work inside the
 writing transaction), and maintained by nabla.
 
-Inserts into `orders`, transactions per second:
+Inserts into `orders`, transactions per second (median of three runs):
 
 | pgbench clients | no view | pg_ivm | nabla |
 |---:|---:|---:|---:|
-| 1 | 857 | 681 | 857 |
-| 4 | 1796 | 716 | 1803 |
-| 16 | 6335 | 677 | 6591 |
+| 1 | 774 | 509 | 683 |
+| 4 | 1675 | 535 | 1571 |
+| 16 | 6272 | 520 | 5876 |
 
 Read the pg_ivm column downwards: it does not move. Adding writers does not add
 throughput, because each one waits for an exclusive lock on the view while it is
-maintained. By sixteen clients that is **11% of what the same hardware does
+maintained. By sixteen clients that is **8% of what the same hardware does
 without a view** — and the same shape shows up on the other two workloads, where
-pg_ivm holds at 573 tps updating `orders` and 461 tps updating `customers`
-against baselines of 6785 and 6804. Two independent full runs agree on this
-within two points.
+pg_ivm holds at 473 tps updating `orders` and 380 tps updating `customers`
+against baselines of 6336 and 5519. Three independent full runs agree on this
+within a few points.
 
 nabla's writers track the no-view baseline instead of flattening. How closely is
-below the noise of the test host: across those two runs nabla measured between
-71% and 104% of the baseline on the insert and update-`orders` workloads, with
-the baseline itself swinging as much as the difference being measured. Take the
-honest reading — nabla does not make writers wait, and its cost, whatever it is
-exactly, does not grow with concurrency.
+at the edge of what the test host can resolve: across those runs nabla measured
+between 71% and 104% of the baseline on the insert and update-`orders`
+workloads, with the baseline itself swinging almost as much between repetitions.
+Take the honest reading — nabla does not make writers wait, and its cost,
+whatever it is exactly, does not grow with concurrency.
 
 ## What that costs you
 
-Staleness, and it is not small. nabla moves the maintenance work off the writer;
-it does not make the work disappear. After ten seconds of writes at sixteen
-clients, this is how long the view took to become current again:
+Staleness. nabla moves the maintenance work off the writer; it does not make the
+work disappear, and a view is only as current as the worker is fast. After ten
+seconds of writes at sixteen clients, this is how long the view took to become
+current again, and what that means as a sustained rate the worker can keep up
+with indefinitely — compared with pg_ivm, whose write rate *is* its maintenance
+rate:
 
-| workload | catch-up after a 10 s burst |
-|---|---:|
-| insert into `orders` | 43 s |
-| update `orders` | 88 s |
-| update `customers` (one row, many groups) | **16 min** |
+| workload | catch-up after a 10 s burst | nabla sustains | pg_ivm sustains |
+|---|---:|---:|---:|
+| insert into `orders` | 44 s | 1325 tx/s | 520 tx/s |
+| update `orders` | 82 s | 684 tx/s | 473 tx/s |
+| update `customers` (one row, many groups) | 131 s | 456 tx/s | 380 tx/s |
 
-The last row is the honest worst case: changing one customer's region rewrites
-every group row that customer contributed to. nabla's writers pay nothing for it
-(95–108% of baseline in both runs) and the worker pays all of it — at that write
-rate the worker never catches up while the writers keep going, and the lag grows
-until the slot cap marks the view stale. pg_ivm pays the same fan-out, but
-synchronously and in front of the user: 7% of baseline throughput, with a view
-that is correct at commit.
+The last row is the honest one to watch. Changing one customer's region rewrites
+every group row that customer contributed to; nabla's writers pay nothing for it
+(104–109% of baseline) and the worker pays all of it, at a rate only a fifth
+above pg_ivm's. Below that rate the view lags by seconds; above it the lag grows
+until `nabla.max_slot_lag_bytes` marks the view stale rather than let the WAL
+fill the disk. That number was 68 tx/s — a fifteen-minute catch-up — until a
+missing index on the shadow tables was found; the worker's remaining cost is
+about 1.7 ms per source transaction, all in the apply phase, and batching it
+across a round is the next lever.
 
-Neither column is a score. pg_ivm spends write throughput to buy freshness;
-nabla spends freshness to buy write throughput. Pick the one your workload can
-afford.
+Neither column is a score. pg_ivm spends write throughput to buy a view that is
+correct at commit; nabla spends freshness to buy write throughput and a change
+feed. Pick the one your workload can afford.
 
 Full tables, spreads, methodology and the exact configuration of every arm are
 in [`bench/head-to-head/RESULTS.md`](bench/head-to-head/RESULTS.md); reproduce
-them with `scripts/dev.sh h2h`. The worker currently applies about **1300 source
-transactions per second** on this host (`scripts/dev.sh bench`), which is the
-number that decides how quickly the lag above drains.
+them with `scripts/dev.sh h2h`. All numbers are from a laptop under Docker
+Desktop for Windows.
 
 ## It tells you what changed
 
@@ -137,7 +141,7 @@ alone, without stopping the others.
 ## Status
 
 Version 0.1 is a walking skeleton: small on purpose, correct about what it
-accepts, explicit about what it rejects. It is covered by 284 integration
+accepts, explicit about what it rejects. It is covered by 295 integration
 assertions but has no production mileage yet. See
 [what it accepts](#v01-scope-two-accepted-shapes) and
 [what it does not do yet](#not-yet).
