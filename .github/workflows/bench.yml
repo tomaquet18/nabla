@@ -1,8 +1,13 @@
 # Nightly throughput floor. This is NOT a benchmark: a shared runner's numbers
-# are not comparable from one run to the next. It only catches a catastrophic
-# regression of the worker's apply path (the kind that once took the drain
-# rate to 22 tx/s): the run fails if the drain rate parsed from
-# scripts/bench.sh is below 200 tx/s or the 20k backlog was not drained.
+# are not comparable from one run to the next, and the runner is several times
+# slower than a developer laptop. It only catches a catastrophic regression of
+# the worker's apply path (the kind that once took the drain rate to 22 tx/s).
+#
+# The floor is therefore a RATE, never a wall-clock time: both the drain rate
+# sampled during the backlog and the rate achieved on the 20k single-row
+# backlog must stay at or above 200 source transactions per second. Whether
+# the backlog fully drained inside the cap depends on the host, so it is not
+# part of the floor; the cap is only there to keep the job bounded.
 name: Bench floor
 
 on:
@@ -12,6 +17,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  FLOOR_TPS: 200
 
 jobs:
   bench:
@@ -25,16 +33,21 @@ jobs:
       - name: Run scripts/bench.sh
         run: |
           set -o pipefail
-          DRAIN_CAP_S=120 bash scripts/bench.sh 2>&1 | tee bench.out
+          DRAIN_CAP_S=600 bash scripts/bench.sh 2>&1 | tee bench.out
 
       - name: Apply the floor
         run: |
           set -eu
-          rate=$(grep -oE 'drain rate: [0-9]+ tx/s' bench.out | grep -oE '[0-9]+' | head -n 1 || true)
-          echo "drain rate: ${rate:-not found} tx/s"
-          if [ -z "$rate" ]; then echo "::error::drain rate not found in the bench output"; exit 1; fi
-          if [ "$rate" -lt 200 ]; then echo "::error::drain rate $rate tx/s is below the 200 tx/s floor"; exit 1; fi
-          if grep -q 'NOT drained' bench.out; then echo "::error::the 20k backlog was not drained"; exit 1; fi
+          # "drain rate: N tx/s" is sampled over 10 s while a backlog exists.
+          sampled=$(grep -oE 'drain rate: [0-9]+ tx/s' bench.out | grep -oE '[0-9]+' | head -n 1 || true)
+          # The 20k backlog line reads either "drained 20000 transactions in N ms (R tx/s; ..."
+          # or "NOT drained within N s: A of 20000 applied (R tx/s)"; R is what matters.
+          backlog=$(grep -E '^(drained [0-9]+ transactions|NOT drained)' bench.out | grep -oE '\([0-9]+ tx/s' | grep -oE '[0-9]+' | head -n 1 || true)
+          echo "sampled drain rate: ${sampled:-not found} tx/s; 20k backlog rate: ${backlog:-not found} tx/s; floor: $FLOOR_TPS tx/s"
+          if [ -z "$sampled" ] || [ -z "$backlog" ]; then echo "::error::could not parse the bench output"; exit 1; fi
+          if [ "$sampled" -lt "$FLOOR_TPS" ]; then echo "::error::sampled drain rate $sampled tx/s is below the floor"; exit 1; fi
+          if [ "$backlog" -lt "$FLOOR_TPS" ]; then echo "::error::20k backlog rate $backlog tx/s is below the floor"; exit 1; fi
+          if grep -q 'NOT drained' bench.out; then echo "::warning::the 20k backlog did not fully drain inside the cap on this runner (rate was $backlog tx/s, above the floor)"; fi
           echo "floor passed"
 
       - name: Keep the bench output and server log
