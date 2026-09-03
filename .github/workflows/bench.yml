@@ -1,0 +1,48 @@
+# Nightly throughput floor. This is NOT a benchmark: a shared runner's numbers
+# are not comparable from one run to the next. It only catches a catastrophic
+# regression of the worker's apply path (the kind that once took the drain
+# rate to 22 tx/s): the run fails if the drain rate parsed from
+# scripts/bench.sh is below 200 tx/s or the 20k backlog was not drained.
+name: Bench floor
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-pgrx
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run scripts/bench.sh
+        run: |
+          set -o pipefail
+          DRAIN_CAP_S=120 bash scripts/bench.sh 2>&1 | tee bench.out
+
+      - name: Apply the floor
+        run: |
+          set -eu
+          rate=$(grep -oE 'drain rate: [0-9]+ tx/s' bench.out | grep -oE '[0-9]+' | head -n 1 || true)
+          echo "drain rate: ${rate:-not found} tx/s"
+          if [ -z "$rate" ]; then echo "::error::drain rate not found in the bench output"; exit 1; fi
+          if [ "$rate" -lt 200 ]; then echo "::error::drain rate $rate tx/s is below the 200 tx/s floor"; exit 1; fi
+          if grep -q 'NOT drained' bench.out; then echo "::error::the 20k backlog was not drained"; exit 1; fi
+          echo "floor passed"
+
+      - name: Keep the bench output and server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output
+          path: |
+            bench.out
+            /tmp/nabla-bench-pg.log
+          if-no-files-found: ignore

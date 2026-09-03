@@ -7,6 +7,7 @@
 **Materialized views for PostgreSQL that stay current without ever blocking your
 writers — and that your application can subscribe to.**
 
+[![CI](https://github.com/tomaquet18/nabla/actions/workflows/ci.yml/badge.svg)](https://github.com/tomaquet18/nabla/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/extension-AGPL--3.0--or--later-1D4ED8)](LICENSE)
 [![Client license](https://img.shields.io/badge/client-MIT%20OR%20Apache--2.0-0284C7)](clients/rust/nabla-client)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17-336791)](https://www.postgresql.org/)
@@ -579,6 +580,17 @@ scripts/dev.sh shell     # interactive shell in the container
 ```
 
 `target/` and the cargo registry live in named Docker volumes.
+
+Every push and pull request runs formatting (`scripts/dev.sh fmt`), license
+headers (`scripts/dev.sh licenses`), clippy (`scripts/dev.sh clippy`), the
+unit tests and the 295-assertion integration suite on a native GitHub runner
+(`.github/workflows/ci.yml`, toolchain in `.github/actions/setup-pgrx`). The
+throughput benchmark runs nightly (`bench.yml`) behind a floor that only
+catches a catastrophic regression; a shared runner's numbers are not a
+benchmark. Timing-sensitive assertions scale on CI through
+`NABLA_TEST_TIME_SCALE`, which stretches the bounds and the transactions the
+suite deliberately holds open by the same factor. The dev image is rebuilt
+weekly (`image.yml`) so the two environments cannot drift apart unnoticed.
 
 ## How it works
 

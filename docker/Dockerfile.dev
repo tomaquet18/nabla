@@ -48,4 +48,7 @@ RUN cargo install cargo-pgrx --locked --version '~0.17'
 # Reuse the system server instead of letting pgrx compile its own.
 RUN cargo pgrx init --pg${PG_MAJOR} /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
 
+# rustfmt and clippy, so scripts/dev.sh fmt and clippy match the CI gates.
+RUN rustup component add rustfmt clippy
+
 CMD ["bash"]

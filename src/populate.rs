@@ -52,7 +52,11 @@ extern "C-unwind" {
         target_rec_ptr: pg_sys::XLogRecPtr,
         cur_page: *mut std::ffi::c_char,
     ) -> c_int;
-    fn wal_segment_open(state: *mut pg_sys::XLogReaderState, next_seg_no: pg_sys::XLogSegNo, tli_p: *mut pg_sys::TimeLineID);
+    fn wal_segment_open(
+        state: *mut pg_sys::XLogReaderState,
+        next_seg_no: pg_sys::XLogSegNo,
+        tli_p: *mut pg_sys::TimeLineID,
+    );
     fn wal_segment_close(state: *mut pg_sys::XLogReaderState);
 }
 
@@ -239,7 +243,10 @@ fn build(view: &Pending, consistent_point: u64, shadows_done: &mut BTreeSet<u32>
         match in_subtransaction(move || Ok(definition::validate(&definition).0)) {
             Ok(spec) => {
                 let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
-                run_args("UPDATE nabla.views SET spec = $2::jsonb WHERE id = $1", &[view.id.into(), json.as_str().into()])?;
+                run_args(
+                    "UPDATE nabla.views SET spec = $2::jsonb WHERE id = $1",
+                    &[view.id.into(), json.as_str().into()],
+                )?;
                 spec
             }
             Err(message) => {
@@ -410,7 +417,7 @@ pub fn populate_group(group: &[Pending]) -> Result<u64, String> {
         if !pg_sys::MyReplicationSlot.is_null() {
             pg_sys::ReplicationSlotRelease();
         }
-        let _ = PgTryBuilder::new(AssertUnwindSafe(|| {
+        PgTryBuilder::new(AssertUnwindSafe(|| {
             pg_sys::ReplicationSlotDrop(slot_ptr, true);
         }))
         .catch_others(|_| ())
@@ -430,9 +437,12 @@ pub fn record_failure(group: &[Pending], message: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs a closure in its own ordinary worker transaction.
+pub type InTransaction<'a> = &'a dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>;
+
 /// Process every pending view. `in_transaction` runs a closure in its own
 /// ordinary worker transaction. Returns true when something was attempted.
-pub fn run_pending(in_transaction: &dyn Fn(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String>) -> Result<bool, String> {
+pub fn run_pending(in_transaction: InTransaction<'_>) -> Result<bool, String> {
     let mut pending: Vec<Pending> = Vec::new();
     in_transaction(&mut || {
         pending = load_pending()?;

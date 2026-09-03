@@ -99,10 +99,7 @@ fn parse_name(name: &str) -> ParsedName {
         let list = pg_sys::stringToQualifiedNameList(c.as_ptr(), std::ptr::null_mut());
         let rv = pg_sys::makeRangeVarFromNameList(list);
         if !(*rv).catalogname.is_null() {
-            errors::invalid(
-                format!("nabla: view name \"{name}\" must have at most two parts (schema.name)"),
-                None,
-            );
+            errors::invalid(format!("nabla: view name \"{name}\" must have at most two parts (schema.name)"), None);
         }
         let schema = if (*rv).schemaname.is_null() { None } else { Some(text((*rv).schemaname)) };
         ParsedName { schema, rel: text((*rv).relname), range_var: rv }
@@ -143,11 +140,7 @@ fn visible_relid(parsed: &ParsedName) -> Option<u32> {
 }
 
 fn not_found(name: &str) -> ! {
-    errors::raise(
-        PgSqlErrorCode::ERRCODE_UNDEFINED_TABLE,
-        format!("nabla: view \"{name}\" does not exist"),
-        None,
-    )
+    errors::raise(PgSqlErrorCode::ERRCODE_UNDEFINED_TABLE, format!("nabla: view \"{name}\" does not exist"), None)
 }
 
 /// Find an existing view: through the search_path by the VIEW's oid, or,
@@ -412,12 +405,7 @@ mod nabla {
         let view_id = Spi::get_one_with_args::<i32>(
             "INSERT INTO nabla.views (name, definition, shape, spec, frontier_lsn, status) \
              VALUES ($1, $2, $3, $4::jsonb, '0/0', 'initializing') RETURNING id",
-            &[
-                canonical.as_str().into(),
-                definition.into(),
-                spec.shape.as_str().into(),
-                spec_json.as_str().into(),
-            ],
+            &[canonical.as_str().into(), definition.into(), spec.shape.as_str().into(), spec_json.as_str().into()],
         )
         .unwrap_or_else(|e| spi_fail(e))
         .expect("view id");
@@ -458,7 +446,10 @@ mod nabla {
         let view = find_view(name);
         for rel in &view.spec.relations {
             if regclass_text(rel.oid).is_none() {
-                errors::failed(&view.name, Some(&format!("base table {} (oid {}) no longer exists", rel.qualified, rel.oid)));
+                errors::failed(
+                    &view.name,
+                    Some(&format!("base table {} (oid {}) no longer exists", rel.qualified, rel.oid)),
+                );
             }
         }
         // The slot may have been dropped for lag; recreate it before any write.
@@ -540,6 +531,9 @@ mod nabla {
     RETURNS TABLE (name text, status text, epoch int, frontier_lsn pg_lsn, frontier text, current_seq bigint, stale_reason text)
     STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     "#)]
+    // pgrx generates the SQL signature from the literal tuple type, so it
+    // cannot be factored into a type alias.
+    #[allow(clippy::type_complexity)]
     fn status(
         name: &str,
     ) -> TableIterator<
@@ -609,7 +603,10 @@ mod nabla {
         epoch: i32,
         max_rows: i32,
         include_hidden: bool,
-    ) -> TableIterator<'static, (name!(seq, i64), name!(lsn, String), name!(xid, Option<i64>), name!(op, String), name!(row, JsonB))> {
+    ) -> TableIterator<
+        'static,
+        (name!(seq, i64), name!(lsn, String), name!(xid, Option<i64>), name!(op, String), name!(row, JsonB)),
+    > {
         let view = find_view(name);
         let canonical = view.name.clone();
         match view.status.as_str() {

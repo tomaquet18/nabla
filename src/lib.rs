@@ -29,4 +29,3 @@ pub extern "C-unwind" fn _PG_init() {
     idle::register();
     worker::register();
 }
-

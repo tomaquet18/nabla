@@ -38,6 +38,27 @@ scripts/dev.sh playground   # a cluster with nabla installed, for hands-on use
 A change is complete when the integration suite passes and, for anything that
 touches the worker's apply path, the benchmark does not regress.
 
+## What a pull request must pass
+
+`.github/workflows/ci.yml` runs these on every push and pull request; each
+can be run locally first:
+
+| gate | locally |
+|---|---|
+| `cargo fmt --check` in both crates (`rustfmt.toml`: width 120) | `scripts/dev.sh fmt` |
+| SPDX header on every source file, license field in every manifest | `scripts/dev.sh licenses` (or `bash scripts/check-licenses.sh`) |
+| `cargo clippy -D warnings` in both crates | `scripts/dev.sh clippy` |
+| `cargo test --lib` | `scripts/dev.sh unit` |
+| `tests/integration.sh`, all assertions | `scripts/dev.sh test` |
+
+CI runs the integration suite with `NABLA_TEST_TIME_SCALE=5` because shared
+runners are slower than a workstation; the variable scales every timing
+bound and every transaction the suite holds open on purpose, so the
+"writers are never blocked" tests keep discriminating. If a timing assertion
+is flaky locally, run `NABLA_TEST_TIME_SCALE=2 scripts/dev.sh test` rather
+than loosening a bound. The nightly benchmark (`bench.yml`) is a floor
+against catastrophic regressions, not a number to optimise for.
+
 ## Commits and pull requests
 
 - Conventional commit messages (`feat:`, `fix:`, `perf:`, `docs:`, `chore:`),

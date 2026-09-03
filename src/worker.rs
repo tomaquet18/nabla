@@ -54,9 +54,7 @@ const FULL_OLD_TUPLE: u8 = 79; // b'O'
 
 pub fn register() {
     if !unsafe { pg_sys::process_shared_preload_libraries_in_progress } {
-        pgrx::warning!(
-            "nabla: not loaded via shared_preload_libraries; the background worker will not start"
-        );
+        pgrx::warning!("nabla: not loaded via shared_preload_libraries; the background worker will not start");
         return;
     }
     BackgroundWorkerBuilder::new("nabla worker")
@@ -88,9 +86,7 @@ fn try_transaction<R>(body: impl FnOnce() -> R) -> Result<R, String> {
         pg_sys::StartTransactionCommand();
         pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
     }
-    let result = PgTryBuilder::new(AssertUnwindSafe(|| Ok(body())))
-        .catch_others(|e| Err(describe(&e)))
-        .execute();
+    let result = PgTryBuilder::new(AssertUnwindSafe(|| Ok(body()))).catch_others(|e| Err(describe(&e))).execute();
     unsafe {
         match &result {
             Ok(_) => {
@@ -141,10 +137,13 @@ fn select_one<T: FromDatum + IntoDatum>(sql: &str, args: &[DatumWithOid]) -> Res
     .map_err(spi_err)
 }
 
+/// One row of two nullable columns, or None when the query returned nothing.
+type TwoColumns<A, B> = Option<(Option<A>, Option<B>)>;
+
 fn select_two<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
     sql: &str,
     args: &[DatumWithOid],
-) -> Result<Option<(Option<A>, Option<B>)>, String> {
+) -> Result<TwoColumns<A, B>, String> {
     Spi::connect(|client| {
         let table = client.select(sql, Some(1), args)?;
         if table.is_empty() {
@@ -338,24 +337,40 @@ fn change_relids(change: &Change) -> Vec<u32> {
 
 /// Primary key values of a change, taken from the old key tuple when pgoutput
 /// sent one, otherwise from the new tuple (the key did not change).
-fn key_values(pk_columns: &[String], rel: &Relation, old: Option<&Tuple>, new: Option<&Tuple>) -> Result<Vec<(usize, String)>, String> {
+fn key_values(
+    pk_columns: &[String],
+    rel: &Relation,
+    old: Option<&Tuple>,
+    new: Option<&Tuple>,
+) -> Result<Vec<(usize, String)>, String> {
     if pk_columns.is_empty() {
         return Err("no primary key columns recorded for the shadow".to_string());
     }
     let mut out = Vec::new();
     for pk in pk_columns {
-        let idx = rel.columns.iter().position(|c| &c.name == pk).ok_or_else(|| format!("primary key column {pk} is missing from the decoded row"))?;
+        let idx = rel
+            .columns
+            .iter()
+            .position(|c| &c.name == pk)
+            .ok_or_else(|| format!("primary key column {pk} is missing from the decoded row"))?;
         let value = old
             .and_then(|t| t.get(idx))
             .and_then(|v| if let ColumnValue::Text(s) = v { Some(s.clone()) } else { None })
-            .or_else(|| new.and_then(|t| t.get(idx)).and_then(|v| if let ColumnValue::Text(s) = v { Some(s.clone()) } else { None }))
+            .or_else(|| {
+                new.and_then(|t| t.get(idx))
+                    .and_then(|v| if let ColumnValue::Text(s) = v { Some(s.clone()) } else { None })
+            })
             .ok_or_else(|| format!("primary key column {pk} has no value in the decoded row"))?;
         out.push((idx, value));
     }
     Ok(out)
 }
 
-fn key_predicate(rel: &Relation, keys: &[(usize, String)], first_param: usize) -> Result<(String, Vec<Option<String>>), String> {
+fn key_predicate(
+    rel: &Relation,
+    keys: &[(usize, String)],
+    first_param: usize,
+) -> Result<(String, Vec<Option<String>>), String> {
     let mut conds = Vec::new();
     let mut values = Vec::new();
     for (n, (idx, value)) in keys.iter().enumerate() {
@@ -372,11 +387,7 @@ fn key_predicate(rel: &Relation, keys: &[(usize, String)], first_param: usize) -
 
 /// Indexes (in the decoded relation) of the shadow's active columns.
 fn shadow_column_indexes(shadow: &Shadow, rel: &Relation) -> Vec<usize> {
-    shadow
-        .columns
-        .iter()
-        .filter_map(|name| rel.columns.iter().position(|c| &c.name == name))
-        .collect()
+    shadow.columns.iter().filter_map(|name| rel.columns.iter().position(|c| &c.name == name)).collect()
 }
 
 /// The full old row of a change, read from the shadow by primary key, in the
@@ -385,7 +396,8 @@ fn shadow_old_row(shadow: &Shadow, rel: &Relation, old: Option<&Tuple>, new: Opt
     let keys = key_values(&shadow.pk_columns, rel, old, new)?;
     let (conds, values) = key_predicate(rel, &keys, 1)?;
     let indexes = shadow_column_indexes(shadow, rel);
-    let cols: Vec<String> = indexes.iter().map(|i| format!("{}::text", quote_identifier(&rel.columns[*i].name))).collect();
+    let cols: Vec<String> =
+        indexes.iter().map(|i| format!("{}::text", quote_identifier(&rel.columns[*i].name))).collect();
     let sql = format!("SELECT {} FROM {} WHERE {conds}", cols.join(", "), shadow.table);
     let args: Vec<DatumWithOid> = values.into_iter().map(|v| v.into()).collect();
     // Mutable SPI on purpose: the read-only path keeps the command id of the
@@ -413,7 +425,13 @@ fn shadow_old_row(shadow: &Shadow, rel: &Relation, old: Option<&Tuple>, new: Opt
 
 /// Apply a change to the shadow: insert, delete by key, or delete + insert,
 /// touching only the shadow's active columns (by name).
-fn shadow_apply(shadow: &Shadow, rel: &Relation, change: &Change, old_full: Option<&Tuple>, new_full: Option<&Tuple>) -> Result<(), String> {
+fn shadow_apply(
+    shadow: &Shadow,
+    rel: &Relation,
+    change: &Change,
+    old_full: Option<&Tuple>,
+    new_full: Option<&Tuple>,
+) -> Result<(), String> {
     let delete = |old: Option<&Tuple>, new: Option<&Tuple>| -> Result<(), String> {
         let keys = key_values(&shadow.pk_columns, rel, old, new)?;
         let (conds, values) = key_predicate(rel, &keys, 1)?;
@@ -553,7 +571,12 @@ fn record_shadow_failure(shadow: &mut Shadow, message: &str) -> Result<(), Strin
 
 /// Plan the effect of one change on one view. `old_full` is the complete old
 /// row when it came from a shadow.
-fn plan_change(view: &mut LiveView, rel: &Relation, change: &Change, old_full: Option<&Tuple>) -> Result<Planned, String> {
+fn plan_change(
+    view: &mut LiveView,
+    rel: &Relation,
+    change: &Change,
+    old_full: Option<&Tuple>,
+) -> Result<Planned, String> {
     let target = ViewTarget { name: &view.storage, spec: &view.spec };
     let mentions = |c: &str| view.definition.to_lowercase().contains(&c.to_lowercase());
     let mut ops = Vec::new();
@@ -679,7 +702,12 @@ fn insert_deltas(view_id: i32, deltas: &[PendingDelta]) -> Result<(), String> {
             let b = i * 6;
             values.push(format!(
                 "(${}, ${}, ${}::pg_lsn, ${}, ${}::\"char\", ${}::jsonb)",
-                b + 1, b + 2, b + 3, b + 4, b + 5, b + 6
+                b + 1,
+                b + 2,
+                b + 3,
+                b + 4,
+                b + 5,
+                b + 6
             ));
             args.push(view_id.into());
             args.push(d.seq.into());
@@ -776,7 +804,7 @@ fn apply_round(decoder: &mut Decoder, txs: &[SourceTransaction]) -> Result<Round
         for change in &tx.changes {
             for relid in change_relids(change) {
                 let rel = &relations[&relid];
-                let shadow_active = shadows.get(&relid).map_or(false, |s| !s.failed && tx.end_lsn > s.frontier);
+                let shadow_active = shadows.get(&relid).is_some_and(|s| !s.failed && tx.end_lsn > s.frontier);
 
                 let mut old_full: Option<Tuple> = None;
                 let mut shadow_error: Option<String> = None;
@@ -867,7 +895,13 @@ fn apply_round(decoder: &mut Decoder, txs: &[SourceTransaction]) -> Result<Round
                 Ok(deltas) => {
                     for d in deltas {
                         view.last_seq += 1;
-                        pending[vi].push(PendingDelta { seq: view.last_seq, lsn: tx.end_lsn, xid: tx.xid, op: d.op, row_json: d.row_json });
+                        pending[vi].push(PendingDelta {
+                            seq: view.last_seq,
+                            lsn: tx.end_lsn,
+                            xid: tx.xid,
+                            op: d.op,
+                            row_json: d.row_json,
+                        });
                     }
                     view.touched = view.touched || view.last_seq > seq_before;
                     view.frontier = tx.end_lsn;
@@ -977,7 +1011,7 @@ fn run_round(state: &mut WorkerState) -> Result<Round, String> {
 
     // Build or rebuild views that create_view/refresh queued, each group
     // under its own consistent snapshot (populate.rs), before decoding.
-    populate::run_pending(&|body| try_transaction(|| body()).and_then(|r| r))?;
+    populate::run_pending(&|body| try_transaction(body).and_then(|r| r))?;
 
     // Slot presence and lag.
     let slot = try_transaction(|| {
@@ -1141,7 +1175,8 @@ fn worker_main() {
     BackgroundWorker::connect_worker_to_spi(Some(&database), None);
     pgrx::log!("nabla worker: connected to database {database}");
 
-    let mut state = WorkerState { decoder: Decoder::default(), self_flush: 0, last_advance: 0, reported_missing_extension: false };
+    let mut state =
+        WorkerState { decoder: Decoder::default(), self_flush: 0, last_advance: 0, reported_missing_extension: false };
     let mut busy = false;
     loop {
         if !busy {

@@ -5,6 +5,9 @@
 #   scripts/dev.sh build    compile the extension (cargo build, debug profile)
 #   scripts/dev.sh test     install the extension and run tests/integration.sh
 #   scripts/dev.sh unit     run the Rust unit tests (cargo test --lib)
+#   scripts/dev.sh fmt      rustfmt --check on both crates (the CI gate)
+#   scripts/dev.sh clippy   clippy with -D warnings on both crates (the CI gate)
+#   scripts/dev.sh licenses SPDX header and manifest check (scripts/check-licenses.sh)
 #   scripts/dev.sh bench    worker throughput benchmark (scripts/bench.sh)
 #   scripts/dev.sh h2h      head-to-head benchmark against pg_ivm (bench/head-to-head)
 #   scripts/dev.sh client   build the reference client (clients/rust/nabla-client, release)
@@ -14,13 +17,13 @@
 #
 # target/ and the cargo registry live in named volumes: a bind-mounted target
 # directory on Windows is unusably slow.
+# shellcheck disable=SC2046  # $(common_args) is split on purpose: one docker argument per line
 set -eu
 
 # Git Bash on Windows needs the Windows-style path for docker -v (pwd -W);
 # elsewhere plain pwd is right.
 REPO_DIR=${NABLA_REPO_DIR:-"$(cd "$(dirname "$0")/.." && (pwd -W 2>/dev/null || pwd))"}
 IMAGE=${NABLA_IMAGE:-nabla-dev:17}
-PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config
 
 run_in_container() {
   MSYS_NO_PATHCONV=1 docker run --rm "$@"
@@ -44,11 +47,20 @@ case "$cmd" in
       "sudo chown -R dev:dev /work/target /usr/local/cargo/registry && cargo build"
     ;;
   test)
-    run_in_container $(common_args) "$IMAGE" bash -c \
+    run_in_container $(common_args) -e NABLA_TEST_TIME_SCALE "$IMAGE" bash -c \
       "sudo chown -R dev:dev /work/target /usr/local/cargo/registry /work/clients/rust/nabla-client/target && bash tests/integration.sh"
     ;;
   bench)
     run_in_container $(common_args) -e BACKLOG -e DRAIN_CAP_S "$IMAGE" bash -c "sudo chown -R dev:dev /work/target /usr/local/cargo/registry && bash scripts/bench.sh"
+    ;;
+  fmt)
+    run_in_container $(common_args) "$IMAGE" bash -c "rustup component list --installed | grep -q rustfmt || rustup component add rustfmt; cargo fmt --check && (cd clients/rust/nabla-client && cargo fmt --check)"
+    ;;
+  clippy)
+    run_in_container $(common_args) "$IMAGE" bash -c "sudo chown -R dev:dev /work/target /usr/local/cargo/registry /work/clients/rust/nabla-client/target && (rustup component list --installed | grep -q clippy || rustup component add clippy) && cargo clippy --all-targets -- -D warnings && (cd clients/rust/nabla-client && cargo clippy -- -D warnings)"
+    ;;
+  licenses)
+    bash "$(dirname "$0")/check-licenses.sh"
     ;;
   h2h)
     # Head-to-head benchmark against pg_ivm. Its image is the dev image plus
@@ -81,7 +93,7 @@ case "$cmd" in
     run_in_container $(common_args) "$IMAGE" bash -c "$*"
     ;;
   *)
-    echo "usage: $0 {build|test|unit|bench|h2h|client|shell|run CMD}" >&2
+    echo "usage: $0 {build|test|unit|fmt|clippy|licenses|bench|h2h|client|shell|run CMD}" >&2
     exit 2
     ;;
 esac

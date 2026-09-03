@@ -1,0 +1,28 @@
+# Weekly build of the local development image (docker/Dockerfile.dev), not
+# pushed anywhere: CI runs natively (.github/actions/setup-pgrx), developers
+# use the image, and this job notices when the two drift apart (a package
+# that no longer installs, a toolchain that no longer resolves).
+name: Dev image
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build docker/Dockerfile.dev
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.dev
+          push: false
+          tags: nabla-dev:17

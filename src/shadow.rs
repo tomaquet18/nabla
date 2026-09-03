@@ -138,7 +138,7 @@ pub fn relation_oid(name: &str) -> Option<u32> {
 }
 
 fn quoted_list(cols: &[String]) -> String {
-    cols.iter().map(|c| quote_identifier(c)).collect::<Vec<_>>().join(", ")
+    cols.iter().map(quote_identifier).collect::<Vec<_>>().join(", ")
 }
 
 fn pk_match(pk: &[String]) -> String {
@@ -179,7 +179,10 @@ fn index_join_keys(rel: &BaseRelation, active: &[String], previous: &[String], k
         run(&format!("CREATE INDEX IF NOT EXISTS {} ON {table} ({})", quote_identifier(&name), quote_identifier(key)));
     }
     let stored: Vec<String> = all.into_iter().collect();
-    run_args("UPDATE nabla.shadows SET join_keys = $2 WHERE relid = $1::oid", &[(rel.oid as i64).into(), stored.into()]);
+    run_args(
+        "UPDATE nabla.shadows SET join_keys = $2 WHERE relid = $1::oid",
+        &[(rel.oid as i64).into(), stored.into()],
+    );
 }
 
 fn store_columns(oid: u32, names: &[String], types: &[String]) {
@@ -279,7 +282,10 @@ fn create(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>, keys: &B
 pub fn ensure(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>, keys: &BTreeSet<String>) {
     match existing(rel.oid) {
         Some(current) => {
-            run_args("UPDATE nabla.shadows SET refcount = refcount + 1 WHERE relid = $1::oid", &[(rel.oid as i64).into()]);
+            run_args(
+                "UPDATE nabla.shadows SET refcount = refcount + 1 WHERE relid = $1::oid",
+                &[(rel.oid as i64).into()],
+            );
             let failed = Spi::get_one_with_args::<bool>(
                 "SELECT failed FROM nabla.shadows WHERE relid = $1::oid",
                 &[(rel.oid as i64).into()],

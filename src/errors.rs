@@ -46,11 +46,7 @@ extern "C-unwind" {
 fn make_sqlstate(code: &str) -> c_int {
     let bytes = code.as_bytes();
     assert!(bytes.len() == 5, "SQLSTATE must have five characters");
-    bytes
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (((*b as i32) - b'0' as i32) & 0x3F) << (6 * i))
-        .sum()
+    bytes.iter().enumerate().map(|(i, b)| (((*b as i32) - b'0' as i32) & 0x3F) << (6 * i)).sum()
 }
 
 /// Raise an ERROR with an arbitrary five-character SQLSTATE.

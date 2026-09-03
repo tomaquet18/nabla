@@ -197,11 +197,8 @@ fn classify(e: tokio_postgres::Error, epoch: i32) -> Failure {
         SQLSTATE_STALE => Failure::Stale(db.detail().unwrap_or("reason not recorded").to_string()),
         SQLSTATE_EPOCH_CHANGED => {
             // DETAIL is "epoch N -> M"; the client's epoch is N.
-            let to = db
-                .detail()
-                .and_then(|d| d.rsplit(' ').next())
-                .and_then(|m| m.parse::<i32>().ok())
-                .unwrap_or(epoch);
+            let to =
+                db.detail().and_then(|d| d.rsplit(' ').next()).and_then(|m| m.parse::<i32>().ok()).unwrap_or(epoch);
             Failure::EpochChanged { from: epoch, to }
         }
         SQLSTATE_FAILED => Failure::Other(Error::ViewFailed(db.detail().unwrap_or("reason not recorded").to_string())),
@@ -374,10 +371,7 @@ impl Subscription {
                 .start()
                 .await?;
             let status = tx
-                .query_one(
-                    "SELECT status, epoch, frontier, current_seq, stale_reason FROM nabla.status($1)",
-                    &[&view],
-                )
+                .query_one("SELECT status, epoch, frontier, current_seq, stale_reason FROM nabla.status($1)", &[&view])
                 .await?;
             let state: String = status.get(0);
             let reason: Option<String> = status.get(4);
@@ -500,10 +494,8 @@ impl Subscription {
     pub async fn wait_for(&self, lsn: &str, timeout: Duration) -> Result<bool> {
         let conn = self.conn.as_ref().ok_or(Error::NotConnected)?;
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let row = conn
-            .client
-            .query_one("SELECT nabla.wait_for($1, $2::text, $3)", &[&self.view, &lsn, &timeout_ms])
-            .await?;
+        let row =
+            conn.client.query_one("SELECT nabla.wait_for($1, $2::text, $3)", &[&self.view, &lsn, &timeout_ms]).await?;
         Ok(row.get(0))
     }
 

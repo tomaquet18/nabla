@@ -104,8 +104,5 @@ pub fn register() {
 
 /// The configured worker database, or `None` when unset or empty.
 pub fn database() -> Option<String> {
-    DATABASE
-        .get()
-        .and_then(|c| c.into_string().ok())
-        .filter(|s| !s.trim().is_empty())
+    DATABASE.get().and_then(|c| c.into_string().ok()).filter(|s| !s.trim().is_empty())
 }

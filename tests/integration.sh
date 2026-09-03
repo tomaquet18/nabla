@@ -12,7 +12,24 @@ DB=nabla_test
 LOG=/tmp/nabla-pg.log
 export PGHOST=/tmp
 
-WAIT_MS=15000
+# Timing bounds scale with NABLA_TEST_TIME_SCALE (default 1; CI runners use a
+# larger value). Every threshold below is multiplied by it: the bounds on how
+# long a writer or create_view/refresh may take (BOUND_MS, FAST_MS), the
+# lock_timeout of the probing writer (LOCK_TIMEOUT), the worker wait
+# (WAIT_MS) AND the length of the transaction the thesis tests hold open on
+# purpose (HOLD_S), and the population delay the create/refresh tests inject
+# (nabla.debug_populate_delay_ms, set inline as N * SCALE). Invariant: HOLD_S
+# and the population delay must stay above BOUND_MS and LOCK_TIMEOUT at every
+# scale. A writer that is in fact blocked waits out the
+# whole hold; only a bound shorter than the hold can tell that apart from a
+# writer that was never blocked. Scaling the bound without the hold would
+# make the thesis tests pass for the wrong reason.
+SCALE=${NABLA_TEST_TIME_SCALE:-1}
+BOUND_MS=$(( 1000 * SCALE ))          # a writer must commit within this while another transaction is open
+FAST_MS=$(( 500 * SCALE ))            # create_view / refresh must return within this
+LOCK_TIMEOUT="$(( 1000 * SCALE ))ms"  # lock_timeout of the probing writer
+HOLD_S=$(( 3 * SCALE ))               # how long the deliberately open transaction sleeps
+WAIT_MS=$(( 15000 * SCALE ))
 FAILED=0
 POLLER_PID=""
 WRITER_PID=""
@@ -25,6 +42,7 @@ die()  { printf 'FATAL %s\n' "$1"; [ -s /tmp/nabla-last.err ] && printf '      l
 # psql wrapper: unaligned, tuples only, stop on error.
 q() { psql -X -q -A -t -v ON_ERROR_STOP=1 -p "$PORT" -d "$DB" -c "$1" 2> >(tee /tmp/nabla-last.err >&2); }
 # Run a statement expected to fail; print its stderr.
+# shellcheck disable=SC2069  # stderr to stdout, stdout dropped: only the error text is wanted
 q_err() { psql -X -q -A -t -p "$PORT" -d "$DB" -c "$1" 2>&1 >/dev/null; }
 
 # SQLSTATE of a failing statement (psql verbose error format: ERROR:  XX000: ...).
@@ -168,13 +186,13 @@ assert_eq "last delta of the transaction is the final group row" "I|5" \
 
 # --- 4. writers are not blocked ---------------------------------------------
 echo "== 4. writers are not blocked"
-psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO orders (k, amount, status) VALUES (1, 10, 'paid'); SELECT pg_sleep(3); COMMIT" >/dev/null 2>&1 &
+psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO orders (k, amount, status) VALUES (1, 10, 'paid'); SELECT pg_sleep($HOLD_S); COMMIT" >/dev/null 2>&1 &
 WRITER_PID=$!
 sleep 0.5
 START_NS=$(date +%s%N)
-if q "SET lock_timeout = '1s'; INSERT INTO orders (k, amount, status) VALUES (2, 20, 'paid')" >/dev/null 2>/tmp/nabla-b.err; then
+if q "SET lock_timeout = '$LOCK_TIMEOUT'; INSERT INTO orders (k, amount, status) VALUES (2, 20, 'paid')" >/dev/null 2>/tmp/nabla-b.err; then
   ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
-  if [ "$ELAPSED_MS" -lt 1000 ]; then pass "concurrent writer committed in ${ELAPSED_MS} ms while another transaction was open"
+  if [ "$ELAPSED_MS" -lt "$BOUND_MS" ]; then pass "concurrent writer committed in ${ELAPSED_MS} ms while another transaction was open"
   else fail "writers not blocked" "commit took ${ELAPSED_MS} ms"; fi
 else
   fail "writers not blocked" "insert failed: $(cat /tmp/nabla-b.err)"
@@ -643,13 +661,13 @@ assert_eq "T1 and T2 deltas carry distinct increasing LSNs" "2|true" \
   "$(q "SELECT count(DISTINCT lsn) || '|' || (min(lsn::pg_lsn) < max(lsn::pg_lsn)) FROM $(CH public.order_lines $SEQ0)")"
 assert_eq "T2 rewrote every order of the customer" "3" \
   "$(q "SELECT count(*) FROM $(CH public.order_lines $SEQ0) WHERE op = 'I' AND row->>'customer' = 'Alicia'")"
-psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 1, 'paid'); SELECT pg_sleep(3); COMMIT" >/dev/null 2>&1 &
+psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 1, 'paid'); SELECT pg_sleep($HOLD_S); COMMIT" >/dev/null 2>&1 &
 WRITER_PID=$!
 sleep 0.5
 START_NS=$(date +%s%N)
-if q "SET lock_timeout = '1s'; UPDATE shop.customers SET name = 'Bob' WHERE id = 2" >/dev/null 2>/tmp/nabla-j.err; then
+if q "SET lock_timeout = '$LOCK_TIMEOUT'; UPDATE shop.customers SET name = 'Bob' WHERE id = 2" >/dev/null 2>/tmp/nabla-j.err; then
   ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
-  if [ "$ELAPSED_MS" -lt 1000 ]; then pass "writer on a joined table committed in ${ELAPSED_MS} ms while another transaction was open"
+  if [ "$ELAPSED_MS" -lt "$BOUND_MS" ]; then pass "writer on a joined table committed in ${ELAPSED_MS} ms while another transaction was open"
   else fail "join thesis" "commit took ${ELAPSED_MS} ms"; fi
 else
   fail "join thesis" "update failed: $(cat /tmp/nabla-j.err)"
@@ -795,22 +813,22 @@ q "SELECT nabla.drop_view('public.canon_test')" >/dev/null
 # --- 21. non-blocking create and refresh ------------------------------------
 echo "== 21. non-blocking create and refresh (consistent snapshot)"
 q "CREATE TABLE shop.events (id bigserial PRIMARY KEY, k int, amount numeric)" >/dev/null
-q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = 2000" >/dev/null
+q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = $(( 2000 * SCALE ))" >/dev/null
 q "SELECT pg_reload_conf()" >/dev/null
 sleep 0.3
-psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO shop.events (k, amount) VALUES (1, 10); SELECT pg_sleep(3); COMMIT" >/dev/null 2>&1 &
+psql -X -q -p "$PORT" -d "$DB" -c "BEGIN; INSERT INTO shop.events (k, amount) VALUES (1, 10); SELECT pg_sleep($HOLD_S); COMMIT" >/dev/null 2>&1 &
 WRITER_PID=$!
 sleep 0.4
 START_NS=$(date +%s%N)
 CREATED=$(q "SELECT nabla.create_view('public.events_view', 'SELECT id, k, amount FROM shop.events')")
 CREATE_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
 assert_eq "create_view returns immediately while a writer holds the table" "public.events_view|yes" \
-  "$CREATED|$( [ "$CREATE_MS" -lt 500 ] && echo yes || echo "no ($CREATE_MS ms)" )"
+  "$CREATED|$( [ "$CREATE_MS" -lt "$FAST_MS" ] && echo yes || echo "no ($CREATE_MS ms)" )"
 assert_eq "the view is initializing" "initializing" "$(q "SELECT status FROM nabla.status('public.events_view')")"
 START_NS=$(date +%s%N)
-if q "SET lock_timeout = '1s'; INSERT INTO shop.events (k, amount) VALUES (2, 20)" >/dev/null 2>/tmp/nabla-c.err; then
+if q "SET lock_timeout = '$LOCK_TIMEOUT'; INSERT INTO shop.events (k, amount) VALUES (2, 20)" >/dev/null 2>/tmp/nabla-c.err; then
   ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
-  if [ "$ELAPSED_MS" -lt 1000 ]; then pass "a second writer committed in ${ELAPSED_MS} ms while the view initializes"
+  if [ "$ELAPSED_MS" -lt "$BOUND_MS" ]; then pass "a second writer committed in ${ELAPSED_MS} ms while the view initializes"
   else fail "no lock during create" "commit took ${ELAPSED_MS} ms"; fi
 else
   fail "no lock during create" "insert failed: $(cat /tmp/nabla-c.err)"
@@ -842,7 +860,7 @@ q "SELECT pg_reload_conf()" >/dev/null
 q "SELECT nabla.create_view('public.revenue_by_region', \$d\$$REV_DEF\$d\$)" >/dev/null || die "create_view(revenue_by_region) failed"
 await_ready public.revenue_by_region
 wait_view public.revenue_by_region
-q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = 3000" >/dev/null
+q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = $(( 3000 * SCALE ))" >/dev/null
 q "SELECT pg_reload_conf()" >/dev/null
 sleep 0.3
 EPOCH_R=$(q "SELECT epoch FROM nabla.status('public.revenue_by_region')")
@@ -852,16 +870,16 @@ CONTENT_R=$(q "SELECT string_agg(region || ':' || n || ':' || revenue, ',' ORDER
 START_NS=$(date +%s%N)
 q "SELECT nabla.refresh('public.revenue_by_region')" >/dev/null || die "refresh(revenue_by_region) failed to start"
 REFRESH_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
-assert_eq "refresh returns immediately" "yes" "$( [ "$REFRESH_MS" -lt 500 ] && echo yes || echo "no ($REFRESH_MS ms)" )"
+assert_eq "refresh returns immediately" "yes" "$( [ "$REFRESH_MS" -lt "$FAST_MS" ] && echo yes || echo "no ($REFRESH_MS ms)" )"
 assert_eq "the view and the views sharing its shadows are refreshing" "refreshing|refreshing" \
   "$(q "SELECT status FROM nabla.status('public.revenue_by_region')")|$(q "SELECT status FROM nabla.status('public.order_lines')")"
 sleep 1
 assert_eq "readers still see the full old content and the old epoch while refreshing" "same|$EPOCH_R" \
   "$( [ "$(q "SELECT string_agg(region || ':' || n || ':' || revenue, ',' ORDER BY region) FROM revenue_by_region")" = "$CONTENT_R" ] && echo same || echo different )|$(q "SELECT epoch FROM nabla.status('public.revenue_by_region')")"
 START_NS=$(date +%s%N)
-if q "SET lock_timeout = '1s'; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 9, 'paid')" >/dev/null 2>/tmp/nabla-r.err; then
+if q "SET lock_timeout = '$LOCK_TIMEOUT'; INSERT INTO shop.orders (customer_id, product_id, qty, status) VALUES (1, 1, 9, 'paid')" >/dev/null 2>/tmp/nabla-r.err; then
   ELAPSED_MS=$(( ($(date +%s%N) - START_NS) / 1000000 ))
-  if [ "$ELAPSED_MS" -lt 1000 ]; then pass "a writer committed in ${ELAPSED_MS} ms while the view refreshes"
+  if [ "$ELAPSED_MS" -lt "$BOUND_MS" ]; then pass "a writer committed in ${ELAPSED_MS} ms while the view refreshes"
   else fail "refresh non-disruptive" "commit took ${ELAPSED_MS} ms"; fi
 else
   fail "refresh non-disruptive" "insert failed: $(cat /tmp/nabla-r.err)"
@@ -1204,7 +1222,7 @@ assert_eq "the planner flattens the VIEW and uses the storage index" "t" \
   "$(q "SET enable_seqscan = off; SELECT count(*) > 0 FROM (SELECT * FROM pg_catalog.pg_get_viewdef('app.sales'::regclass) v) x" >/dev/null; q "SET enable_seqscan = off; EXPLAIN SELECT * FROM app.sales WHERE region = 1" | grep -qE 'Index (Only )?Scan' && echo t || echo f)"
 # refresh keeps the VIEW's oid and readers keep the old rows meanwhile
 OID_BEFORE=$(q "SELECT 'app.sales'::regclass::oid")
-q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = 2000" >/dev/null
+q "ALTER SYSTEM SET nabla.debug_populate_delay_ms = $(( 2000 * SCALE ))" >/dev/null
 q "SELECT pg_reload_conf()" >/dev/null
 sleep 0.3
 ROWS_BEFORE=$(q "SELECT count(*) FROM app.sales")

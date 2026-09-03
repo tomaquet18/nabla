@@ -66,10 +66,7 @@ fn values_source(rel: &Relation, alias: &str, first_param: usize) -> Result<Stri
     let mut casts = Vec::with_capacity(rel.columns.len());
     let mut names = Vec::with_capacity(rel.columns.len());
     for (i, col) in rel.columns.iter().enumerate() {
-        let ty = col
-            .type_name
-            .as_deref()
-            .ok_or_else(|| format!("type of column {} not resolved", col.name))?;
+        let ty = col.type_name.as_deref().ok_or_else(|| format!("type of column {} not resolved", col.name))?;
         casts.push(format!("${}::{}", first_param + i, ty));
         names.push(quote_identifier(&col.name));
     }
@@ -242,7 +239,13 @@ pub fn plan_single_delete(view: &ViewTarget, rel: &Relation, key_kind: u8, old: 
 
 /// Delta rows of a join view for one row of relation `rel_index` (position
 /// in `spec.relations`): the row joins the shadows of every other relation.
-pub fn plan_join(view: &ViewTarget, rel_index: usize, rel: &Relation, row: &Tuple, sign: i32) -> Result<Vec<Op>, String> {
+pub fn plan_join(
+    view: &ViewTarget,
+    rel_index: usize,
+    rel: &Relation,
+    row: &Tuple,
+    sign: i32,
+) -> Result<Vec<Op>, String> {
     let spec = view.spec;
     let mut from = Vec::with_capacity(spec.relations.len());
     for (i, r) in spec.relations.iter().enumerate() {
@@ -291,12 +294,8 @@ fn projection_row(view: &ViewTarget, sign: i32, row_json: &str, deltas: &mut Vec
             deltas.push(Delta { op: 'I', row_json });
         }
     } else {
-        let conds: Vec<String> = view
-            .spec
-            .pk_view_columns
-            .iter()
-            .map(|c| format!("v.{c} = d.{c}", c = quote_identifier(c)))
-            .collect();
+        let conds: Vec<String> =
+            view.spec.pk_view_columns.iter().map(|c| format!("v.{c} = d.{c}", c = quote_identifier(c))).collect();
         let sql = format!(
             "DELETE FROM {view} AS v USING jsonb_populate_record(NULL::{view}, $1::jsonb) AS d \
              WHERE {conds} RETURNING to_jsonb(v)::text",
@@ -435,18 +434,13 @@ pub fn net(spec: &ViewSpec, deltas: Vec<Delta>) -> Vec<Delta> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let key: Vec<serde_json::Value> = identity
-            .iter()
-            .map(|c| row.get(*c).cloned().unwrap_or(serde_json::Value::Null))
-            .collect();
+        let key: Vec<serde_json::Value> =
+            identity.iter().map(|c| row.get(*c).cloned().unwrap_or(serde_json::Value::Null)).collect();
         let index = match order.iter().position(|k| *k == key) {
             Some(i) => i,
             None => {
                 order.push(key);
-                states.push(State {
-                    before: if d.op == 'D' { Some(row.clone()) } else { None },
-                    after: None,
-                });
+                states.push(State { before: if d.op == 'D' { Some(row.clone()) } else { None }, after: None });
                 states.len() - 1
             }
         };
@@ -503,7 +497,8 @@ mod net_tests {
 
     #[test]
     fn nets_to_final_state() {
-        let out = net(&spec(), vec![d('I', r#"{"k":1,"n":1}"#), d('D', r#"{"k":1,"n":1}"#), d('I', r#"{"k":1,"n":2}"#)]);
+        let out =
+            net(&spec(), vec![d('I', r#"{"k":1,"n":1}"#), d('D', r#"{"k":1,"n":1}"#), d('I', r#"{"k":1,"n":2}"#)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].op, 'I');
         assert!(out[0].row_json.contains(r#""n":2"#));
@@ -512,16 +507,25 @@ mod net_tests {
     #[test]
     fn insert_then_delete_is_silent_and_delete_keeps_before() {
         assert!(net(&spec(), vec![d('I', r#"{"k":1,"n":1}"#), d('D', r#"{"k":1,"n":1}"#)]).is_empty());
-        let out = net(&spec(), vec![d('D', r#"{"k":2,"n":3}"#), d('I', r#"{"k":2,"n":1}"#), d('D', r#"{"k":2,"n":1}"#)]);
+        let out =
+            net(&spec(), vec![d('D', r#"{"k":2,"n":3}"#), d('I', r#"{"k":2,"n":1}"#), d('D', r#"{"k":2,"n":1}"#)]);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].op, out[0].row_json.contains(r#""n":3"#)), ('D', true));
     }
 
     #[test]
     fn hidden_only_changes_are_silent_and_keys_keep_order() {
-        assert!(net(&spec(), vec![d('D', r#"{"k":1,"n":1,"_nabla_nn_0":0}"#), d('I', r#"{"k":1,"n":1,"_nabla_nn_0":1}"#)]).is_empty());
-        let out = net(&spec(), vec![d('D', r#"{"k":9,"n":1}"#), d('I', r#"{"k":9,"n":2}"#), d('D', r#"{"k":3,"n":5}"#)]);
-        let ops: Vec<(char, i64)> = out.iter().map(|x| (x.op, serde_json::from_str::<serde_json::Value>(&x.row_json).unwrap()["k"].as_i64().unwrap())).collect();
+        assert!(net(
+            &spec(),
+            vec![d('D', r#"{"k":1,"n":1,"_nabla_nn_0":0}"#), d('I', r#"{"k":1,"n":1,"_nabla_nn_0":1}"#)]
+        )
+        .is_empty());
+        let out =
+            net(&spec(), vec![d('D', r#"{"k":9,"n":1}"#), d('I', r#"{"k":9,"n":2}"#), d('D', r#"{"k":3,"n":5}"#)]);
+        let ops: Vec<(char, i64)> = out
+            .iter()
+            .map(|x| (x.op, serde_json::from_str::<serde_json::Value>(&x.row_json).unwrap()["k"].as_i64().unwrap()))
+            .collect();
         assert_eq!(ops, vec![('D', 9), ('I', 9), ('D', 3)]);
     }
 }

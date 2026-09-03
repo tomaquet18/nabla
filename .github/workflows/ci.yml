@@ -1,0 +1,81 @@
+# Continuous integration: formatting, license headers, clippy, unit tests and
+# the integration suite, on a native runner (no Docker image; see
+# .github/actions/setup-pgrx). Every job must pass before a pull request is
+# merged.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          components: rustfmt
+      - name: Extension
+        run: cargo fmt --check
+      - name: Client
+        run: cargo fmt --check
+        working-directory: clients/rust/nabla-client
+
+  licenses:
+    name: license headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/check-licenses.sh
+
+  test:
+    name: build, clippy, unit and integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-pgrx
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            clients/rust/nabla-client -> target
+
+      - name: Build the extension
+        run: cargo build
+      - name: Unit tests
+        run: cargo test --lib
+      - name: Clippy (extension)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (client)
+        run: cargo clippy -- -D warnings
+        working-directory: clients/rust/nabla-client
+      - name: Build the client and its follow example
+        run: cargo build --release --example follow
+        working-directory: clients/rust/nabla-client
+
+      - name: Integration suite
+        # Shared runners are slower and noisier than a workstation; the suite
+        # scales every timing bound (and the transactions it holds open on
+        # purpose) by this factor. See the comment on the variable in the suite.
+        env:
+          NABLA_TEST_TIME_SCALE: "5"
+        run: bash tests/integration.sh
+
+      - name: Keep the server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nabla-pg-log
+          path: /tmp/nabla-pg.log
+          if-no-files-found: ignore

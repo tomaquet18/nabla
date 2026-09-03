@@ -329,7 +329,8 @@ unsafe fn join_key_vars(node: *mut pg_sys::Node, out: &mut Vec<(i32, i16)>) {
         }
         Some(NodeTag::T_OpExpr) => {
             let op = &*(node as *mut pg_sys::OpExpr);
-            let builtin = pg_sys::get_func_namespace(pg_sys::get_opcode(op.opno)) == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE);
+            let builtin = pg_sys::get_func_namespace(pg_sys::get_opcode(op.opno))
+                == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE);
             if !builtin || text(pg_sys::get_opname(op.opno)) != "=" {
                 return;
             }
@@ -337,7 +338,9 @@ unsafe fn join_key_vars(node: *mut pg_sys::Node, out: &mut Vec<(i32, i16)>) {
             if args.len() != 2 {
                 return;
             }
-            if let (Some(l), Some(r)) = (operand_var(args[0] as *mut pg_sys::Node), operand_var(args[1] as *mut pg_sys::Node)) {
+            if let (Some(l), Some(r)) =
+                (operand_var(args[0] as *mut pg_sys::Node), operand_var(args[1] as *mut pg_sys::Node))
+            {
                 if l.0 != r.0 {
                     out.push(l);
                     out.push(r);
@@ -372,8 +375,8 @@ unsafe fn require_base_vars(node: *mut pg_sys::Node, allowed: &[i32]) {
 // --- analysis ----------------------------------------------------------------
 
 unsafe fn analyze(definition: &str) -> *mut pg_sys::Query {
-    let source = CString::new(definition)
-        .unwrap_or_else(|_| errors::invalid("nabla: the definition contains a NUL byte", None));
+    let source =
+        CString::new(definition).unwrap_or_else(|_| errors::invalid("nabla: the definition contains a NUL byte", None));
     let raw = pg_sys::raw_parser(source.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
     let statements = list_items(raw);
     match statements.len() {
@@ -551,11 +554,7 @@ fn lookup_base(relid: u32, nspname: &str, relname: &str) -> (BaseTable, Vec<i16>
             pk_attnums.push(row.get::<i32>(1)?.unwrap_or_default() as i16);
             pk_columns.push(row.get::<String>(2)?.unwrap_or_default());
         }
-        Ok::<_, pgrx::spi::Error>((
-            BaseTable { oid: relid, qualified, replident, pk_columns },
-            pk_attnums,
-            columns,
-        ))
+        Ok::<_, pgrx::spi::Error>((BaseTable { oid: relid, qualified, replident, pk_columns }, pk_attnums, columns))
     })
     .unwrap_or_else(|e| errors::invalid(format!("nabla: catalog lookup failed: {e}"), None))
 }
@@ -582,10 +581,7 @@ unsafe fn check_relation_kind(rte: *mut pg_sys::RangeTblEntry, qualified: &str, 
         b'v' => reject(format!("{qualified} is a view; the base must be an ordinary table")),
         b'm' => reject(format!("{qualified} is a materialized view; the base must be an ordinary table")),
         b'f' => reject(format!("{qualified} is a foreign table; the base must be an ordinary table")),
-        other => reject(format!(
-            "{qualified} is not an ordinary table (relkind '{}')",
-            other as char
-        )),
+        other => reject(format!("{qualified} is not an ordinary table (relkind '{}')", other as char)),
     }
     if nspname == "nabla" {
         reject(format!("{qualified} is a nabla catalog table and cannot be a base table"));
@@ -655,7 +651,12 @@ unsafe fn targets(query: *mut pg_sys::Query) -> Vec<Target> {
         .map(|item| {
             let tle = &*(item as *mut pg_sys::TargetEntry);
             let alias = if tle.resname.is_null() { "?column?".to_string() } else { text(tle.resname) };
-            Target { node: tle.expr as *mut pg_sys::Node, alias, sortgroupref: tle.ressortgroupref, resjunk: tle.resjunk }
+            Target {
+                node: tle.expr as *mut pg_sys::Node,
+                alias,
+                sortgroupref: tle.ressortgroupref,
+                resjunk: tle.resjunk,
+            }
         })
         .collect()
 }
@@ -794,7 +795,11 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                 .map(|item| {
                     let rte = item as *mut pg_sys::RangeTblEntry;
                     let eref = (*rte).eref;
-                    if eref.is_null() { String::from("t") } else { text((*eref).aliasname) }
+                    if eref.is_null() {
+                        String::from("t")
+                    } else {
+                        text((*eref).aliasname)
+                    }
                 })
                 .collect();
             Deparser::for_rtable((*query).rtable, &names)

@@ -85,10 +85,8 @@ impl<'a> Reader<'a> {
     }
     fn cstring(&mut self) -> Result<String, String> {
         let rest = &self.data[self.pos..];
-        let end = rest
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or_else(|| "unterminated string in pgoutput message".to_string())?;
+        let end =
+            rest.iter().position(|b| *b == 0).ok_or_else(|| "unterminated string in pgoutput message".to_string())?;
         let s = String::from_utf8_lossy(&rest[..end]).into_owned();
         self.pos += end + 1;
         Ok(s)
@@ -223,8 +221,7 @@ impl Decoder {
                 if self.current.is_some() {
                     return Err("BEGIN while a transaction is already open".to_string());
                 }
-                self.current =
-                    Some(SourceTransaction { xid, commit_lsn: final_lsn, end_lsn: 0, changes: Vec::new() });
+                self.current = Some(SourceTransaction { xid, commit_lsn: final_lsn, end_lsn: 0, changes: Vec::new() });
             }
             Message::Commit { commit_lsn, end_lsn } => {
                 let mut tx = self.current.take().ok_or("COMMIT without BEGIN")?;
