@@ -1299,6 +1299,62 @@ assert_eq "notifications arrived at most once per view per round, and at least o
 LAST_PAYLOAD=$(grep -oE 'Asynchronous notification "nabla:public.s25_proj" with payload "[^"]+"' /tmp/nabla-listen25.out | tail -n 1 | grep -oE 'payload ".*"' | tr -d '"' | cut -c 9-)
 assert_eq "the last notification carries the view's current seq" "$(q "SELECT current_seq FROM nabla.status('public.s25_proj')")" "${LAST_PAYLOAD%%:*}"
 
+# --- 26. join-key indexes on shadows ---------------------------------------------
+echo "== 26. join-key indexes on shadows"
+q "CREATE TABLE s26_customers (id int PRIMARY KEY, region text)" >/dev/null
+q "CREATE TABLE s26_products (id int PRIMARY KEY, price numeric)" >/dev/null
+q "CREATE TABLE s26_orders (id bigserial PRIMARY KEY, customer_id int, product_id int, qty int, status text)" >/dev/null
+q "INSERT INTO s26_customers SELECT i, 'region ' || (i % 7) FROM generate_series(1, 500) i" >/dev/null
+q "INSERT INTO s26_products SELECT i, i % 20 + 1 FROM generate_series(1, 50) i" >/dev/null
+q "INSERT INTO s26_orders (customer_id, product_id, qty, status) SELECT 1 + i % 500, 1 + i % 50, 1 + i % 3, CASE WHEN i % 5 = 0 THEN 'new' ELSE 'paid' END FROM generate_series(1, 50000) i" >/dev/null
+q "ANALYZE" >/dev/null
+# First a view joining orders on product_id only: the orders shadow gets that one index.
+q "SELECT nabla.create_view('public.s26_by_product', 'SELECT p.id AS product_id, count(*) AS n FROM s26_orders o JOIN s26_products p ON p.id = o.product_id GROUP BY p.id')" >/dev/null || die "create_view(s26_by_product) failed"
+await_ready public.s26_by_product
+SO=$(q "SELECT table_name FROM nabla.shadows WHERE relid = 's26_orders'::regclass")
+SP=$(q "SELECT table_name FROM nabla.shadows WHERE relid = 's26_products'::regclass")
+shadow_indexes() { q "SELECT string_agg(indexdef, ' | ' ORDER BY indexname) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${1#nabla_shadow.}'"; }
+assert_eq "one join key gives the orders shadow exactly one extra index, on product_id" "1|1|0" \
+  "$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}' AND indexdef LIKE '%(product_id)'")|$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}' AND indexdef NOT LIKE 'CREATE UNIQUE%'")|$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}' AND indexdef LIKE '%(customer_id)'")"
+assert_eq "the products shadow's join key is its single primary key: only the unique index" "1|{id}" \
+  "$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SP#nabla_shadow.}'")|$(q "SELECT join_keys FROM nabla.shadows WHERE relid = 's26_products'::regclass")"
+assert_eq "join_keys of the orders shadow after the first view" "{product_id}" "$(q "SELECT join_keys FROM nabla.shadows WHERE relid = 's26_orders'::regclass")"
+# The three-table view reuses the shadow and adds exactly the missing customer_id index.
+q "SELECT nabla.create_view('public.s26_rev', 'SELECT c.region, count(*) AS n, sum(o.qty * p.price) AS revenue FROM s26_orders o JOIN s26_customers c ON c.id = o.customer_id JOIN s26_products p ON p.id = o.product_id WHERE o.status = ''paid'' GROUP BY c.region')" >/dev/null || die "create_view(s26_rev) failed"
+await_ready public.s26_rev
+SC=$(q "SELECT table_name FROM nabla.shadows WHERE relid = 's26_customers'::regclass")
+assert_eq "the second view adds the customer_id index and nothing else" "3|1|0|{customer_id,product_id}" \
+  "$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}'")|$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}' AND indexname = '${SO#nabla_shadow.}_customer_id_idx'")|$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}' AND indexdef LIKE '%status%'")|$(q "SELECT join_keys FROM nabla.shadows WHERE relid = 's26_orders'::regclass")"
+assert_eq "the customers shadow needs no extra index (join key = single primary key)" "1" \
+  "$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SC#nabla_shadow.}'")"
+assert_eq "the spec records the join keys per relation" "customer_id,product_id|id|id" \
+  "$(q "SELECT string_agg(r->>'join_keys', '|') FROM (SELECT jsonb_array_elements(spec->'relations') r FROM nabla.views WHERE name = 'public.s26_rev') s" | sed 's/\[\"//g; s/\"\]//g; s/\", \"/,/g; s/\",\"/,/g')"
+# The worker's delta query for a customer change must not scan the orders shadow.
+PLAN=$(psql -X -q -A -t -p "$PORT" -d "$DB" -c "EXPLAIN SELECT c.region, count(*) AS n, sum(o.qty * p.price) AS revenue FROM (VALUES (1::int, 'region 1'::text)) AS c(id, region), $SO AS o, $SP AS p WHERE (c.id = o.customer_id) AND (p.id = o.product_id) AND (o.status = 'paid') GROUP BY c.region")
+assert_eq "the delta query uses the customer_id index of the orders shadow (no Seq Scan on it)" "0|1" \
+  "$(printf '%s' "$PLAN" | grep -c "Seq Scan on ${SO#nabla_shadow.}")|$(printf '%s' "$PLAN" | grep -c "${SO#nabla_shadow.}_customer_id_idx")"
+# Fan-out floor: 200 single-row customer updates, each moving ~80 paid orders
+# between two groups, absorbed within 20 s (this only catches a regression to
+# sequential scans; it is not a benchmark).
+rev26_diff() { q "SELECT count(*) FROM ((SELECT region, n, revenue FROM s26_rev EXCEPT SELECT c.region, count(*), sum(o.qty * p.price) FROM s26_orders o JOIN s26_customers c ON c.id = o.customer_id JOIN s26_products p ON p.id = o.product_id WHERE o.status = 'paid' GROUP BY c.region) UNION ALL (SELECT c.region, count(*), sum(o.qty * p.price) FROM s26_orders o JOIN s26_customers c ON c.id = o.customer_id JOIN s26_products p ON p.id = o.product_id WHERE o.status = 'paid' GROUP BY c.region EXCEPT SELECT region, n, revenue FROM s26_rev)) d"; }
+wait_view public.s26_rev
+START26=$(date +%s%N)
+for i in $(seq 1 200); do q "UPDATE s26_customers SET region = 'region ' || (($i + 3) % 7) WHERE id = $i" >/dev/null; done
+FANOUT=$(q "SELECT nabla.wait_for('public.s26_rev', pg_current_wal_lsn(), 20000)")
+FANOUT_MS=$(( ($(date +%s%N) - START26) / 1000000 ))
+assert_eq "200 fan-out updates absorbed within 20 s" "t" "$FANOUT"
+echo "   (200 customer updates absorbed in ${FANOUT_MS} ms)"
+assert_eq "the aggregate join view equals its query after the fan-out" "0" "$(rev26_diff)"
+# drop_view leaves the indexes (join keys are never compacted); refresh rebuilds them.
+q "SELECT nabla.drop_view('public.s26_rev')" >/dev/null || die "drop_view(s26_rev) failed"
+assert_eq "drop_view keeps the shadow's indexes and join keys" "3|{customer_id,product_id}" \
+  "$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}'")|$(q "SELECT join_keys FROM nabla.shadows WHERE relid = 's26_orders'::regclass")"
+q "SELECT nabla.refresh('public.s26_by_product')" >/dev/null || die "refresh(s26_by_product) failed"
+await_ready public.s26_by_product
+assert_eq "refresh rebuilds the shadow with its indexes" "3|{customer_id,product_id}|50000" \
+  "$(q "SELECT count(*) FROM pg_indexes WHERE schemaname = 'nabla_shadow' AND tablename = '${SO#nabla_shadow.}'")|$(q "SELECT join_keys FROM nabla.shadows WHERE relid = 's26_orders'::regclass")|$(q "SELECT count(*) FROM $SO")"
+q "SELECT nabla.drop_view('public.s26_by_product')" >/dev/null || die "drop_view(s26_by_product) failed"
+
 # --- summary -----------------------------------------------------------------
 echo "== server log (warnings and errors)"
 grep -E 'WARNING|ERROR|FATAL|PANIC' "$LOG" | tail -n 20 || true

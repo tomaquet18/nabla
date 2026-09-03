@@ -97,6 +97,11 @@ pub struct BaseRelation {
     /// relation marks the view stale.
     #[serde(default)]
     pub used_column_types: Vec<String>,
+    /// Columns of this relation that an equality in the quals compares with a
+    /// column of another relation (`a.x = b.y` makes `x` a join key of `a` and
+    /// `y` one of `b`), in attribute order. The shadow indexes them.
+    #[serde(default)]
+    pub join_keys: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -290,6 +295,57 @@ unsafe extern "C-unwind" fn collect_vars(node: *mut pg_sys::Node, ctx: *mut c_vo
         return false;
     }
     pg_sys::expression_tree_walker_impl(node, Some(collect_vars), ctx)
+}
+
+/// The Var behind a qual operand, looking through a binary-compatible
+/// relabel (`int4 = int8` and the like); None for anything else.
+unsafe fn operand_var(node: *mut pg_sys::Node) -> Option<(i32, i16)> {
+    let node = match tag(node as *const c_void) {
+        Some(NodeTag::T_RelabelType) => (*(node as *mut pg_sys::RelabelType)).arg as *mut pg_sys::Node,
+        _ => node,
+    };
+    if tag(node as *const c_void) != Some(NodeTag::T_Var) {
+        return None;
+    }
+    let var = &*(node as *mut pg_sys::Var);
+    (var.varlevelsup == 0).then_some((var.varno, var.varattno))
+}
+
+/// Every (varno, attno) that a conjunct of `node` of the form `a.x = b.y`
+/// (built-in `=`, two plain columns of two different relations) compares.
+/// Only conjuncts count: an equality under OR or NOT is not a join key.
+unsafe fn join_key_vars(node: *mut pg_sys::Node, out: &mut Vec<(i32, i16)>) {
+    if node.is_null() {
+        return;
+    }
+    match tag(node as *const c_void) {
+        Some(NodeTag::T_BoolExpr) => {
+            let b = &*(node as *mut pg_sys::BoolExpr);
+            if b.boolop == pg_sys::BoolExprType::AND_EXPR {
+                for item in list_items(b.args) {
+                    join_key_vars(item as *mut pg_sys::Node, out);
+                }
+            }
+        }
+        Some(NodeTag::T_OpExpr) => {
+            let op = &*(node as *mut pg_sys::OpExpr);
+            let builtin = pg_sys::get_func_namespace(pg_sys::get_opcode(op.opno)) == pg_sys::Oid::from(pg_sys::PG_CATALOG_NAMESPACE);
+            if !builtin || text(pg_sys::get_opname(op.opno)) != "=" {
+                return;
+            }
+            let args = list_items(op.args);
+            if args.len() != 2 {
+                return;
+            }
+            if let (Some(l), Some(r)) = (operand_var(args[0] as *mut pg_sys::Node), operand_var(args[1] as *mut pg_sys::Node)) {
+                if l.0 != r.0 {
+                    out.push(l);
+                    out.push(r);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Every (varno, attno) referenced by `node`.
@@ -707,6 +763,7 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                 column_types,
                 used_columns: Vec::new(),
                 used_column_types: Vec::new(),
+                join_keys: Vec::new(),
             });
             if i == 0 {
                 first_pk_attnums = pk_attnums;
@@ -746,8 +803,10 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
         };
 
         let mut var_refs: Vec<(i32, i16)> = Vec::new();
+        let mut join_refs: Vec<(i32, i16)> = Vec::new();
         for q in &quals {
             referenced_vars(*q, &mut var_refs);
+            join_key_vars(*q, &mut join_refs);
         }
         let mut predicate_parts = Vec::new();
         let qual_place = if is_join { "the WHERE or ON clause" } else { "the WHERE clause" };
@@ -808,6 +867,13 @@ pub fn validate(definition: &str) -> (ViewSpec, BaseTable) {
                     rel.used_column_types.push(ty.clone());
                 }
             }
+            let mut keys: HashSet<String> = HashSet::new();
+            for (varno, attno) in &join_refs {
+                if *varno == entry.rt_index && *attno > 0 {
+                    keys.insert(text(pg_sys::get_attname((*entry.rte).relid, *attno, false)));
+                }
+            }
+            rel.join_keys = rel.columns.iter().filter(|c| keys.contains(*c)).cloned().collect();
         }
 
         let has_aggs = (*query).hasAggs;

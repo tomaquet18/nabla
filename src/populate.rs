@@ -189,10 +189,12 @@ fn read_text(sql: &str, args: &[DatumWithOid]) -> Result<Option<String>, String>
     .map_err(spi_err)
 }
 
-/// Columns a shadow of `relid` must hold: the union of `used_columns` over
-/// every view that references the table (any status), plus this view's own.
-fn needed_columns(relid: u32, own: &ViewSpec) -> Result<BTreeSet<String>, String> {
+/// What a shadow of `relid` must hold: the union of `used_columns` and of
+/// `join_keys` over every view that references the table (any status),
+/// plus this view's own.
+fn needed_columns(relid: u32, own: &ViewSpec) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
     let mut needed: BTreeSet<String> = BTreeSet::new();
+    let mut keys: BTreeSet<String> = BTreeSet::new();
     let specs: Vec<JsonB> = Spi::connect(|client| {
         let mut out = Vec::new();
         for r in client.select(
@@ -212,13 +214,15 @@ fn needed_columns(relid: u32, own: &ViewSpec) -> Result<BTreeSet<String>, String
         if let Ok(spec) = serde_json::from_value::<ViewSpec>(s.0) {
             for rel in spec.relations.iter().filter(|r| r.oid == relid) {
                 needed.extend(rel.used_columns.iter().cloned());
+                keys.extend(rel.join_keys.iter().cloned());
             }
         }
     }
     for rel in own.relations.iter().filter(|r| r.oid == relid) {
         needed.extend(rel.used_columns.iter().cloned());
+        keys.extend(rel.join_keys.iter().cloned());
     }
-    Ok(needed)
+    Ok((needed, keys))
 }
 
 /// Build (or rebuild) one view of a group inside the population transaction.
@@ -257,13 +261,13 @@ fn build(view: &Pending, consistent_point: u64, shadows_done: &mut BTreeSet<u32>
             if !shadows_done.insert(rel.oid) {
                 continue;
             }
-            let needed = needed_columns(rel.oid, &spec)?;
+            let (needed, keys) = needed_columns(rel.oid, &spec)?;
             if rebuild {
                 // Every shadow of the group is rebuilt from this point.
-                shadow::rebuild(rel, consistent_point, &needed);
+                shadow::rebuild(rel, consistent_point, &needed, &keys);
             } else {
                 // First build: existing healthy shadows are extended, never re-snapshotted.
-                shadow::ensure(rel, consistent_point, &needed);
+                shadow::ensure(rel, consistent_point, &needed, &keys);
             }
         }
     }

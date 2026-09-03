@@ -8,7 +8,14 @@
 //! A shadow holds the primary key plus the union of the columns used by the
 //! views that share it (`nabla.shadows.columns`, kept in base attribute
 //! order). Columns are added when a new view needs them; they are never
-//! removed when a view is dropped (a later compaction may do that). Shadow
+//! removed when a view is dropped (a later compaction may do that). Each
+//! join key of the shadow (a column an ON or WHERE equality compares with a
+//! column of another table, `nabla.shadows.join_keys`) carries a btree
+//! index: the delta of one changed row is a join against the shadows on
+//! those columns, and without the index every such delta scans the whole
+//! shadow, while the index costs one extra write per shadow row change,
+//! which is bounded by the base table's own write rate. Predicate-only
+//! columns are not indexed; they filter, they do not fan out. Shadow
 //! tables live in schema `nabla_shadow` as `t<oid>`, are written only by the
 //! worker (same guard trigger as views), depend on their base table in
 //! `pg_depend` (so `DROP TABLE base` needs CASCADE and takes them along), are
@@ -43,16 +50,17 @@ fn run_args(sql: &str, args: &[DatumWithOid]) {
     Spi::run_with_args(sql, args).unwrap_or_else(|e| spi_fail(e));
 }
 
-/// Existing shadow: (refcount, columns, column types).
+/// Existing shadow: columns, column types, indexed join keys.
 struct Existing {
     columns: Vec<String>,
     types: Vec<String>,
+    join_keys: Vec<String>,
 }
 
 fn existing(oid: u32) -> Option<Existing> {
     Spi::connect(|client| {
         let table = client.select(
-            "SELECT columns, column_types FROM nabla.shadows WHERE relid = $1::oid",
+            "SELECT columns, column_types, join_keys FROM nabla.shadows WHERE relid = $1::oid",
             Some(1),
             &[(oid as i64).into()],
         )?;
@@ -63,6 +71,7 @@ fn existing(oid: u32) -> Option<Existing> {
         Ok(Some(Existing {
             columns: t.get::<Vec<String>>(1)?.unwrap_or_default(),
             types: t.get::<Vec<String>>(2)?.unwrap_or_default(),
+            join_keys: t.get::<Vec<String>>(3)?.unwrap_or_default(),
         }))
     })
     .unwrap_or_else(|e| spi_fail(e))
@@ -150,6 +159,29 @@ fn active_set(rel: &BaseRelation, needed: &BTreeSet<String>, base: &[(String, St
     (names, types)
 }
 
+/// Create the btree index of every join key that is an active column and is
+/// not the single primary-key column (already covered by the unique index;
+/// a multi-column key covers only its leading column, so its members are
+/// indexed too). Deterministic names, idempotent, then the catalog union.
+fn index_join_keys(rel: &BaseRelation, active: &[String], previous: &[String], keys: &BTreeSet<String>) {
+    let table = table_name(rel.oid);
+    let mut all: BTreeSet<String> = previous.iter().cloned().collect();
+    all.extend(keys.iter().cloned());
+    let single_pk = rel.pk_columns.len() == 1;
+    for key in &all {
+        if !active.contains(key) || (single_pk && rel.pk_columns[0] == *key) {
+            continue;
+        }
+        let mut name = format!("t{}_{}_idx", rel.oid, key);
+        while name.len() > 63 {
+            name.pop();
+        }
+        run(&format!("CREATE INDEX IF NOT EXISTS {} ON {table} ({})", quote_identifier(&name), quote_identifier(key)));
+    }
+    let stored: Vec<String> = all.into_iter().collect();
+    run_args("UPDATE nabla.shadows SET join_keys = $2 WHERE relid = $1::oid", &[(rel.oid as i64).into(), stored.into()]);
+}
+
 fn store_columns(oid: u32, names: &[String], types: &[String]) {
     run_args(
         "UPDATE nabla.shadows SET columns = $2, column_types = $3 WHERE relid = $1::oid",
@@ -168,7 +200,7 @@ fn store_columns(oid: u32, names: &[String], types: &[String]) {
 /// absorbs those transactions (INSERT/UPDATE tuples carry every column, a
 /// DELETE removes the row, and unchanged-TOAST markers keep the backfilled
 /// value).
-fn extend(rel: &BaseRelation, current: &Existing, needed: &BTreeSet<String>) {
+fn extend(rel: &BaseRelation, current: &Existing, needed: &BTreeSet<String>, keys: &BTreeSet<String>) {
     let table = table_name(rel.oid);
     let base = base_columns(rel.oid);
     let physical = physical_columns(&table);
@@ -202,9 +234,10 @@ fn extend(rel: &BaseRelation, current: &Existing, needed: &BTreeSet<String>) {
     pairs.sort_by_key(|(n, _)| order.iter().position(|o| *o == n).unwrap_or(usize::MAX));
     let (names, types): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
     store_columns(rel.oid, &names, &types);
+    index_join_keys(rel, &names, &current.join_keys, keys);
 }
 
-fn create(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>) {
+fn create(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>, keys: &BTreeSet<String>) {
     let table = table_name(rel.oid);
     let base = base_columns(rel.oid);
     let (names, types) = active_set(rel, needed, &base);
@@ -225,11 +258,14 @@ fn create(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>) {
             (rel.oid as i64).into(),
             table.as_str().into(),
             lsn::format(frontier).into(),
-            names.into(),
+            names.clone().into(),
             rel.pk_columns.clone().into(),
             types.into(),
         ],
     );
+    index_join_keys(rel, &names, &[], keys);
+    // Fresh statistics so the planner uses the indexes from the first delta.
+    run(&format!("ANALYZE {table}"));
     if let Some(shadow_oid) = relation_oid(&table) {
         record_dependency(shadow_oid, rel.oid);
     }
@@ -240,7 +276,7 @@ fn create(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>) {
 /// deliberately NOT re-snapshotted: it has its own frontier and the worker
 /// skips transactions at or below it (see the skip rule in worker.rs). A
 /// shadow whose maintenance failed has no live dependents and is rebuilt.
-pub fn ensure(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>) {
+pub fn ensure(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>, keys: &BTreeSet<String>) {
     match existing(rel.oid) {
         Some(current) => {
             run_args("UPDATE nabla.shadows SET refcount = refcount + 1 WHERE relid = $1::oid", &[(rel.oid as i64).into()]);
@@ -252,21 +288,21 @@ pub fn ensure(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>) {
             .flatten()
             .unwrap_or(false);
             if failed {
-                rebuild(rel, frontier, needed);
+                rebuild(rel, frontier, needed, keys);
             } else {
-                extend(rel, &current, needed);
+                extend(rel, &current, needed, keys);
             }
         }
-        None => create(rel, frontier, needed),
+        None => create(rel, frontier, needed, keys),
     }
 }
 
 /// Rebuild an existing shadow from scratch under the caller's snapshot with
 /// the current column set and types (refresh path).
-pub fn rebuild(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>) {
-    if existing(rel.oid).is_none() {
-        return create(rel, frontier, needed);
-    }
+pub fn rebuild(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>, keys: &BTreeSet<String>) {
+    let Some(current) = existing(rel.oid) else {
+        return create(rel, frontier, needed, keys);
+    };
     let table = table_name(rel.oid);
     let base = base_columns(rel.oid);
     let physical = physical_columns(&table);
@@ -286,6 +322,8 @@ pub fn rebuild(rel: &BaseRelation, frontier: u64, needed: &BTreeSet<String>) {
     }
     let list = quoted_list(&names);
     run(&format!("INSERT INTO {table} ({list}) SELECT {list} FROM {}", rel.qualified));
+    index_join_keys(rel, &names, &current.join_keys, keys);
+    run(&format!("ANALYZE {table}"));
     run_args(
         "UPDATE nabla.shadows SET frontier_lsn = $2::pg_lsn, stale_reason = NULL, failed = false, \
          columns = $3, pk_columns = $4, column_types = $5 WHERE relid = $1::oid",

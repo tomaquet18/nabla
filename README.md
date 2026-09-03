@@ -333,6 +333,9 @@ itself enters the join as a one-row VALUES built from the decoded row.
   by every join view that uses it (`refcount`).
 - Every joined table needs a primary key; because old rows come from the
   shadow, join views do NOT need `REPLICA IDENTITY FULL`.
+- Shadows carry a btree index on each of their join keys (the columns an
+  ON or WHERE equality compares across tables), so the delta of one changed
+  row never scans a whole shadow; predicate-only columns are not indexed.
 - Projection join views carry hidden `_nabla_pk<rti>_<column>` columns (one
   per primary-key column of each table, rti = the table's 1-based position
   in the FROM list) that identify a joined row; the unique index is on them.

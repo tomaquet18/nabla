@@ -50,6 +50,7 @@ CREATE TABLE nabla.shadows (
   columns       text[] NOT NULL DEFAULT '{}',   -- active column set: primary key + columns some view uses
   pk_columns    text[] NOT NULL DEFAULT '{}',
   column_types  text[] NOT NULL DEFAULT '{}',   -- format_type() text, parallel to columns
+  join_keys     text[] NOT NULL DEFAULT '{}',   -- columns joined on by some view; each has a btree index
   failed        bool NOT NULL DEFAULT false,    -- maintenance stopped; refresh rebuilds
   stale_reason  text,                           -- set when maintenance failed; rebuilt by refresh
   created_at    timestamptz NOT NULL DEFAULT now()
